@@ -1,3 +1,9 @@
+# 第三方许可证与版权声明
+
+## rednote_downloader
+
+以下 MIT 许可声明适用于本项目中源自 `rednote_downloader` 的代码部分。ShortVideoDesk 其他代码的主许可证见根目录的 `LICENSE`。
+
 MIT License
 
 Copyright (c) 2026 Sean Li

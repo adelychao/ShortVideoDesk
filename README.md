@@ -1,5 +1,7 @@
 # ShortVideoDesk
 
+**中文名（暂用）：地瓜创作者工作台**
+
 ShortVideoDesk 是一套在本机浏览器里使用的短视频工具。你可以下载或导入素材，整理评论和转写稿，也可以管理文章和视频发布。
 
 ## 选哪个入口
@@ -68,7 +70,7 @@ ShortVideoDesk 是一套在本机浏览器里使用的短视频工具。你可�
 
 ## 许可证
 
-ShortVideoDesk 项目采用 [GNU GPL-3.0-or-later](LICENSE)。原 `rednote_downloader` 代码保留原版权声明和 [MIT 许可证](LICENSE.MIT)。第三方依赖适用各自的许可证。
+本仓库的主许可证为 [GNU GPL-3.0-or-later](LICENSE)。源自 `rednote_downloader` 的代码保留原版权及 MIT 许可声明，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。其他第三方依赖适用各自的许可证。
 
 ## 页面截图
 
