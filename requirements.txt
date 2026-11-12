@@ -1,0 +1,14 @@
+fastapi>=0.115,<1
+playwright>=1.50,<2
+pydantic>=2.10,<3
+uvicorn[standard]>=0.34,<1
+yt-dlp[default,deno]==2026.8.19
+keyring>=25.7,<26
+litellm>=1.106,<2
+python-multipart>=0.0.20,<1
+Pillow>=10,<13
+requests>=2.31,<3
+segno>=1.6.6,<2
+rapidocr==3.10.0
+onnxruntime>=1.20,<2
+zhihu-mediacloud-uploader @ git+https://github.com/zhihu/zhihu-mediacloud-uploader.git@c136afd14f64a824e479168b467727fca424dc5d

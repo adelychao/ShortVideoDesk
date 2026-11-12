@@ -1,0 +1,15 @@
+# Download-only validation on this machine. Deno is optional for the later YouTube path.
+fastapi>=0.115,<1
+python-multipart>=0.0.20,<1
+requests>=2.31,<3
+segno>=1.6.6,<2
+playwright==1.64.1
+pydantic>=2.10,<3
+keyring>=25.7,<26
+litellm>=1.106,<2
+faster-whisper>=1.1,<2
+opencc-python-reimplemented>=0.1.7,<0.2
+rapidocr==3.10.0
+onnxruntime>=1.20,<2
+uvicorn[standard]>=0.34,<1
+yt-dlp[default]==2026.8.19

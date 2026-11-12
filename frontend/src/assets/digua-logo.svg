@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">地瓜新芽 Logo</title>
+  <desc id="desc">暖白圆角方块中，一颗红褐色地瓜长出绿色嫩芽。</desc>
+  <rect x="4" y="4" width="248" height="248" rx="58" fill="#FFF9EC"/>
+
+  <path d="M136 139c.7-24-1-49-1-76" fill="none" stroke="#405B30" stroke-linecap="round" stroke-width="9"/>
+  <path d="M136 139c.7-24-1-49-1-76" fill="none" stroke="#83AB50" stroke-linecap="round" stroke-width="4.5"/>
+
+  <path d="M134 104c-17-21-35-23-52-13 12 1 17 13 28 18 9 4 17 1 24-5Z" fill="#91B85A" stroke="#405B30" stroke-linejoin="round" stroke-width="5"/>
+  <path d="M89 93c15 0 27 4 39 10" fill="none" stroke="#5D823B" stroke-linecap="round" stroke-width="3"/>
+  <path d="M137 91c12-20 29-25 46-12-13 1-18 11-29 15-7 3-12 2-17-3Z" fill="#9AC35D" stroke="#405B30" stroke-linejoin="round" stroke-width="5"/>
+  <path d="M174 80c-13 1-23 5-32 10" fill="none" stroke="#5D823B" stroke-linecap="round" stroke-width="3"/>
+  <path d="M135 66c-2-16 8-26 24-25-7 5-8 14-17 20-2 2-5 4-7 5Z" fill="#A5C970" stroke="#405B30" stroke-linejoin="round" stroke-width="5"/>
+
+  <path d="M30 177c17-8 25-30 45-39 17-8 49-11 70-11 29 0 45 10 58 18 5 3 10 3 15 5 3 1 4 5 1 8-9 7-12 16-22 23-15 12-34 17-55 21-26 5-48 5-68 1-17-3-32-7-42-13-6-3-7-9-2-13Z" fill="#B8754B" stroke="#4D3024" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M35 180c23 2 35-4 53-9 16-5 28 0 43-3 22-4 39-14 57-12 10 1 17 0 23-3-7 7-11 15-19 21-15 11-33 15-52 18-28 5-49 5-67 2-16-3-28-7-38-14Z" fill="#985432"/>
+  <path d="M75 151c10-7 24-10 36-11" fill="none" stroke="#CF8E61" stroke-linecap="round" stroke-width="5"/>
+  <circle cx="102" cy="165" r="2.8" fill="#75412C"/>
+  <circle cx="162" cy="148" r="2.7" fill="#75412C"/>
+  <circle cx="179" cy="176" r="2.4" fill="#75412C"/>
+</svg>

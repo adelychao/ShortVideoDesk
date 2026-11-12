@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+
+
+APP_ID = "original-media-downloader"
+APP_VERSION = "1.3.0"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_DEV_ENV = "OMD_FRONTEND_DEV"
+
+
+def calculate_build_id(project_root: Path = PROJECT_ROOT) -> str:
+    """Fingerprint the code and static assets loaded by the local web process."""
+
+    candidates = [
+        project_root / "run.py",
+        project_root / "launcher.py",
+        project_root / "stop.py",
+        project_root / "start.command",
+        project_root / "start.sh",
+        project_root / "start.bat",
+        project_root / "start-local.cmd",
+        project_root / "stop.command",
+        project_root / "stop.sh",
+        project_root / "stop.bat",
+        project_root / "pyproject.toml",
+        project_root / "requirements.txt",
+        project_root / "requirements-poc.txt",
+        project_root / "anonymous_poc.py",
+    ]
+    candidates.extend((project_root / "app").glob("*.py"))
+    candidates.extend((project_root / "app" / "workbench").rglob("*.py"))
+    candidates.extend((project_root / "app" / "static").glob("*"))
+    frontend_dev = os.environ.get(FRONTEND_DEV_ENV) == "1"
+    if not frontend_dev:
+        candidates.extend((project_root / "frontend" / "dist").rglob("*"))
+    digest = hashlib.sha256()
+    for path in sorted(
+        (candidate for candidate in candidates if candidate.is_file()),
+        key=lambda candidate: candidate.relative_to(project_root).as_posix(),
+    ):
+        relative = path.relative_to(project_root).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
+
+
+BUILD_ID = calculate_build_id()
