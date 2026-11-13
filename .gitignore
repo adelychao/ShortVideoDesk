@@ -6,6 +6,7 @@
 .pytest_cache/
 .venv/
 .venv.backup-*/
+/.shortvideodesk-bootstrap.lock
 .vscode/
 __pycache__/
 *.py[cod]
