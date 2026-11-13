@@ -458,6 +458,8 @@ def _prepare_virtual_environment(
     *,
     base_python: Path,
     run_command: Callable[[Sequence[str]], None],
+    requirements_file: Path = Path("requirements.txt"),
+    skip_dependency_install: bool = False,
 ) -> Path:
     python = _venv_python(project_root)
     if not python.is_file():
@@ -470,9 +472,15 @@ def _prepare_virtual_environment(
             "The existing .venv uses an unsupported Python version. "
             "Delete .venv and run again."
         )
-    requirements = project_root / "requirements.txt"
+    requirements = (project_root / requirements_file).resolve()
+    try:
+        requirements.relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise LauncherError("The requirements file must be under the project root") from exc
     if not requirements.is_file():
-        raise LauncherError("requirements.txt was not found")
+        raise LauncherError(f"{requirements_file} was not found")
+    if skip_dependency_install:
+        return python
     print("Checking dependencies...")
     pip_check = subprocess.run(
         [str(python), "-m", "pip", "--version"],
@@ -811,6 +819,8 @@ def _launch(
     initial_parent_pid: int,
     asgi_app: str = "app.main:app",
     frontend_dev: bool = False,
+    requirements_file: Path = Path("requirements.txt"),
+    skip_dependency_install: bool = False,
 ) -> int:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     lock = ProjectLock(project_root / "data" / "runtime" / "project.lock")
@@ -855,6 +865,8 @@ def _launch(
             project_root,
             base_python=base_python,
             run_command=run_command,
+            requirements_file=requirements_file,
+            skip_dependency_install=skip_dependency_install,
         )
         if stop_requested.is_set() or parent_monitor.disappeared():
             raise LauncherCancelled("Startup was cancelled")
@@ -1003,6 +1015,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", default=DEFAULT_SERVER_PORT, type=_port)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
+        "--requirements-file",
+        type=Path,
+        default=Path("requirements.txt"),
+        help="dependency file to install (default: requirements.txt)",
+    )
+    parser.add_argument(
+        "--skip-dependency-install",
+        action="store_true",
+        help="skip pip installation after validating the environment and dependency file",
+    )
+    parser.add_argument(
         "--frontend-dev",
         action="store_true",
         help="run the Vue frontend with Vite HMR",
@@ -1041,6 +1064,8 @@ def main(argv: list[str] | None = None) -> int:
                 initial_parent_pid=initial_parent_pid,
                 asgi_app=args.asgi_app,
                 frontend_dev=args.frontend_dev,
+                requirements_file=args.requirements_file,
+                skip_dependency_install=args.skip_dependency_install,
             )
     except LauncherCancelled:
         return 0
