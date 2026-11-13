@@ -15,18 +15,11 @@ ShortVideoDesk 是一套在本机浏览器里使用的短视频工具。你可�
 
 ## 启动本地工作台（Windows）
 
-1. 安装 Python 3.11、Node.js（含 npm）、uv、Google Chrome 和 FFmpeg。确保 `ffmpeg` 和 `ffprobe` 可以在终端里运行。
-2. 下载或克隆本仓库，在项目根目录打开 PowerShell，执行以下命令。
-
-   ```powershell
-   uv venv --seed .venv --python 3.11
-   uv pip install --system-certs --python .venv\Scripts\python.exe -r requirements-poc.txt
-   .\.venv\Scripts\python.exe -m playwright install chromium
-   npm --prefix frontend ci
-   ```
-
-3. 双击 [start-local.cmd](start-local.cmd)。服务就绪后会打开浏览器。
-4. 第一次使用时，在 **知识库与设置** 中选择素材归档目录，再粘贴链接或导入本地文件。
+1. 下载或克隆本仓库，在项目文件夹中双击 [start-local.cmd](start-local.cmd)。首次启动会自动准备工作台所需环境、下载依赖包和 Playwright 管理的 Chromium，然后启动服务并打开浏览器。
+2. 首次准备需要网络连接。如果缺少必需的 Windows 工具，安装流程会使用 `winget`；系统可能显示原生许可协议或权限提升提示，请按提示操作。若安装失败，请阅读启动窗口中的中文错误和恢复说明。
+3. 后续使用时仍双击 [start-local.cmd](start-local.cmd) 即可；已准备好的环境会被复用。
+4. FFmpeg 对启动工作台不是必需的，但部分媒体功能需要它。安装失败时，请根据启动窗口中的中文提示处理；已安装的 FFmpeg 和 FFprobe 应能从系统 PATH 中找到。
+5. 第一次使用时，在 **知识库与设置** 中选择素材归档目录，再粘贴链接或导入本地文件。
 
 首次启动会自动创建 `data/workbench.sqlite3` 并初始化数据库，无需安装数据库服务或导入 SQL。任务和设置保存在本机，素材保存在你选择的归档目录。
 
