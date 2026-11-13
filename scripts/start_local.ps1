@@ -64,6 +64,15 @@ function Test-NodeVersion {
     return ($version -match '^v([0-9]+)\.' -and [int] $Matches[1] -ge 20)
 }
 
+function Get-PythonLauncher {
+    foreach ($candidate in Get-Command -Name 'py' -CommandType Application -All -ErrorAction SilentlyContinue) {
+        $version = Get-ToolOutput $candidate.Source @('-3.11', '--version')
+        if ($version -match '^Python 3\.11\.') {
+            return $candidate
+        }
+    }
+}
+
 function Select-CompatibleNode {
     if (Test-NodeVersion) {
         return
@@ -105,9 +114,9 @@ function Enter-BootstrapLock {
 }
 
 function Enter-ProjectRuntimeLock {
-    $pythonLauncher = Get-Command -Name 'py' -CommandType Application -ErrorAction SilentlyContinue
+    $pythonLauncher = Get-PythonLauncher
     if ($null -eq $pythonLauncher) {
-        throw '无法调用 Python 启动器 py，不能安全检查项目运行状态。请检查 Python 3.11 安装后重新启动。'
+        throw '找不到可运行 Python 3.11 的启动器 py，不能安全检查项目运行状态。请检查 Python 3.11 安装后重新启动。'
     }
 
     $guardPath = Join-Path $PSScriptRoot 'project_lock_guard.py'
@@ -234,7 +243,7 @@ $packages = @(
     @{
         Name = 'Python 3.11'
         Id = 'Python.Python.3.11'
-        Probe = { (Get-ToolOutput 'py' @('-3.11', '--version')) -match '^Python 3\.11\.' }
+        Probe = { [bool] (Get-PythonLauncher) }
     }
     @{
         Name = 'uv'
