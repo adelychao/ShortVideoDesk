@@ -476,9 +476,16 @@ def _prepare_virtual_environment(
     try:
         requirements.relative_to(project_root.resolve())
     except ValueError as exc:
-        raise LauncherError("The requirements file must be under the project root") from exc
+        message = (
+            "工作台依赖文件必须位于项目目录内"
+            if requirements_file != Path("requirements.txt")
+            else "The requirements file must be under the project root"
+        )
+        raise LauncherError(message) from exc
     if not requirements.is_file():
-        raise LauncherError(f"{requirements_file} was not found")
+        if requirements_file == Path("requirements.txt"):
+            raise LauncherError("requirements.txt was not found")
+        raise LauncherError(f"找不到工作台依赖文件：{requirements_file}")
     if skip_dependency_install:
         return python
     print("Checking dependencies...")
@@ -502,15 +509,36 @@ def _prepare_virtual_environment(
     requirements_to_install = requirements
     temporary_requirements: Path | None = None
     if gpu_runtime:
-        kept_lines = []
-        for line in requirements.read_text(encoding="utf-8").splitlines():
-            requirement = line.partition("#")[0].strip()
-            match = re.match(r"([A-Za-z0-9_.-]+)", requirement)
-            package_name = match.group(1).lower().replace("_", "-") if match else ""
-            if package_name != "onnxruntime":
-                kept_lines.append(line)
+        def expand_requirements(path: Path, active: set[Path]) -> list[str]:
+            resolved_path = path.resolve()
+            if resolved_path in active:
+                raise LauncherError(f"Circular requirements include: {resolved_path}")
+            active.add(resolved_path)
+            try:
+                expanded: list[str] = []
+                for line in resolved_path.read_text(encoding="utf-8").splitlines():
+                    content = line.partition("#")[0].strip()
+                    include_match = re.match(
+                        r"^(?:-r|--requirement)(?:\s+|=)(.+?)\s*$", content
+                    )
+                    if include_match:
+                        include_path = (resolved_path.parent / include_match.group(1)).resolve()
+                        expanded.extend(expand_requirements(include_path, active))
+                        continue
+                    match = re.match(r"([A-Za-z0-9_.-]+)", content)
+                    package_name = (
+                        match.group(1).lower().replace("_", "-") if match else ""
+                    )
+                    if package_name != "onnxruntime":
+                        expanded.append(line)
+                return expanded
+            finally:
+                active.remove(resolved_path)
+
+        kept_lines = expand_requirements(requirements, set())
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix="-requirements.txt", delete=False
+            mode="w", encoding="utf-8", suffix="-requirements.txt",
+            dir=project_root, delete=False,
         ) as stream:
             stream.write("\n".join(kept_lines) + "\n")
             temporary_requirements = Path(stream.name)
