@@ -5,6 +5,7 @@
 .idea/
 .pytest_cache/
 .venv/
+.venv.backup-*/
 .vscode/
 __pycache__/
 *.py[cod]
