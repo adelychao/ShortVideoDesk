@@ -206,9 +206,9 @@ function Read-Requirements {
     try {
         $Hashes.Add((Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash)
         foreach ($line in Get-Content -LiteralPath $resolved -Encoding UTF8) {
-            $content = ($line -replace '(^|\s+)#.*$', '').Trim()
+            $content = ([string] ($line -replace '(^|\s+)#.*$', '')).Trim()
             if ($content -match '^(?:--requirement(?:\s+|=)|-r\s*=?)\s*(.+)$') {
-                $include = $Matches[1].Trim().Trim('"', "'")
+                $include = ([string] $Matches[1]).Trim().Trim('"', "'")
                 if (-not [IO.Path]::IsPathRooted($include)) {
                     $include = Join-Path (Split-Path -Parent $resolved) $include
                 }
@@ -358,12 +358,14 @@ try {
         Read-Requirements $requirements $activeIncludes $requirementHashes $filteredRequirements '工作台'
         $requirementsHash = Get-RequirementsHash $requirementHashes
         $requirementsMarker = '.venv\.shortvideodesk-requirements.sha256'
-        $requirementsRecorded = if (Test-Path -LiteralPath $requirementsMarker) {
-            Get-Content -LiteralPath $requirementsMarker -Raw
+        $requirementsRecorded = ''
+        if (Test-Path -LiteralPath $requirementsMarker) {
+            $requirementsRecorded = [string] (Get-Content -LiteralPath $requirementsMarker -Raw)
         }
+        $requirementsRecorded = $requirementsRecorded.Trim()
         $importCheck = 'import fastapi, keyring, multipart, uvicorn, yt_dlp, playwright, pydantic, litellm, rapidocr, onnxruntime, PIL, requests, segno, mediacloud_uploader'
         $importsReady = Get-ToolOutput $venvPython @('-c', "$importCheck; print(1)")
-        if ($requirementsHash -ne ([string] $requirementsRecorded).Trim() -or -not $importsReady) {
+        if ($requirementsHash -ne $requirementsRecorded -or -not $importsReady) {
             Write-Host '正在安装 Python 工作台依赖…'
             if (Test-Path -LiteralPath $requirementsMarker) {
                 Remove-Item -LiteralPath $requirementsMarker
@@ -399,10 +401,12 @@ try {
         Write-Host '正在检查前端依赖…'
         $lockHash = (Get-FileHash -LiteralPath 'frontend\package-lock.json' -Algorithm SHA256).Hash
         $lockMarker = 'frontend\node_modules\.shortvideodesk-lock.sha256'
-        $lockRecorded = if (Test-Path -LiteralPath $lockMarker) {
-            Get-Content -LiteralPath $lockMarker -Raw
+        $lockRecorded = ''
+        if (Test-Path -LiteralPath $lockMarker) {
+            $lockRecorded = [string] (Get-Content -LiteralPath $lockMarker -Raw)
         }
-        if ($lockHash -ne ([string] $lockRecorded).Trim() -or
+        $lockRecorded = $lockRecorded.Trim()
+        if ($lockHash -ne $lockRecorded -or
             -not (Test-Path -LiteralPath 'frontend\node_modules\vite\bin\vite.js' -PathType Leaf)) {
             Write-Host '正在安装前端依赖…'
             if (Test-Path -LiteralPath $lockMarker) {
@@ -436,7 +440,13 @@ try {
     Invoke-CheckedProcess '启动 ShortVideoDesk 工作台' $venvPython $workbenchArguments
 }
 catch {
-    [Console]::Error.WriteLine("ShortVideoDesk 启动失败：$($_.Exception.Message)")
+    $errorRecord = $_
+    $errorMessage = $errorRecord.Exception.Message
+    $errorLocation = $errorRecord.InvocationInfo
+    if ($null -ne $errorLocation -and $errorLocation.ScriptLineNumber -gt 0) {
+        $errorMessage += "（启动脚本第 $($errorLocation.ScriptLineNumber) 行）"
+    }
+    [Console]::Error.WriteLine("ShortVideoDesk 启动失败：$errorMessage")
     exit 1
 }
 finally {
