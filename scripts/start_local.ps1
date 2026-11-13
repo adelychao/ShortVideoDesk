@@ -45,12 +45,38 @@ function Invoke-CheckedProcess {
 function Update-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = [Environment]::ExpandEnvironmentVariables("$machinePath;$userPath;$env:Path")
+    $knownEntries = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $env:Path -split ';') {
+        [void] $knownEntries.Add($entry)
+    }
+    $registryPath = [Environment]::ExpandEnvironmentVariables("$machinePath;$userPath")
+    foreach ($entry in $registryPath -split ';') {
+        if ($entry -and $knownEntries.Add($entry)) {
+            $env:Path += ";$entry"
+        }
+    }
 }
 
 function Test-NodeVersion {
-    $version = Get-ToolOutput 'node' @('--version')
+    param([string] $Executable = 'node')
+
+    $version = Get-ToolOutput $Executable @('--version')
     return ($version -match '^v([0-9]+)\.' -and [int] $Matches[1] -ge 20)
+}
+
+function Select-CompatibleNode {
+    if (Test-NodeVersion) {
+        return
+    }
+
+    foreach ($candidate in Get-Command -Name 'node.exe' -CommandType Application -All -ErrorAction SilentlyContinue) {
+        $nodeDirectory = Split-Path -Parent $candidate.Source
+        $npm = Join-Path $nodeDirectory 'npm.cmd'
+        if ((Test-NodeVersion $candidate.Source) -and (Get-ToolOutput $npm @('--version'))) {
+            $env:Path = "$nodeDirectory;$env:Path"
+            return
+        }
+    }
 }
 
 function Enter-BootstrapLock {
@@ -179,6 +205,9 @@ try {
         Write-Host '正在检查 Windows 工具…'
         $winget = Get-Command -Name 'winget' -CommandType Application -ErrorAction SilentlyContinue
         foreach ($package in $packages) {
+            if ($package.Id -eq 'OpenJS.NodeJS.LTS') {
+                Select-CompatibleNode
+            }
             if (& $package.Probe) {
                 continue
             }
@@ -194,6 +223,9 @@ try {
                     'install', '--id', $package.Id, '--exact', '--source', 'winget', '--accept-source-agreements'
                 ) '请查看安装提示，或手动安装此工具后重试。'
                 Update-ProcessPath
+                if ($package.Id -eq 'OpenJS.NodeJS.LTS') {
+                    Select-CompatibleNode
+                }
                 if (-not (& $package.Probe)) {
                     throw "安装后仍无法调用所需版本的 $($package.Name)。请重新打开终端并检查 PATH 中的工具版本，再重新启动。"
                 }
