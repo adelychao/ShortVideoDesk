@@ -10,7 +10,8 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 function Get-ToolOutput {
     param([string] $Executable, [string[]] $CommandArguments)
 
-    $command = Get-Command -Name $Executable -CommandType Application -ErrorAction SilentlyContinue
+    $command = Get-Command -Name $Executable -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($null -eq $command) {
         return
     }
@@ -31,7 +32,8 @@ function Invoke-CheckedProcess {
     )
 
     $ErrorActionPreference = 'Continue'
-    $command = Get-Command -Name $Executable -CommandType Application -ErrorAction SilentlyContinue
+    $command = Get-Command -Name $Executable -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($null -eq $command) {
         throw "$Phase 失败。找不到命令：$Executable。$HelpText"
     }
@@ -284,7 +286,8 @@ try {
     try {
         Update-ProcessPath
         Write-Host '正在检查 Windows 工具…'
-        $winget = Get-Command -Name 'winget' -CommandType Application -ErrorAction SilentlyContinue
+        $winget = Get-Command -Name 'winget' -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
         foreach ($package in $packages) {
             if ($package.Id -eq 'OpenJS.NodeJS.LTS') {
                 Select-CompatibleNode
