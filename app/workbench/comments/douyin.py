@@ -107,14 +107,14 @@ class DouyinCommentAdapter:
             raise CommentAdapterError("browser_safety_blocked", str(exc), retryable=False) from exc
         try:
             self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(channel="chrome", headless=True, timeout=20_000)
+            self._browser = self._playwright.chromium.launch(headless=True, timeout=20_000)
             self._context = self._browser.new_context(locale="zh-CN", accept_downloads=False)
             if self._account_cookies:
                 self._context.add_cookies(self._account_cookies)
             self._page = self._context.new_page()
         except PlaywrightError as exc:
             self.close()
-            raise CommentAdapterError("comments_browser_start_failed", "无法启动匿名浏览器；请检查 Chrome 和本机浏览器环境。", retryable=True) from exc
+            raise CommentAdapterError("comments_browser_start_failed", "无法启动工作台自带的 Chromium；请重新运行 start-local.cmd 完成浏览器环境准备。", retryable=True) from exc
 
         try:
             def on_response(response) -> None:

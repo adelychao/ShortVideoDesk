@@ -10,7 +10,7 @@ Windows 用户从 GitHub 下载或克隆 ShortVideoDesk 后，双击 `start-loca
 
 - `.venv` 和 `frontend/node_modules` 已被 `.gitignore` 排除，不会随仓库克隆。
 - `start-local.cmd` 只检查 `.venv`、Node/npm 和 Vite 依赖，缺少时退出。
-- README 要求手动安装 Python 3.11、Node、uv、Chrome 和 FFmpeg，再运行数条命令。
+- 独立下载器仍要求手动安装 Python、Chrome 和 FFmpeg；本地工作台的两条抖音浏览器路径也指定了系统 Chrome，与自动安装 Playwright Chromium 的方案不一致。
 - 工作台说明使用 `requirements-poc.txt`，启动器默认安装 `requirements.txt`。两份清单各有工作台需要的包，不能只安装其中一份就假定工作台依赖齐全。
 
 ## 推荐方案
@@ -34,11 +34,12 @@ Windows 用户从 GitHub 下载或克隆 ShortVideoDesk 后，双击 `start-loca
 ### 项目本地依赖
 
 - 在项目目录创建 `.venv`，使用 Python 3.11。
-- 增加 `requirements-workbench.txt`，以 `requirements.txt` 为基础并加入工作台所需的 `faster-whisper` 和 OpenCC 依赖；独立下载器继续使用原来的 `requirements.txt`。
+- 增加 `requirements-workbench.txt`，以 `requirements.txt` 为基础；本机 faster-whisper 和 OpenCC 转写组件继续由工作台设置页按需安装，不作为启动必需依赖。独立下载器继续使用原来的 `requirements.txt`。
 - 通过 `uv pip install --system-certs` 安装工作台依赖。
-- 安装 Playwright 管理的 Chromium；不要求用户另行安装 Google Chrome 才能首次启动。
+- 两条工作台抖音浏览器路径使用 Playwright 管理的 Chromium；独立下载器行为保持不变。
 - 记录 requirements 和 `frontend/package-lock.json` 的摘要。只有清单改变、环境版本不匹配或必要依赖缺失时才重新安装；这样第二次启动不需要重新解析 Python/npm 依赖。
 - Node/npm 可用后，若前端依赖缺失或锁文件摘要变化则运行 `npm --prefix frontend ci`。
+- 使用与启动器相同的项目运行锁保护虚拟环境、Playwright 和 `node_modules` 的准备过程；完成后释放锁，再交由启动器接管。
 - 使用工作台依赖清单启动 `launcher.py`。启动器保留现有默认清单，保证 `start.bat`、macOS 和 Linux 的独立下载器入口不变。
 
 首次配置完成后启动本地服务。后续运行先检查缺失项，仅补齐需要的组件，再启动。数据库、项目数据和素材目录保持原有位置，不随环境重建处理。
@@ -47,6 +48,7 @@ Windows 用户从 GitHub 下载或克隆 ShortVideoDesk 后，双击 `start-loca
 
 - 所有新手可见的配置步骤、进度和错误使用简明中文。
 - 明确提示首次运行需要联网下载 Python 包、npm 包和 Chromium。
+- 说明离线转写依赖可在设置页按需安装，不影响工作台启动。
 - winget 缺失时，给出安装 Windows App Installer/winget 的步骤，并说明可手动安装各工具后重试。
 - README 将多条手动命令改为双击启动说明，并标出 Windows/winget 与联网要求。
 

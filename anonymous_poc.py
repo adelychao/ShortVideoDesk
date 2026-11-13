@@ -77,7 +77,7 @@ def capture_public_detail(url: str, media_id: str, update, *, browser_cookies=No
     update(message="正在加载抖音作品页", phase="解析")
     require_safe_browser("anonymous douyin")
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True, timeout=20_000)
+        browser = p.chromium.launch(headless=True, timeout=20_000)
         try:
             # This isolated context receives only platform-filtered cookies from the app profile.
             context = browser.new_context(locale="zh-CN", accept_downloads=False)

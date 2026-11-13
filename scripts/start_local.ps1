@@ -104,6 +104,77 @@ function Enter-BootstrapLock {
     }
 }
 
+function Enter-ProjectRuntimeLock {
+    $pythonLauncher = Get-Command -Name 'py' -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $pythonLauncher) {
+        throw '无法调用 Python 启动器 py，不能安全检查项目运行状态。请检查 Python 3.11 安装后重新启动。'
+    }
+
+    $guardPath = Join-Path $PSScriptRoot 'project_lock_guard.py'
+    if (-not (Test-Path -LiteralPath $guardPath -PathType Leaf)) {
+        throw "找不到项目运行锁辅助脚本：$guardPath。请确认下载的项目文件完整。"
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pythonLauncher.Source
+    $startInfo.Arguments = '-3.11 -u "' + $guardPath + '"'
+    $startInfo.WorkingDirectory = $projectRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw '无法启动项目运行锁辅助进程。请关闭其他启动窗口后重试。'
+    }
+
+    $result = $process.StandardOutput.ReadLine()
+    if ($result -eq 'LOCKED') {
+        return $process
+    }
+
+    $exitCode = $null
+    if (-not $process.HasExited) {
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    }
+    else {
+        $exitCode = $process.ExitCode
+    }
+    $process.Dispose()
+
+    if ($result -eq 'BUSY') {
+        throw '检测到 ShortVideoDesk 正在运行或启动。请先关闭现有工作台/下载器窗口，再重新启动，避免运行中修改项目环境。'
+    }
+    throw "无法获取项目运行锁，辅助进程退出码：$exitCode。请检查 Python 3.11 和项目文件后重试。"
+}
+
+function Exit-ProjectRuntimeLock {
+    param([Diagnostics.Process] $Process)
+
+    if ($null -eq $Process) {
+        return
+    }
+
+    try {
+        $Process.StandardInput.WriteLine('release')
+        $Process.StandardInput.Close()
+        if (-not $Process.WaitForExit(10000)) {
+            $Process.Kill()
+            $Process.WaitForExit()
+            throw '释放项目运行锁超时，已停止辅助进程。请稍后重新启动。'
+        }
+        if ($Process.ExitCode -ne 0) {
+            throw "项目运行锁辅助进程异常退出：$($Process.ExitCode)。请检查启动窗口后重试。"
+        }
+    }
+    finally {
+        $Process.Dispose()
+    }
+}
+
 function Read-Requirements {
     param(
         [string] $Path,
@@ -200,6 +271,7 @@ Push-Location -LiteralPath $projectRoot
 try {
     Write-Host '正在等待启动准备锁…'
     $bootstrapLock = Enter-BootstrapLock (Join-Path $projectRoot '.shortvideodesk-bootstrap.lock')
+    $projectRuntimeLock = $null
     try {
         Update-ProcessPath
         Write-Host '正在检查 Windows 工具…'
@@ -244,6 +316,9 @@ try {
             }
         }
 
+        Write-Host '正在检查项目是否已启动…'
+        $projectRuntimeLock = Enter-ProjectRuntimeLock
+
         Write-Host '正在准备 Python 3.11 虚拟环境…'
         $venvPython = '.\.venv\Scripts\python.exe'
         if ((Test-Path -LiteralPath '.venv') -and
@@ -274,7 +349,7 @@ try {
         $requirementsRecorded = if (Test-Path -LiteralPath $requirementsMarker) {
             Get-Content -LiteralPath $requirementsMarker -Raw
         }
-        $importCheck = 'import fastapi, keyring, multipart, uvicorn, yt_dlp, playwright, pydantic, litellm, faster_whisper, opencc, rapidocr, onnxruntime, PIL, requests, segno, mediacloud_uploader'
+        $importCheck = 'import fastapi, keyring, multipart, uvicorn, yt_dlp, playwright, pydantic, litellm, rapidocr, onnxruntime, PIL, requests, segno, mediacloud_uploader'
         $importsReady = Get-ToolOutput $venvPython @('-c', "$importCheck; print(1)")
         if ($requirementsHash -ne ([string] $requirementsRecorded).Trim() -or -not $importsReady) {
             Write-Host '正在安装 Python 工作台依赖…'
@@ -330,7 +405,13 @@ try {
         }
     }
     finally {
-        $bootstrapLock.Dispose()
+        try {
+            Exit-ProjectRuntimeLock $projectRuntimeLock
+            $projectRuntimeLock = $null
+        }
+        finally {
+            $bootstrapLock.Dispose()
+        }
     }
 
     Write-Host '正在启动 ShortVideoDesk 工作台…'
