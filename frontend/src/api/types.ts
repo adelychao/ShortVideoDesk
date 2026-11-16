@@ -42,6 +42,7 @@ export interface CreateTaskRequest {
   scriptStyleIds?: string[]
   allowFirstFrame: boolean
   commentSortOrder?: 'likes_desc' | 'time_desc' | 'time_asc'
+  commentAnalysisOptions?: CommentAnalysisOptions
   consents: StepConsent[]
   transcriptionMode?: 'cloud' | 'local'
   ocrMode?: 'cloud' | 'local'
@@ -53,6 +54,32 @@ export interface CreateTaskRequest {
   platformAccessMode?: 'anonymous' | 'account'
   platformAccountId?: string
   modelProfileId?: string
+}
+
+export interface CommentAnalysisOptions {
+  mode: 'economy' | 'full'
+  batch_size: number
+  candidate_limit: number
+  budget_cny: number
+  token_budget: number
+  input_price_per_million: number
+  output_price_per_million: number
+  max_output_tokens: number
+}
+
+export interface CommentAnalysisPreview {
+  preview_revision: string
+  original_count: number
+  unique_text_count: number
+  candidate_text_count: number
+  candidate_original_count: number
+  unselected_original_count: number
+  estimated_batch_count: number
+  input_utf8_bytes: number
+  estimated_input_tokens: number
+  estimated_max_output_tokens: number
+  estimated_upper_cost_cny: number
+  estimate_note: string
 }
 
 export interface PlatformAccountStatus {
@@ -114,10 +141,17 @@ export interface WorkbenchHealth {
   worker_count: number
 }
 
+export interface ObsidianOutputDirectory {
+  name: string
+  directory: string
+}
+
 export interface AppSettings {
+  comment_analysis_options: CommentAnalysisOptions
   archive_root: string | null
   obsidian_reference_root: string | null
   obsidian_output_root: string | null
+  obsidian_output_directories: ObsidianOutputDirectory[]
   model_provider: string | null
   model_id: string | null
   asr_model_id: string | null
@@ -380,6 +414,7 @@ export interface ArticleListItem {
   created_at: string
   updated_at: string
   source_title: string | null
+  source_kind: 'manual' | 'final_script' | 'pasted_script'
   source_task_id: string | null
   source_artifact_id: string | null
   publication_statuses: Record<string, ArticlePublication['status'] | 'partial'>
@@ -404,6 +439,12 @@ export interface ArticleSourceScript {
   source_title: string | null
   version: number
   created_at: string
+}
+
+export interface ArticleFromTextRequest {
+  content: string
+  idempotency_key: string
+  authorized: boolean
 }
 
 export interface CsdnTagCatalog {
@@ -848,6 +889,10 @@ export interface CommentItem {
   like_count: number | null
   created_at: string | null
   collected_at: string
+  has_more_text?: boolean
+  reply_draft?: string
+  response_status?: 'pending' | 'drafted' | 'marked_replied' | 'ignore'
+  owner_authorized_at?: string | null
 }
 
 export interface CommentCollectionState {
@@ -868,6 +913,9 @@ export interface CommentPageResponse {
   limit: number
   offset: number
   total: number
+  matched_total?: number
+  revision?: string
+  view?: 'full' | 'preview'
   scope: string
 }
 
@@ -887,7 +935,16 @@ export interface CommentInsights {
   audience_questions: string[]
   disagreements: string[]
   claims_to_verify: string[]
-  processed_comment_ids: string[]
+  processed_comment_ids?: string[]
+  processed_comment_count?: number
+  batch_count?: number
+  classification_counts?: Record<string, number>
+  classification_page?: Array<CommentItem & { labels: string[] }>
+  classification_total?: number
+  classification_offset?: number
+  classification_limit?: number
+  classification_category?: string
+  coverage?: { mode: string; original_count: number; unique_text_count: number; candidate_text_count: number; analyzed_original_count: number; attempted_original_count: number; not_selected_original_count: number; unanalysed_original_count: number; completed_batches: number; total_batches: number; input_tokens: number; output_tokens: number; estimated_cost_cny: string; unknown_cost: boolean; budget_cny: number; token_budget: number; stop_reason: string | null; running?: boolean }
   source_artifact_ids: string[]
 }
 
@@ -992,6 +1049,7 @@ export interface VaultWriteResult {
   path: string | null
   conflict_path: string | null
   reason: string | null
+  library_name?: string | null
 }
 
 export interface SearchHit {

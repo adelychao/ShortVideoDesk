@@ -447,7 +447,8 @@ def test_temporary_cookie_file_is_scoped_and_removed_after_use(tmp_path, monkeyp
 
 def test_account_download_fails_closed_when_platform_session_is_missing(tmp_path, monkeypatch):
     class MissingAccount:
-        def require_authenticated_cookies(self, _platform):
+        def require_authenticated_cookies(self, _platform, *, collection_access=False):
+            assert collection_access is True
             raise PlatformAccountError("请先登录。")
 
     monkeypatch.setattr(platform_accounts, "get_platform_account_manager", lambda: MissingAccount())

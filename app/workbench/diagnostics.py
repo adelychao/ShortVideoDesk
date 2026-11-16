@@ -26,9 +26,11 @@ _ALL_STEPS = [
 def run_diagnostics(config: AppConfig | None = None, frontend_dist: Path | None = None) -> list[dict[str, Any]]:
     selected_config = config or AppConfig()
     try:
-        settings = get_default_model_profile(selected_config) or selected_config.get_settings()
+        app_settings = selected_config.get_settings()
+        model_settings = get_default_model_profile(selected_config) or app_settings
     except Exception:
-        settings = dict(DEFAULT_SETTINGS)
+        app_settings = dict(DEFAULT_SETTINGS)
+        model_settings = app_settings
     results: list[dict[str, Any]] = []
 
     python_ok = sys.version_info >= (3, 11)
@@ -137,7 +139,7 @@ def run_diagnostics(config: AppConfig | None = None, frontend_dist: Path | None 
         ("obsidian-output-root", "obsidian_output_root", "Obsidian 输出目录", True, ["write_obsidian"]),
     )
     for check_id, key, label, needs_write, affected in directory_settings:
-        raw = settings.get(key)
+        raw = app_settings.get(key)
         if not isinstance(raw, str) or not raw:
             results.append(_result(check_id, "unconfigured", f"{label}尚未配置。", f"在“知识库与设置”中选择本机目录。", affected))
             continue
@@ -152,15 +154,15 @@ def run_diagnostics(config: AppConfig | None = None, frontend_dist: Path | None 
                 "重新选择存在且权限正确的本机文件夹。", affected,
             ))
 
-    provider = settings.get("model_provider")
-    model_id = settings.get("model_id")
+    provider = model_settings.get("provider_id") or model_settings.get("model_provider")
+    model_id = model_settings.get("model_id")
     if not provider or not model_id:
         results.append(_result("model", "unconfigured", "模型服务商和模型尚未配置。", "服务商与具体模型将在本机设置页配置。", ["transcribe", "ocr", "analyze_comments", "analyze_structure", "knowledge_cards", "generate_scripts"]))
     else:
         try:
             configured_key = bool(
-                profile_api_key(settings)
-                if isinstance(settings.get("credential_id"), str)
+                profile_api_key(model_settings)
+                if isinstance(model_settings.get("credential_id"), str)
                 else get_model_api_key(str(provider))
             )
         except CredentialStoreUnavailable:

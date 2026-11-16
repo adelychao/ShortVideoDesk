@@ -214,6 +214,9 @@ class CollectionMediaSelectRequest(BaseModel):
     confirm_over_limit: bool = False
 
 
+from .comment_analysis_settings import CommentAnalysisOptionsRequest
+
+
 class CreateTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -224,6 +227,7 @@ class CreateTaskRequest(BaseModel):
     script_style_ids: list[str] = Field(default_factory=list, max_length=MAX_SELECTED_SCRIPT_STYLES)
     allow_first_frame: bool = False
     comment_sort_order: str = Field(default="likes_desc", pattern="^(likes_desc|time_desc|time_asc)$")
+    comment_analysis_options: CommentAnalysisOptionsRequest | None = None
     transcription_mode: str = Field(default="cloud", pattern="^(cloud|local)$")
     ocr_mode: str = Field(default="cloud", pattern="^(cloud|local)$")
     ocr_interval_seconds: float = Field(default=2.0, ge=0.5, le=60)
@@ -265,12 +269,20 @@ class ScriptStyleTemplateRequest(BaseModel):
     reference_paths: list[str] = Field(default_factory=list, max_length=50)
 
 
+class ObsidianOutputDirectoryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(min_length=1, max_length=64)
+    directory: str = Field(min_length=1, max_length=2048)
+
+
 class WorkbenchSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     archive_root: str | None = Field(default=None, max_length=2048)
     obsidian_reference_root: str | None = Field(default=None, max_length=2048)
     obsidian_output_root: str | None = Field(default=None, max_length=2048)
+    obsidian_output_directories: list[ObsidianOutputDirectoryRequest] | None = Field(default=None, max_length=20)
     model_provider: str | None = Field(default=None, max_length=64)
     model_id: str | None = Field(default=None, max_length=128)
     asr_model_id: str | None = Field(default=None, max_length=128)
@@ -279,6 +291,7 @@ class WorkbenchSettingsRequest(BaseModel):
     local_asr_device: str = Field(default='auto', pattern='^(auto|cpu|cuda)$')
     knowledge_card_prompt: str = Field(default='', max_length=20_000)
     script_style_templates: list[ScriptStyleTemplateRequest] | None = Field(default=None, max_length=50)
+    comment_analysis_options: CommentAnalysisOptionsRequest | None = None
     video_publish_auto_cleanup_enabled: bool = True
     video_publish_retention_days: int = Field(default=15, ge=1, le=3650)
     video_publish_cover_root: str | None = Field(default=None, max_length=2048)
@@ -331,6 +344,7 @@ class ArtifactVaultRequest(BaseModel):
 
     artifact_id: str = Field(min_length=1, max_length=128)
     relative_path: str = Field(min_length=1, max_length=1024)
+    library_name: str | None = Field(default=None, max_length=64)
 
 
 class ArtifactVaultWriteRequest(ArtifactVaultRequest):
@@ -355,6 +369,7 @@ class ArtifactTextEditRequest(BaseModel):
 
     expected_sha256: str = Field(pattern="^[0-9a-fA-F]{64}$")
     content: str = Field(max_length=5_000_000)
+    title: str | None = Field(default=None, max_length=160)
 
 
 class TaskDeleteRequest(BaseModel):
@@ -367,6 +382,8 @@ class ArtifactReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     expected_sha256: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    # 审核知识卡时指定要写入的知识库名称；未指定时使用唯一的输出目录，配置多个时不自动写入。
+    library_name: str | None = Field(default=None, max_length=64)
 
 
 class GenerateScriptsRequest(BaseModel):
@@ -389,6 +406,14 @@ class ArticleFromScriptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     artifact_id: str = Field(min_length=1, max_length=128)
+    authorized: bool
+
+
+class ArticleFromTextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    content: str = Field(min_length=1, max_length=1_000_000)
+    idempotency_key: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     authorized: bool
 
 
@@ -465,6 +490,30 @@ class ArticlePublishRequest(BaseModel):
     platforms: list[str] = Field(default_factory=list, max_length=7)
     targets: list[ArticlePublishTarget] = Field(default_factory=list, max_length=20)
     confirmed: bool
+
+
+class CommentResponseNoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    owner_authorized: bool
+    reply_draft: str = Field(default="", max_length=5_000)
+    status: str = Field(default="pending", pattern="^(pending|drafted|marked_replied|ignore)$")
+
+
+class StartCommentAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    authorized: bool
+    options: CommentAnalysisOptionsRequest | None = None
+    preview_revision: str | None = Field(default=None, pattern='^[0-9a-f]{64}$')
+
+
+class ContinueCommentAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    authorized: bool
+    budget_cny: float = Field(gt=0, le=10000)
+    token_budget: int = Field(ge=10000, le=100000000)
 
 
 class ArticleManualPublishRequest(BaseModel):
@@ -757,6 +806,37 @@ def _runner(request: Request) -> TaskRunner:
     return runner if isinstance(runner, TaskRunner) else get_default_runner()
 
 
+def _output_library_entries(runner: TaskRunner) -> list[tuple[str, Path]]:
+    """Configured knowledge libraries as (名称, 输出目录) pairs, in settings order."""
+    entries_raw = runner.config.get_settings().get("obsidian_output_directories")
+    entries: list[tuple[str, Path]] = []
+    if isinstance(entries_raw, list):
+        for item in entries_raw:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and isinstance(item.get("directory"), str)
+                and item["name"].strip()
+                and item["directory"].strip()
+            ):
+                entries.append((item["name"].strip(), Path(item["directory"])))
+    return entries
+
+
+def _select_output_library(runner: TaskRunner, library_name: str | None) -> tuple[str, Path]:
+    """Resolve the vault root for manual writes; the first library is the default."""
+    entries = _output_library_entries(runner)
+    if not entries:
+        raise HTTPException(status_code=409, detail="请先在“知识库与设置”中配置知识库输出目录。")
+    if library_name is None or not library_name.strip():
+        return entries[0]
+    wanted = library_name.strip()
+    for name, directory in entries:
+        if name.casefold() == wanted.casefold():
+            return name, directory
+    raise HTTPException(status_code=422, detail="所选知识库目录不存在，请刷新页面后重试。")
+
+
 def _model_configuration_ready(
     runner: TaskRunner,
     *,
@@ -1029,7 +1109,7 @@ def put_config(body: WorkbenchSettingsRequest, request: Request) -> dict[str, ob
     runner = _runner(request)
     try:
         settings_values = body.model_dump()
-        for field in ("script_style_templates", "video_publish_cover_root", "article_image_root"):
+        for field in ("script_style_templates", "video_publish_cover_root", "article_image_root", "comment_analysis_options", "obsidian_output_directories"):
             if field not in body.model_fields_set:
                 settings_values.pop(field, None)
         saved = runner.config.update_settings(settings_values)
@@ -1243,18 +1323,22 @@ def preview_obsidian_artifact(body: ArtifactVaultRequest, request: Request) -> d
     from .obsidian import conflict_path_candidate, preview_vault_write
 
     runner = _runner(request)
-    root_value = runner.config.get_settings().get("obsidian_output_root")
-    if not isinstance(root_value, str) or not root_value:
-        raise HTTPException(status_code=409, detail="请先配置知识库输出目录。")
+    library_name, root = _select_output_library(runner, body.library_name)
     try:
         content, title = _vault_artifact_content(runner, body.artifact_id)
-        preview = preview_vault_write(Path(root_value), body.relative_path, content)
+        preview = preview_vault_write(root, body.relative_path, content)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="指定的定稿或知识卡不存在。") from exc
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=_safe_error(exc)) from exc
-    suggested = conflict_path_candidate(Path(root_value), body.relative_path) if preview.conflict else None
-    return {**preview.__dict__, "suggested_path": suggested, "title": title, "content": content}
+    suggested = conflict_path_candidate(root, body.relative_path) if preview.conflict else None
+    return {
+        **preview.__dict__,
+        "suggested_path": suggested,
+        "title": title,
+        "content": content,
+        "library_name": library_name,
+    }
 
 
 @_router.post("/obsidian/write", dependencies=[Depends(_same_origin)])
@@ -1262,13 +1346,11 @@ def write_obsidian_artifact(body: ArtifactVaultWriteRequest, request: Request) -
     from .obsidian import write_vault_note
 
     runner = _runner(request)
-    root_value = runner.config.get_settings().get("obsidian_output_root")
-    if not isinstance(root_value, str) or not root_value:
-        raise HTTPException(status_code=409, detail="请先配置知识库输出目录。")
+    library_name, root = _select_output_library(runner, body.library_name)
     try:
         content, _ = _vault_artifact_content(runner, body.artifact_id)
         result = write_vault_note(
-            Path(root_value),
+            root,
             body.relative_path,
             content,
             body.expected_sha256,
@@ -1286,13 +1368,13 @@ def write_obsidian_artifact(body: ArtifactVaultWriteRequest, request: Request) -
                 (
                     uuid.uuid4().hex,
                     body.artifact_id,
-                    str(Path(root_value).resolve(strict=True)),
+                    str(root.resolve(strict=True)),
                     result.path,
                     hashlib.sha256(content.encode("utf-8")).hexdigest(),
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 ),
             )
-    return result.__dict__
+    return {**result.__dict__, "library_name": library_name}
 
 
 @_router.post("/search", dependencies=[Depends(_same_origin)])
@@ -1578,6 +1660,8 @@ def create_task(body: CreateTaskRequest, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=422, detail="评论采集依赖下载步骤；请选择下载后再按需采集评论。")
     if StepKind.ANALYZE_COMMENTS.value in requested and StepKind.COMMENTS.value not in requested:
         raise HTTPException(status_code=422, detail="评论分析需要同时选择公开评论采集。")
+    if body.comment_analysis_options is not None and StepKind.ANALYZE_COMMENTS.value not in requested:
+        raise HTTPException(status_code=422, detail="未选择评论分析时不能设置分析预算。")
     if any(step in requested for step in {StepKind.ANALYZE_STRUCTURE.value, StepKind.KNOWLEDGE_CARDS.value, StepKind.GENERATE_SCRIPTS.value}) and StepKind.TRANSCRIBE.value not in requested:
         raise HTTPException(status_code=422, detail="结构分析、知识卡和口播稿需要先选择语音转写。")
     if len(requested) > 9:
@@ -1611,6 +1695,10 @@ def create_task(body: CreateTaskRequest, request: Request) -> dict[str, object]:
             step_kinds=[StepKind(step) for step in requested],
             comment_sort_order=body.comment_sort_order,
         )
+        if body.comment_analysis_options is not None:
+            from .comment_analysis_policy import save_options
+            analysis_step = next(step for step in task.steps if step.kind is StepKind.ANALYZE_COMMENTS)
+            save_options(runner.database, task.id, analysis_step.id, body.comment_analysis_options.model_dump(), datetime.now(timezone.utc).isoformat())
         if script_style_snapshot is not None:
             save_task_script_style_snapshot(runner.database, task.id, script_style_snapshot)
         if model_profile is not None and validated_consents:
@@ -1648,18 +1736,50 @@ def task_comments(
     sort: str = Query(default="likes_desc", pattern="^(likes_desc|time_desc|time_asc)$"),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=120),
+    view: str = Query(default="full", pattern="^(full|preview)$"),
+    revision: str | None = Query(default=None, min_length=1, max_length=64),
 ) -> dict[str, object]:
     runner = _runner(request)
     task = runner.repository.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在。")
+    if view == "preview" and limit > 100:
+        raise HTTPException(status_code=422, detail="评论预览每页最多 100 条。")
+    keyword = (q or "").strip()
+    if len(keyword) > 120:
+        raise HTTPException(status_code=422, detail="搜索词最多 120 个字符。")
+    base_where = "ci.task_id = ? AND c.asset_id = ?"
+    base_params: list[object] = [task_id, task.asset_id]
+    query_where = base_where
+    query_params = list(base_params)
+    if keyword:
+        # instr() performs literal substring matching; %, _ and quotes are data.
+        query_where += " AND instr(c.text, ?) > 0"
+        query_params.append(keyword)
     with runner.database.transaction() as connection:
         state_row = connection.execute(
             "SELECT * FROM comment_collection_state WHERE task_id = ?", (task_id,)
         ).fetchone()
-        total_row = connection.execute(
-            "SELECT count(*) AS total FROM comment_collection_items WHERE task_id = ?",
-            (task_id,),
+        version_row = connection.execute(
+            f"""SELECT count(*) AS total, max(c.collected_at) AS latest_comment_at
+                FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
+                WHERE {base_where}""",
+            base_params,
+        ).fetchone()
+        total = int(version_row["total"]) if version_row is not None else 0
+        latest_comment_at = str(version_row["latest_comment_at"] or "") if version_row is not None else ""
+        state_updated_at = str(state_row["updated_at"] or "") if state_row is not None else ""
+        revision_value = hashlib.sha256(
+            f"{task_id}:{total}:{latest_comment_at}:{state_updated_at}".encode("utf-8")
+        ).hexdigest()[:24]
+        if revision is not None and revision != revision_value:
+            raise HTTPException(status_code=409, detail="评论采集数据已更新，请刷新当前页。")
+        matched_row = connection.execute(
+            f"""SELECT count(*) AS total
+                FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
+                WHERE {query_where}""",
+            query_params,
         ).fetchone()
         order_by = {
             "likes_desc": "CASE WHEN like_count IS NULL THEN 1 ELSE 0 END, like_count DESC, created_at DESC, platform_comment_id ASC",
@@ -1670,9 +1790,9 @@ def task_comments(
             f"""SELECT c.platform_comment_id, c.parent_id, c.author, c.text, c.like_count,
                        c.created_at, c.collected_at
                 FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
-                WHERE c.asset_id = ? AND ci.task_id = ?
+                WHERE {query_where}
                 ORDER BY {order_by} LIMIT ? OFFSET ?""",
-            (task.asset_id, task_id, limit, offset),
+            [*query_params, limit, offset],
         ).fetchall()
     state: dict[str, object] | None = None
     if state_row is not None:
@@ -1692,32 +1812,176 @@ def task_comments(
             "stop_reason": _safe_error(state_row["stop_reason"]) if state_row["stop_reason"] else None,
             "updated_at": state_row["updated_at"],
         }
-    return {
-        "items": [
-            {
+    items: list[dict[str, object]] = []
+    for row in rows:
+        comment_text = _safe_comment_text(row["text"])
+        item: dict[str, object] = {
                 "platform_comment_id": str(row["platform_comment_id"]),
                 "parent_id": row["parent_id"],
                 "author": _safe_error(row["author"]) if row["author"] else None,
-                "text": _safe_error(row["text"]),
+                "text": comment_text,
                 "like_count": int(row["like_count"]) if row["like_count"] is not None else None,
                 "created_at": row["created_at"],
                 "collected_at": row["collected_at"],
-            }
-            for row in rows
-        ],
+        }
+        if view == "preview":
+            item["has_more_text"] = len(comment_text) > 240
+            item["text"] = comment_text[:240]
+        items.append(item)
+    return {
+        "items": items,
         "state": state,
         "sort": sort,
         "limit": limit,
         "offset": offset,
-        "total": int(total_row["total"]) if total_row is not None else 0,
+        "total": total,
+        "matched_total": int(matched_row["total"]) if matched_row is not None else 0,
+        "revision": revision_value,
+        "view": view,
         "scope": "本次采集到的部分公开评论",
     }
 
 
-@_router.get("/tasks/{task_id}/comment-insights", dependencies=[Depends(_same_origin)])
-def task_comment_insights(task_id: str, request: Request) -> dict[str, object]:
+@_router.get("/tasks/{task_id}/comments/{comment_id}", dependencies=[Depends(_same_origin)])
+def task_comment(task_id: str, comment_id: str, request: Request) -> dict[str, object]:
+    runner = _runner(request)
+    task = runner.repository.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    with runner.database.transaction() as connection:
+        row = connection.execute(
+            """SELECT c.platform_comment_id, c.parent_id, c.author, c.text, c.like_count,
+                      c.created_at, c.collected_at
+               FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
+               WHERE ci.task_id = ? AND c.asset_id = ? AND c.platform_comment_id = ?""",
+            (task_id, task.asset_id, comment_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="该评论不属于当前任务。")
+    return {
+        "platform_comment_id": str(row["platform_comment_id"]),
+        "parent_id": row["parent_id"],
+        "author": _safe_error(row["author"]) if row["author"] else None,
+        "text": _safe_comment_text(row["text"]),
+        "like_count": int(row["like_count"]) if row["like_count"] is not None else None,
+        "created_at": row["created_at"],
+        "collected_at": row["collected_at"],
+    }
+
+
+@_router.get("/tasks/{task_id}/comment-analysis-preview", dependencies=[Depends(_same_origin)])
+def preview_task_comment_analysis(
+    task_id: str,
+    request: Request,
+    mode: str = Query(default="economy", pattern="^(economy|full)$"),
+    batch_size: int = Query(default=200, ge=25, le=300),
+    candidate_limit: int = Query(default=2000, ge=100, le=50000),
+    max_output_tokens: int = Query(default=32768, ge=256, le=32768),
+    input_price_per_million: float = Query(default=0.8, ge=0, le=100000, allow_inf_nan=False),
+    output_price_per_million: float = Query(default=2.8, ge=0, le=100000, allow_inf_nan=False),
+) -> dict[str, object]:
+    from types import SimpleNamespace
+    from .comment_analysis_policy import group_comments, choose_groups, partition_groups, batch_input, comment_snapshot
+    from .steps.analyze_comments import _load_collected_comments
+
+    runner = _runner(request)
+    task = runner.repository.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    comments = _load_collected_comments(SimpleNamespace(task=task, repository=runner.repository))
+    groups = group_comments(comments)
+    candidates = choose_groups(groups, mode, candidate_limit)
+    batches = partition_groups(candidates, batch_size, 96 * 1024)
+    from .steps.analyze_comments_economy import _PROMPT
+    estimated_input = sum(len((_PROMPT + batch_input(batch)).encode('utf-8')) + 256 for batch in batches)
+    estimated_output = len(batches) * max_output_tokens
+    estimated_upper_cost = (estimated_input * input_price_per_million + estimated_output * output_price_per_million) / 1_000_000
+    return {"original_count": len(comments), "unique_text_count": len(groups),
+            "preview_revision": comment_snapshot(comments),
+            "candidate_text_count": len(candidates), "candidate_original_count": sum(len(item.comments) for item in candidates),
+            "unselected_original_count": len(comments) - sum(len(item.comments) for item in candidates),
+            "estimated_batch_count": len(batches), "input_utf8_bytes": sum(len(batch_input(batch).encode('utf-8')) for batch in batches),
+            "estimated_input_tokens": estimated_input, "estimated_max_output_tokens": estimated_output,
+            "estimated_upper_cost_cny": round(estimated_upper_cost, 4),
+            "estimate_note": "按 UTF-8 字节估算输入并假设每批用满输出上限；不含失败重试与未知计费，实际 Token 和费用以服务商账单为准。"}
+
+
+@_router.post(
+    "/tasks/{task_id}/comment-analysis",
+    status_code=202,
+    dependencies=[Depends(_same_origin)],
+)
+def start_task_comment_analysis(
+    task_id: str,
+    body: StartCommentAnalysisRequest,
+    request: Request,
+) -> dict[str, object]:
+    if not body.authorized:
+        raise HTTPException(status_code=422, detail="请先确认将当前已采集评论发送给文本模型并承担可能产生的费用。")
     runner = _runner(request)
     if runner.repository.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    if not _task_model_configuration_ready(runner, task_id):
+        raise HTTPException(status_code=409, detail="原任务所用模型配置或 API Key 当前不可用。")
+    options = body.options.model_dump() if body.options else None
+    if options is not None:
+        if not body.preview_revision:
+            raise HTTPException(status_code=422, detail="请先预览当前评论分析范围。")
+        options['preview_snapshot'] = body.preview_revision
+    try:
+        step_id = runner.enqueue_followup_comment_analysis(task_id, options=options)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在。") from None
+    except RunnerError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {"step_id": step_id, "task": task_detail(task_id, request)["task"]}
+
+
+@_router.post("/tasks/{task_id}/steps/{step_id}/continue-comment-analysis", status_code=202, dependencies=[Depends(_same_origin)])
+def continue_task_comment_analysis(task_id: str, step_id: str, body: ContinueCommentAnalysisRequest, request: Request) -> dict[str, object]:
+    if not body.authorized:
+        raise HTTPException(status_code=422, detail="请先确认新的分析预算。")
+    runner = _runner(request)
+    with runner._lock:
+        task = runner.repository.get_task(task_id)
+        step = next((item for item in task.steps if item.id == step_id), None) if task else None
+        if step is None or step.kind is not StepKind.ANALYZE_COMMENTS or step.status != 'partial' or task.status in {'running', 'queued'}:
+            raise HTTPException(status_code=409, detail="分析步骤状态已变化，请刷新后重试。")
+        with runner.database.transaction(write=True) as connection:
+            row = connection.execute('SELECT options_json FROM comment_analysis_options WHERE task_id=? AND step_id=?', (task_id, step_id)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=409, detail="旧版分析不支持调整预算续跑。")
+            options = json.loads(row['options_json'])
+            runs = connection.execute('SELECT status, usage_json FROM model_runs WHERE task_id=? AND step_id=?', (task_id, step_id)).fetchall()
+            for run in runs:
+                usage = _json_object(run['usage_json'])
+                if run['status'] != 'completed' or not isinstance(usage.get('input_tokens'), int) or not isinstance(usage.get('output_tokens'), int):
+                    raise HTTPException(status_code=409, detail="有调用费用未知，暂不能自动续跑，请先核对服务商记录。")
+            if body.budget_cny < float(options['budget_cny']) or body.token_budget < int(options['token_budget']):
+                raise HTTPException(status_code=422, detail="续跑预算不能低于原预算。")
+            options.update({'budget_cny': body.budget_cny, 'token_budget': body.token_budget})
+            connection.execute('UPDATE comment_analysis_options SET options_json=? WHERE task_id=? AND step_id=?', (json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(',', ':')), task_id, step_id))
+        try:
+            runner.retry_step(task_id, step_id)
+        except RunnerError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return task_detail(task_id, request)
+
+
+@_router.get("/tasks/{task_id}/comment-insights", dependencies=[Depends(_same_origin)])
+def task_comment_insights(
+    task_id: str,
+    request: Request,
+    category: str = Query(
+        default="全部",
+        pattern="^(全部|观众提问|选题请求|经验与观点|纠错与具体反馈|普通互动|垃圾信息|待复核)$",
+    ),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    runner = _runner(request)
+    task = runner.repository.get_task(task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="任务不存在。")
     with runner.database.transaction() as connection:
         row = connection.execute(
@@ -1743,7 +2007,131 @@ def task_comment_insights(task_id: str, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=409, detail="评论分析产物不可用或哈希已变化。") from None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=409, detail="评论分析产物结构无效。")
-    return payload
+    all_classifications = payload.get("classifications", [])
+    if not isinstance(all_classifications, list):
+        all_classifications = []
+    valid_classifications: list[dict[str, object]] = []
+    for item in all_classifications:
+        if not isinstance(item, dict):
+            continue
+        comment_id = item.get("comment_id")
+        labels = item.get("labels")
+        if not isinstance(comment_id, str) or not isinstance(labels, list):
+            continue
+        normalized_labels = list(dict.fromkeys(
+            label for label in labels
+            if isinstance(label, str) and label in {
+                "观众提问", "选题请求", "经验与观点", "纠错与具体反馈", "普通互动", "垃圾信息", "待复核",
+            }
+        ))
+        valid_classifications.append({"comment_id": comment_id, "labels": normalized_labels})
+    if category == "全部":
+        filtered_classifications = valid_classifications
+    else:
+        filtered_classifications = [item for item in valid_classifications if category in item["labels"]]
+    page_classifications = filtered_classifications[offset:offset + limit]
+    ids = [str(item["comment_id"]) for item in page_classifications]
+    comments_by_id: dict[str, dict[str, object]] = {}
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        with runner.database.transaction() as connection:
+            rows = connection.execute(
+                f"""SELECT c.id, c.platform_comment_id, c.parent_id, c.author, c.text, c.like_count,
+                          c.created_at, c.collected_at, rn.reply_draft, rn.status AS response_status,
+                          rn.owner_authorized_at
+                   FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
+                   LEFT JOIN comment_response_notes AS rn ON rn.task_id = ci.task_id AND rn.comment_id = c.id
+                   WHERE ci.task_id = ? AND c.asset_id = ? AND c.platform_comment_id IN ({placeholders})""",
+                [task_id, task.asset_id, *ids],
+            ).fetchall()
+        for comment in rows:
+            text_value = _safe_comment_text(comment["text"])
+            comments_by_id[str(comment["platform_comment_id"])] = {
+                "platform_comment_id": str(comment["platform_comment_id"]),
+                "parent_id": comment["parent_id"],
+                "author": _safe_error(comment["author"]) if comment["author"] else None,
+                "text": text_value[:1000],
+                "has_more_text": len(text_value) > 1000,
+                "like_count": int(comment["like_count"]) if comment["like_count"] is not None else None,
+                "created_at": comment["created_at"],
+                "collected_at": comment["collected_at"],
+                "reply_draft": str(comment["reply_draft"] or ""),
+                "response_status": str(comment["response_status"] or "pending"),
+                "owner_authorized_at": comment["owner_authorized_at"],
+            }
+    classification_page = [
+        {**comments_by_id[comment_id], "labels": item["labels"]}
+        for item in page_classifications
+        if (comment_id := str(item["comment_id"])) in comments_by_id
+    ]
+    processed_ids = payload.get("processed_comment_ids")
+    try:
+        processed_count = len(processed_ids) if isinstance(processed_ids, list) else max(0, int(payload.get("processed_comment_count", 0) or 0))
+    except (TypeError, ValueError):
+        processed_count = 0
+    batch_values = payload.get("batches")
+    batch_count = len(batch_values) if isinstance(batch_values, list) else 0
+    response = {
+        key: value for key, value in payload.items()
+        if key not in {"classifications", "processed_comment_ids", "batches"}
+    }
+    response.update({
+        "processed_comment_count": processed_count,
+        "batch_count": batch_count,
+        "classification_page": classification_page,
+        "classification_total": len(filtered_classifications),
+        "classification_offset": offset,
+        "classification_limit": limit,
+        "classification_category": category,
+        "classification_counts": payload.get("classification_counts", {}),
+    })
+    return response
+
+
+@_router.put(
+    "/tasks/{task_id}/comments/{comment_id}/response-note",
+    dependencies=[Depends(_same_origin)],
+)
+def save_task_comment_response_note(
+    task_id: str,
+    comment_id: str,
+    body: CommentResponseNoteRequest,
+    request: Request,
+) -> dict[str, object]:
+    if not body.owner_authorized:
+        raise HTTPException(status_code=403, detail="请先确认你是作品发布者或获授权管理者。")
+    runner = _runner(request)
+    task = runner.repository.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    updated_at = datetime.now(timezone.utc).isoformat()
+    with runner.database.transaction(write=True) as connection:
+        row = connection.execute(
+            """SELECT c.id FROM comments AS c JOIN comment_collection_items AS ci ON ci.comment_id = c.id
+               WHERE ci.task_id = ? AND c.asset_id = ? AND c.platform_comment_id = ?""",
+            (task_id, task.asset_id, comment_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="该评论不属于当前任务。")
+        connection.execute(
+            """INSERT INTO comment_response_notes (
+                   task_id, comment_id, owner_authorized_at, reply_draft, status, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(task_id, comment_id) DO UPDATE SET
+                   owner_authorized_at = excluded.owner_authorized_at,
+                   reply_draft = excluded.reply_draft,
+                   status = excluded.status,
+                   updated_at = excluded.updated_at""",
+            (task_id, str(row["id"]), updated_at, body.reply_draft, body.status, updated_at),
+        )
+    return {
+        "comment_id": comment_id,
+        "owner_authorized_at": updated_at,
+        "reply_draft": body.reply_draft,
+        "status": body.status,
+        "updated_at": updated_at,
+        "delivery_status": "not_sent",
+    }
 
 
 @_router.post("/tasks/{task_id}/generate-scripts", status_code=202, dependencies=[Depends(_same_origin)])
@@ -1777,7 +2165,7 @@ def generate_scripts_from_selection(
     analysis_artifact_id: str | None = None
     if body.comment_ids:
         try:
-            analysis = task_comment_insights(task_id, request)
+            analysis = task_comment_insights(task_id, request, category="全部", limit=50, offset=0)
         except HTTPException as exc:
             if exc.status_code == 404:
                 raise HTTPException(status_code=422, detail="所选评论没有对应的精选分析结果。") from None
@@ -1902,13 +2290,6 @@ def create_article_from_script(body: ArticleFromScriptRequest, request: Request)
     if str(source["kind"]) != "final_script" or metadata.get("finalized") is not True or metadata.get("human_reviewed") is not True:
         raise HTTPException(status_code=409, detail="请先将口播稿审核并设为定稿，再生成博文。")
     task_id = str(source["task_id"])
-    settings = task_model_settings(runner.config, task_id)
-    if not _task_model_configuration_ready(runner, task_id):
-        raise HTTPException(status_code=409, detail="该任务的文本模型配置或 API Key 当前不可用。")
-    provider_id = settings.get("model_provider")
-    model_id = settings.get("model_id")
-    if not isinstance(provider_id, str) or not isinstance(model_id, str):
-        raise HTTPException(status_code=409, detail="该任务没有可用的文本模型配置。")
     try:
         source_text = read_text_artifact(body.artifact_id, request)["content"]
     except HTTPException:
@@ -1916,8 +2297,63 @@ def create_article_from_script(body: ArticleFromScriptRequest, request: Request)
     except (TypeError, ValueError, OSError):
         raise HTTPException(status_code=409, detail="口播稿文件不可用或已变化。") from None
 
-    prompt = (
-        "你是中文文章编辑。把用户提供的已定稿口播稿转成适合公众号与博客平台阅读的文章。"
+    settings = task_model_settings(runner.config, task_id)
+    if not _task_model_configuration_ready(runner, task_id):
+        raise HTTPException(status_code=409, detail="该任务的文本模型配置或 API Key 当前不可用。")
+    return _generate_article_from_text(
+        runner,
+        str(source_text),
+        settings=settings,
+        source_kind="final_script",
+        note="由定稿口播稿生成",
+        operation="article_from_final_script",
+        task_id=task_id,
+        artifact_id=body.artifact_id,
+    )
+
+
+@_router.post("/articles/from-text", status_code=201, dependencies=[Depends(_same_origin)])
+def create_article_from_text(body: ArticleFromTextRequest, request: Request) -> dict[str, object]:
+    if not body.authorized:
+        raise HTTPException(status_code=422, detail="请先确认本次向所选模型发送这段口播稿。")
+    if not body.content.strip():
+        raise HTTPException(status_code=422, detail="请先粘贴口播稿原文。")
+    runner = _runner(request)
+    profile = get_default_model_profile(runner.config)
+    settings = runner.config.get_settings()
+    if profile is not None:
+        try:
+            profile_capabilities = json.loads(str(profile.get("capabilities_json") or "[]"))
+        except json.JSONDecodeError:
+            profile_capabilities = []
+        if not isinstance(profile_capabilities, list) or "text_generation" not in profile_capabilities:
+            raise HTTPException(status_code=409, detail="当前默认模型不支持文本生成。请先选择默认文本模型。")
+        settings = {
+            **settings,
+            "model_profile_id": profile.get("id"),
+            "model_profile_name": profile.get("name"),
+            "credential_id": profile.get("credential_id"),
+            "legacy_provider_id": profile.get("legacy_provider_id"),
+            "model_provider": profile.get("provider_id"),
+            "model_id": profile.get("model_id"),
+            "model_base_url": profile.get("model_base_url"),
+        }
+    if not _model_configuration_ready(runner, settings_override=settings):
+        raise HTTPException(status_code=409, detail="默认文本模型配置或 API Key 当前不可用。请先在知识库与设置中完成配置。")
+    return _generate_article_from_text(
+        runner,
+        body.content.strip(),
+        settings=settings,
+        source_kind="pasted_script",
+        note="由手动输入文案生成",
+        operation="article_from_pasted_script",
+        idempotency_key=body.idempotency_key,
+    )
+
+
+def _article_generation_prompt() -> str:
+    return (
+        "你是中文文章编辑。把用户提供的口播稿原文转成适合公众号与博客平台阅读的文章。"
         "忠实保留原稿事实、数字、专有名词和作者意图；不能编造数据、案例、引用或经历。"
         "先判断 refine（结构需要重组）、polish（表达和阅读节奏需要润色）或 layout（只需排版），mode 必须只选这三个值中的一个。"
         "给出三个方向不同的标题、推荐标题、摘要、核心观点、判断原因、封面配图提示词和正文 blocks。"
@@ -1933,17 +2369,154 @@ def create_article_from_script(body: ArticleFromScriptRequest, request: Request)
         "blocks 的 type 每次只能选 heading、paragraph、quote、code、bullet_list、ordered_list、divider、table 中的一种；"
         "列表使用 items，表格使用 headers 和 rows，标题块使用 level。"
     )
-    run_id = uuid.uuid4().hex
+
+
+def _begin_article_generation_run(
+    runner: TaskRunner,
+    *,
+    run_id: str,
+    idempotency_key: str,
+    input_sha256: str,
+    provider_id: str,
+    model_id: str,
+) -> tuple[str, str | None]:
     now = datetime.now(timezone.utc).isoformat()
-    usage_json = json.dumps({"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None, "input_detail": {"operation": "article_from_final_script", "source_artifact_ids": [body.artifact_id], "authorized": True}}, ensure_ascii=False, separators=(",", ":"))
+    usage_json = json.dumps(
+        {"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None,
+         "input_detail": {"operation": "article_from_pasted_script", "authorized": True}},
+        ensure_ascii=False, separators=(",", ":"),
+    )
     with runner.database.transaction(write=True) as connection:
+        existing = connection.execute(
+            "SELECT * FROM article_generation_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["input_sha256"]) != input_sha256:
+                raise HTTPException(status_code=409, detail="此请求标识已用于其他文案，请修改文案后重试。")
+            article_id = existing["article_id"]
+            if str(existing["status"]) == "completed" and article_id:
+                return str(existing["id"]), str(article_id)
+            if str(existing["status"]) == "running":
+                completed_article = connection.execute(
+                    "SELECT id FROM articles WHERE generation_key_sha256 = ?",
+                    (hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest(),),
+                ).fetchone()
+                if completed_article is not None:
+                    recovered_article_id = str(completed_article["id"])
+                    connection.execute(
+                        """UPDATE article_generation_runs
+                           SET article_id = ?, status = 'completed', error_code = NULL, finished_at = ?
+                           WHERE id = ?""",
+                        (recovered_article_id, now, existing["id"]),
+                    )
+                    return str(existing["id"]), recovered_article_id
+                raise HTTPException(status_code=409, detail="这段文案正在生成，请稍后重试或查看文章列表。")
+            connection.execute(
+                """UPDATE article_generation_runs
+                   SET article_id = NULL, provider_id = ?, model_id = ?, request_id = ?, usage_json = ?,
+                       status = 'running', error_code = NULL, created_at = ?, finished_at = NULL
+                   WHERE id = ?""",
+                (provider_id, model_id, run_id, usage_json, now, existing["id"]),
+            )
+            return str(existing["id"]), None
         connection.execute(
-            """INSERT INTO model_runs (id, task_id, step_id, provider_id, model_id, artifact_ids_json,
-                   request_id, usage_json, cost_json, status, error_code, created_at, finished_at)
-               VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)""",
-            (run_id, task_id, provider_id, model_id, json.dumps([body.artifact_id]), run_id, usage_json,
+            """INSERT INTO article_generation_runs (
+                   id, idempotency_key, input_sha256, article_id, provider_id, model_id,
+                   request_id, usage_json, cost_json, status, error_code, created_at, finished_at
+               ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)""",
+            (run_id, idempotency_key, input_sha256, provider_id, model_id, run_id, usage_json,
              json.dumps({"currency": "CNY", "amount": None, "known": False}), now),
         )
+    return run_id, None
+
+
+def _update_article_generation_run(
+    runner: TaskRunner,
+    *,
+    task_id: str | None,
+    run_id: str,
+    status: str,
+    error_code: str | None = None,
+    article_id: str | None = None,
+    request_id: str | None = None,
+    usage_json: str | None = None,
+) -> None:
+    finished_at = datetime.now(timezone.utc).isoformat()
+    if task_id is not None:
+        with runner.database.transaction(write=True) as connection:
+            if status == "completed":
+                connection.execute(
+                    """UPDATE model_runs SET request_id = ?, usage_json = ?, status = ?, finished_at = ?
+                       WHERE id = ?""",
+                    (request_id, usage_json, status, finished_at, run_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE model_runs SET status = ?, error_code = ?, finished_at = ? WHERE id = ?",
+                    (status, error_code, finished_at, run_id),
+                )
+        return
+    with runner.database.transaction(write=True) as connection:
+        if status == "completed":
+            connection.execute(
+                """UPDATE article_generation_runs
+                   SET article_id = ?, request_id = ?, usage_json = ?, status = ?, finished_at = ?
+                   WHERE id = ?""",
+                (article_id, request_id, usage_json, status, finished_at, run_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE article_generation_runs SET status = ?, error_code = ?, finished_at = ? WHERE id = ?",
+                (status, error_code, finished_at, run_id),
+            )
+
+
+def _generate_article_from_text(
+    runner: TaskRunner,
+    source_text: str,
+    *,
+    settings: dict[str, Any],
+    source_kind: str,
+    note: str,
+    operation: str,
+    task_id: str | None = None,
+    artifact_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, object]:
+    provider_id = settings.get("model_provider")
+    model_id = settings.get("model_id")
+    if not isinstance(provider_id, str) or not isinstance(model_id, str):
+        raise HTTPException(status_code=409, detail="当前没有可用的文本模型配置。")
+    run_id = uuid.uuid4().hex
+    if idempotency_key is not None:
+        run_id, existing_article_id = _begin_article_generation_run(
+            runner,
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            input_sha256=hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+        if existing_article_id is not None:
+            article = get_article(runner.database, existing_article_id)
+            if article is not None:
+                return article
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        usage_json = json.dumps(
+            {"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None,
+             "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        with runner.database.transaction(write=True) as connection:
+            connection.execute(
+                """INSERT INTO model_runs (id, task_id, step_id, provider_id, model_id, artifact_ids_json,
+                       request_id, usage_json, cost_json, status, error_code, created_at, finished_at)
+                   VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'running', NULL, ?, NULL)""",
+                (run_id, task_id, provider_id, model_id, json.dumps([artifact_id] if artifact_id else []),
+                 run_id, usage_json, json.dumps({"currency": "CNY", "amount": None, "known": False}), now),
+            )
     try:
         api_key = task_profile_api_key(settings)
         if not api_key:
@@ -1952,34 +2525,54 @@ def create_article_from_script(body: ArticleFromScriptRequest, request: Request)
         provider = create_provider(api_key, base_url=base_url if isinstance(base_url, str) else None, provider_id=provider_id)
         if hasattr(provider, "set_client_request_id"):
             provider.set_client_request_id(run_id)
-        response = provider.analyze_text(prompt, str(source_text), model_id)
-        raw = str(response.text)
+        response = provider.analyze_text(_article_generation_prompt(), source_text, model_id)
         from .steps.text_analysis_common import parse_json_object
 
-        generated = normalize_document(parse_json_object(raw))
-        article = create_article(runner.database, generated, source_task_id=task_id, source_artifact_id=body.artifact_id, note="由定稿口播稿生成")
+        generated = normalize_document(parse_json_object(str(response.text)))
+        article = create_article(
+            runner.database,
+            generated,
+            source_task_id=task_id,
+            source_artifact_id=artifact_id,
+            source_kind=source_kind,
+            generation_key_sha256=hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest() if idempotency_key else None,
+            note=note,
+        )
+        usage_json = json.dumps(
+            {"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None,
+             "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
+            ensure_ascii=False, separators=(",", ":"),
+        )
         usage = getattr(response, "usage", None)
         if hasattr(usage, "__dataclass_fields__"):
             usage_value = {key: str(value) if hasattr(value, "as_tuple") else value for key, value in usage.__dict__.items()}
-            usage_json = json.dumps({**usage_value, "input_detail": {"operation": "article_from_final_script", "source_artifact_ids": [body.artifact_id], "authorized": True}}, ensure_ascii=False, separators=(",", ":"))
-        with runner.database.transaction(write=True) as connection:
-            connection.execute("UPDATE model_runs SET request_id = ?, usage_json = ?, status = 'completed', finished_at = ? WHERE id = ?", (getattr(response, "request_id", None) or run_id, usage_json, datetime.now(timezone.utc).isoformat(), run_id))
+            usage_json = json.dumps(
+                {**usage_value, "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
+                ensure_ascii=False, separators=(",", ":"),
+            )
+        _update_article_generation_run(
+            runner,
+            task_id=task_id,
+            run_id=run_id,
+            status="completed",
+            article_id=str(article["id"]),
+            request_id=getattr(response, "request_id", None) or run_id,
+            usage_json=usage_json,
+        )
+        if task_id is None:
+            article = get_article(runner.database, str(article["id"])) or article
         return article
     except HTTPException as exc:
-        with runner.database.transaction(write=True) as connection:
-            connection.execute("UPDATE model_runs SET status = 'failed', error_code = ?, finished_at = ? WHERE id = ?", (f"http_{exc.status_code}", datetime.now(timezone.utc).isoformat(), run_id))
+        _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status="failed", error_code=f"http_{exc.status_code}")
         raise
     except ProviderError as exc:
-        with runner.database.transaction(write=True) as connection:
-            connection.execute("UPDATE model_runs SET status = 'failed', error_code = ?, finished_at = ? WHERE id = ?", (str(getattr(exc, "code", "provider_error"))[:64], datetime.now(timezone.utc).isoformat(), run_id))
+        _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status="failed", error_code=str(getattr(exc, "code", "provider_error"))[:64])
         raise HTTPException(status_code=502, detail=_safe_error(str(exc)) or "文章生成模型调用失败。") from None
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        with runner.database.transaction(write=True) as connection:
-            connection.execute("UPDATE model_runs SET status = 'failed', error_code = 'invalid_article_output', finished_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), run_id))
+        _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status="failed", error_code="invalid_article_output")
         raise HTTPException(status_code=502, detail=_safe_error(str(exc)) or "模型返回的文章结构无效。") from None
     except Exception:
-        with runner.database.transaction(write=True) as connection:
-            connection.execute("UPDATE model_runs SET status = 'failed', error_code = 'article_generation_failed', finished_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), run_id))
+        _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status="failed", error_code="article_generation_failed")
         raise HTTPException(status_code=502, detail="文章生成失败；请查看本地模型调用记录后再决定是否重试。") from None
 
 
@@ -2394,12 +2987,15 @@ def update_article_platform_account(platform_id: str, account_id: str, body: Art
         account_name = (body.account_name or "").strip()
         if platform_id == "wechat":
             config = _runner(request).config
-            stored_app_id, stored_secret = account_credentials(config, "wechat", account_id)
-            if body.public_value.strip() != stored_app_id and not (body.secret_value or "").strip():
+            new_secret = (body.secret_value or "").strip()
+            current_app_id, app_secret = account_credentials(
+                config, "wechat", account_id, secret_override=new_secret or None,
+            )
+            if body.public_value.strip() != current_app_id and not new_secret:
                 raise ValueError("更换 AppID 时，请同时填写对应的新 AppSecret。")
             credential_verified_at = verify_wechat_credentials(
                 body.public_value,
-                (body.secret_value or "").strip() or stored_secret,
+                app_secret,
             )
         if not account_name:
             raise ValueError("请填写账号名称。")
@@ -3772,7 +4368,33 @@ def save_text_artifact_revision(
         "knowledge_card_approved", "final_script",
     }:
         raise HTTPException(status_code=422, detail="该产物不支持人工文本校对。")
+    edited_title: str | None = None
+    if body.title is not None:
+        if not original_kind.startswith("knowledge_card"):
+            raise HTTPException(status_code=422, detail="仅知识卡支持修改标题。")
+        edited_title = body.title.strip()
+        if not edited_title or "\n" in edited_title or "\r" in edited_title:
+            raise HTTPException(status_code=422, detail="知识卡标题不能为空且必须为单行文本。")
     source_metadata = _json_object(original["metadata_json"])
+    source_vault_write: dict[str, object] | None = None
+    vault_note_path = source_metadata.get("vault_note_path")
+    vault_output_root = source_metadata.get("vault_output_root")
+    if (
+        original_kind == "knowledge_card_approved"
+        and isinstance(vault_note_path, str)
+        and vault_note_path.strip()
+        and isinstance(vault_output_root, str)
+        and vault_output_root.strip()
+    ):
+        with runner.database.transaction() as connection:
+            write_row = connection.execute(
+                """SELECT output_root, relative_path, sha256, created_at FROM obsidian_writes
+                   WHERE artifact_id = ? AND output_root = ? AND relative_path = ?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (artifact_id, vault_output_root, vault_note_path),
+            ).fetchone()
+        if write_row is not None:
+            source_vault_write = dict(write_row)
     review_copy = original_kind == "transcript_draft" or source_metadata.get("review_copy") is True
     content = body.content
     word_count: int | None = None
@@ -3841,6 +4463,21 @@ def save_text_artifact_revision(
         ):
             if key in source_metadata:
                 metadata[key] = source_metadata[key]
+        if new_kind == "knowledge_card_approved":
+            for key in (
+                "vault_note_path", "vault_output_root", "vault_library_name", "vault_aliases",
+                "vault_filename_managed", "vault_filename_pending",
+            ):
+                if key in source_metadata:
+                    metadata[key] = source_metadata[key]
+        if edited_title is not None:
+            metadata["title"] = edited_title
+            if (
+                new_kind == "knowledge_card_approved"
+                and source_metadata.get("vault_note_path")
+                and edited_title != str(source_metadata.get("title", "")).strip()
+            ):
+                metadata["vault_filename_pending"] = True
         if new_kind == "script_revision":
             metadata.update({"finalized": False, "review_status": "edited"})
         elif new_kind.startswith("knowledge_card"):
@@ -3891,6 +4528,20 @@ def save_text_artifact_revision(
                     now,
                 ),
             )
+            if new_kind == "knowledge_card_approved" and source_vault_write is not None:
+                connection.execute(
+                    """INSERT OR IGNORE INTO obsidian_writes (
+                           id, artifact_id, output_root, relative_path, sha256, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        uuid.uuid4().hex,
+                        new_id,
+                        str(source_vault_write["output_root"]),
+                        str(source_vault_write["relative_path"]),
+                        str(source_vault_write["sha256"]),
+                        str(source_vault_write["created_at"]),
+                    ),
+                )
             step_row = connection.execute(
                 "SELECT output_artifact_ids_json FROM task_steps WHERE id = ? AND task_id = ?",
                 (str(original["step_id"]), str(original["task_id"])),
@@ -3939,6 +4590,20 @@ def save_text_artifact_revision(
     finally:
         if descriptor is not None:
             os.close(descriptor)
+    if new_kind == "knowledge_card_approved" and metadata.get("vault_note_path"):
+        result["vault_sync"] = _sync_approved_card_vault_note(
+            runner,
+            new_id,
+            metadata,
+            source_vault_write,
+            rename_to_title=edited_title is not None and edited_title != str(source_metadata.get("title", "")).strip(),
+        )
+        with runner.database.transaction() as connection:
+            fresh_row = connection.execute("SELECT * FROM artifacts WHERE id = ?", (new_id,)).fetchone()
+        if fresh_row is not None:
+            sync_result = result["vault_sync"]
+            result = _artifact_payload(fresh_row, root)
+            result["vault_sync"] = sync_result
     return result
 
 
@@ -4001,9 +4666,12 @@ def review_generated_artifact(
             )
             row = connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
             assert row is not None
+        vault_write = _auto_write_card_to_vault(runner, artifact_id, body.library_name)
+        with runner.database.transaction() as connection:
+            fresh_row = connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
         return {
-            **_artifact_payload(row, root),
-            "vault_write": _auto_write_card_to_vault(runner, artifact_id),
+            **_artifact_payload(fresh_row if fresh_row is not None else row, root),
+            "vault_write": vault_write,
         }
 
     new_kind = "final_script" if is_script else "knowledge_card_approved"
@@ -4698,11 +5366,13 @@ def open_vault_note(
     """Open an approved card's vault note, or reveal it in the file manager.
 
     The note location is resolved server-side from the card metadata that the
-    auto-write step recorded; clients never pass a path.
+    auto-write step recorded; clients never pass a path. Only directories
+    still configured as knowledge libraries are searched, preferring the one
+    the card was written to.
     """
     runner = _runner(request)
-    root_value = runner.config.get_settings().get("obsidian_output_root")
-    if not isinstance(root_value, str) or not root_value:
+    entries = _output_library_entries(runner)
+    if not entries:
         raise HTTPException(status_code=409, detail="请先配置知识库输出目录。")
     with runner.database.transaction() as connection:
         row = connection.execute("SELECT kind, metadata_json FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
@@ -4710,19 +5380,37 @@ def open_vault_note(
         raise HTTPException(status_code=404, detail="知识卡不存在。")
     if str(row["kind"]) != "knowledge_card_approved":
         raise HTTPException(status_code=422, detail="仅已审核知识卡支持打开知识库笔记。")
-    note_path_value = _json_object(row["metadata_json"]).get("vault_note_path")
+    metadata = _json_object(row["metadata_json"])
+    note_path_value = metadata.get("vault_note_path")
     if not isinstance(note_path_value, str) or not note_path_value.strip():
         raise HTTPException(status_code=409, detail="该知识卡尚未写入知识库。")
-    try:
-        vault_root = Path(root_value)
-        note_path = vault_root / note_path_value.strip()
-        if note_path.is_symlink() or not note_path.is_file() or note_path.suffix.casefold() != ".md":
-            raise ValueError("note unavailable")
-        safe_note = _assert_contained(note_path, vault_root, strict=True)
-        if safe_note.is_symlink() or not safe_note.is_file():
-            raise ValueError("note unavailable")
-    except (OSError, RuntimeError, ValueError):
-        raise HTTPException(status_code=409, detail="知识库笔记不存在或已被移动。") from None
+    recorded_root = metadata.get("vault_output_root")
+    configured_keys = [os.path.normcase(str(directory)) for _, directory in entries]
+    candidates: list[Path] = []
+    if isinstance(recorded_root, str) and recorded_root.strip():
+        recorded_key = os.path.normcase(str(Path(recorded_root)))
+        if recorded_key in configured_keys:
+            candidates.append(Path(recorded_root))
+    candidates.extend(
+        directory
+        for _, directory in entries
+        if os.path.normcase(str(directory)) not in {os.path.normcase(str(item)) for item in candidates}
+    )
+    safe_note: Path | None = None
+    for vault_root in candidates:
+        try:
+            note_path = vault_root / note_path_value.strip()
+            if note_path.is_symlink() or not note_path.is_file() or note_path.suffix.casefold() != ".md":
+                continue
+            contained = _assert_contained(note_path, vault_root, strict=True)
+            if contained.is_symlink() or not contained.is_file():
+                continue
+            safe_note = contained
+            break
+        except (OSError, RuntimeError, ValueError):
+            continue
+    if safe_note is None:
+        raise HTTPException(status_code=409, detail="知识库笔记不存在，或所在目录已不在知识库输出目录设置中。")
     try:
         _open_local_path(safe_note, reveal=reveal)
     except OSError:
@@ -5373,10 +6061,19 @@ def mount_workbench_api(app: FastAPI, runner: TaskRunner | None = None) -> TaskR
 
 
 async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    if request.url.path.endswith('/comment-analysis-preview'):
+        errors = {str(item.get('loc', ())[-1]) for item in exc.errors() if item.get('loc')}
+        if 'max_output_tokens' in errors:
+            return JSONResponse(status_code=422, content={'detail': '每批最大输出 Token 须为 256～32,768 的整数，请在知识库与设置中调整。'})
     return JSONResponse(status_code=422, content={"detail": _ERROR_TEXT})
 
 
-def _vault_artifact_content(runner: TaskRunner, artifact_id: str) -> tuple[str, str]:
+def _vault_artifact_content(
+    runner: TaskRunner,
+    artifact_id: str,
+    *,
+    metadata_overrides: dict[str, object] | None = None,
+) -> tuple[str, str]:
     with runner.database.transaction() as connection:
         row = connection.execute(
             """SELECT ar.kind, ar.path, ar.sha256, ar.metadata_json, a.title, a.id AS asset_id,
@@ -5394,6 +6091,8 @@ def _vault_artifact_content(runner: TaskRunner, artifact_id: str) -> tuple[str, 
         raise KeyError("artifact not found")
     artifact_kind = str(row["kind"]).casefold()
     metadata = _json_object(row["metadata_json"])
+    if metadata_overrides:
+        metadata.update(metadata_overrides)
     approved_card = artifact_kind == "knowledge_card_approved" and metadata.get("human_reviewed") is True
     finalized_script = artifact_kind == "final_script" and metadata.get("finalized") is True and metadata.get("human_reviewed") is True
     if not approved_card and not finalized_script:
@@ -5414,32 +6113,47 @@ def _vault_artifact_content(runner: TaskRunner, artifact_id: str) -> tuple[str, 
         original = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ValueError("指定产物不是 UTF-8 文本。") from exc
+    # zhw 2026-11-15 21:05:39：知识卡以卡片标题作为笔记标题；定稿仍沿用素材标题。
+    card_title = metadata.get("title")
+    raw_title = str(
+        card_title if approved_card and isinstance(card_title, str) and card_title.strip()
+        else row["title"] or path.stem
+    ).strip()
     # Platform title sanitizers can leave trailing underscores; trim them so
     # note titles and filenames read naturally in the vault.
-    raw_title = str(row["title"] or path.stem).strip()
     title = raw_title[:300].rstrip("_").strip() or raw_title[:300] or path.stem
     # The generated card links the source transcript by vault-relative name,
     # but transcripts are not written into the vault, so the link is dead.
     # Drop it while keeping the working video and workbench links.
     original = re.sub(r"\s*·\s*\[完整口播稿\]\([^)]*\)", "", original)
     media_ref: str | None = None
-    output_root = runner.config.get_settings().get("obsidian_output_root")
-    if isinstance(output_root, str) and isinstance(row["media_path"], str):
+    if isinstance(row["media_path"], str):
         media_path = Path(str(row["media_path"]))
-        try:
-            if media_path.is_symlink():
-                raise ValueError("registered media is not a regular file")
-            safe_media = _assert_contained(media_path, Path(output_root), strict=True)
-            if safe_media.is_file():
-                media_ref = "[[" + safe_media.relative_to(Path(output_root).resolve(strict=True)).as_posix().replace("]", "\\]") + "]]"
-        except (OSError, RuntimeError, ValueError):
-            media_ref = None
+        for _, library_root in _output_library_entries(runner):
+            try:
+                if media_path.is_symlink():
+                    raise ValueError("registered media is not a regular file")
+                safe_media = _assert_contained(media_path, library_root, strict=True)
+                if safe_media.is_file():
+                    media_ref = "[[" + safe_media.relative_to(library_root.resolve(strict=True)).as_posix().replace("]", "\\]") + "]]"
+                    break
+            except (OSError, RuntimeError, ValueError):
+                media_ref = None
     # Keep the note frontmatter human-readable: just title and media. Workbench
     # provenance stays queryable through the obsidian_writes ledger instead.
     metadata_lines = [
         "---",
         f"title: {json.dumps(title, ensure_ascii=False)}",
     ]
+    raw_aliases = metadata.get("vault_aliases")
+    aliases = []
+    if isinstance(raw_aliases, list):
+        aliases = list(dict.fromkeys(
+            item.strip() for item in raw_aliases
+            if isinstance(item, str) and item.strip()
+        ))[:20]
+    if aliases:
+        metadata_lines.append(f"aliases: {json.dumps(aliases, ensure_ascii=False)}")
     if media_ref:
         metadata_lines.append(f"media: {json.dumps(media_ref, ensure_ascii=False)}")
     metadata_lines.extend(["---", ""])
@@ -5450,26 +6164,190 @@ def _vault_artifact_content(runner: TaskRunner, artifact_id: str) -> tuple[str, 
     return frontmatter + media_embed + original, title
 
 
-def _auto_write_card_to_vault(runner: TaskRunner, artifact_id: str) -> dict[str, object]:
-    """Write an approved knowledge card into the configured vault automatically.
+def _sync_approved_card_vault_note(
+    runner: TaskRunner,
+    artifact_id: str,
+    metadata: dict[str, object],
+    previous_write: dict[str, object] | None,
+    *,
+    rename_to_title: bool,
+) -> dict[str, object]:
+    """仅同步仍匹配上次写入校验值的关联笔记。zhw，2026-11-15 20:46:13。"""
+    relative_path = metadata.get("vault_note_path")
+    root_value = metadata.get("vault_output_root")
+    if not isinstance(relative_path, str) or not relative_path.strip() or not isinstance(root_value, str) or not root_value.strip():
+        return {"synced": False, "path": None, "reason": "原知识库文件关联信息不完整，未覆盖文件。"}
+    if previous_write is None:
+        return {"synced": False, "path": relative_path, "reason": "缺少原文件校验记录，未覆盖知识库文件；原文件关联已保留。"}
+
+    try:
+        configured_root = Path(root_value)
+        if configured_root.is_symlink():
+            raise ValueError("知识库目录已变化。")
+        resolved_root = configured_root.resolve(strict=True)
+        selected_root: Path | None = None
+        for _, directory in _output_library_entries(runner):
+            try:
+                if directory.is_symlink() or directory.resolve(strict=True) != resolved_root:
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            selected_root = directory
+            break
+        if selected_root is None:
+            return {"synced": False, "path": relative_path, "reason": "原知识库目录已不在设置中，未同步；原文件关联已保留。"}
+        if (
+            str(previous_write.get("relative_path")) != relative_path
+            or Path(str(previous_write.get("output_root"))).resolve(strict=True) != resolved_root
+        ):
+            return {"synced": False, "path": relative_path, "reason": "原文件校验记录与关联路径不一致，未覆盖知识库文件。"}
+
+        requested_path = relative_path
+        rename_requested = rename_to_title or metadata.get("vault_filename_pending") is True
+        title = metadata.get("title")
+        if rename_requested and isinstance(title, str) and title.strip():
+            base = title.replace('\\/:*?"<>|', "_").strip()[:100].rstrip("_").strip() or "知识卡"
+            parent = PurePosixPath(relative_path).parent
+            filename = f"{base}.md"
+            requested_path = f"{parent.as_posix()}/{filename}" if parent.as_posix() != "." else filename
+            rename_requested = requested_path.casefold() != relative_path.casefold()
+            if rename_requested:
+                aliases_raw = metadata.get("vault_aliases")
+                aliases = [item.strip() for item in aliases_raw if isinstance(item, str) and item.strip()] if isinstance(aliases_raw, list) else []
+                old_stem = PurePosixPath(relative_path).stem
+                if old_stem.casefold() != title.strip().casefold():
+                    aliases = [item for item in aliases if item.casefold() != title.strip().casefold()]
+                    if old_stem.casefold() not in {item.casefold() for item in aliases}:
+                        aliases = [*aliases[-19:], old_stem]
+                if aliases:
+                    metadata["vault_aliases"] = aliases
+        elif rename_requested:
+            rename_requested = False
+
+        from .obsidian import (
+            remove_vault_note_alias_if_unchanged,
+            rename_vault_note_if_unchanged,
+            update_vault_note_if_unchanged,
+        )
+
+        content, _ = _vault_artifact_content(runner, artifact_id, metadata_overrides=metadata)
+        result = update_vault_note_if_unchanged(
+            selected_root,
+            relative_path,
+            content,
+            str(previous_write.get("sha256", "")),
+        )
+        if not result.written or not result.path:
+            return {"synced": False, "path": relative_path, "reason": result.reason or "知识库文件未同步。"}
+
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        synced_path = relative_path
+        rename_reason: str | None = None
+        renamed = False
+        if rename_requested:
+            rename_result = rename_vault_note_if_unchanged(
+                selected_root,
+                relative_path,
+                requested_path,
+                digest,
+            )
+            if rename_result.written and rename_result.path:
+                synced_path = rename_result.path
+                renamed = synced_path.casefold() != relative_path.casefold()
+                rename_reason = rename_result.reason
+                metadata["vault_filename_managed"] = True
+                metadata.pop("vault_filename_pending", None)
+            else:
+                rename_reason = rename_result.reason or "知识库内容已更新，文件名保持不变。"
+                metadata["vault_filename_pending"] = True
+        elif rename_to_title:
+            metadata["vault_filename_managed"] = True
+            metadata.pop("vault_filename_pending", None)
+
+        metadata["vault_note_path"] = synced_path
+        with runner.database.transaction(write=True) as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO obsidian_writes (
+                       id, artifact_id, output_root, relative_path, sha256, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    artifact_id,
+                    str(resolved_root),
+                    synced_path,
+                    digest,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+            connection.execute(
+                "UPDATE artifacts SET metadata_json = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")), artifact_id),
+            )
+
+        if renamed and not remove_vault_note_alias_if_unchanged(
+            selected_root,
+            relative_path,
+            synced_path,
+            digest,
+        ):
+            old_file_reason = "旧文件名未能安全清理，新文件关联已生效，旧路径可能仍有副本。"
+            rename_reason = f"{rename_reason}；{old_file_reason}" if rename_reason else old_file_reason
+        return {
+            "synced": True,
+            "path": synced_path,
+            "renamed": renamed,
+            "reason": rename_reason,
+        }
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+        return {"synced": False, "path": relative_path, "reason": _safe_error(exc)}
+
+
+def _auto_write_card_to_vault(runner: TaskRunner, artifact_id: str, library_name: str | None = None) -> dict[str, object]:
+    """Write an approved knowledge card into a configured knowledge library.
 
     Runs after the card's approval flip commits; a vault failure never blocks
     approval, it is reported back to the caller instead. Uses the same note
-    path convention as the manual write panel (asset title + .md) and falls
+    path convention as the manual write panel (card title + .md) and falls
     back to the suggested conflict path when a different note already exists.
     """
     from .obsidian import write_vault_note
 
-    root_value = runner.config.get_settings().get("obsidian_output_root")
-    if not isinstance(root_value, str) or not root_value:
-        return {"written": False, "path": None, "reason": "未配置知识库输出目录，已仅完成审核。"}
+    entries = _output_library_entries(runner)
+    if not entries:
+        return {"written": False, "path": None, "reason": "未配置知识库输出目录，已仅完成审核。", "library_name": None}
+    selected_name: str | None = None
+    root: Path | None = None
+    if library_name is not None and library_name.strip():
+        wanted = library_name.strip()
+        for name, directory in entries:
+            if name.casefold() == wanted.casefold():
+                selected_name, root = name, directory
+                break
+        if root is None:
+            return {
+                "written": False,
+                "path": None,
+                "reason": "所选知识库目录不存在，已仅完成审核；请在“知识库与设置”中检查后重新审核修订版。",
+                "library_name": None,
+            }
+    elif len(entries) == 1:
+        selected_name, root = entries[0]
+    else:
+        return {
+            "written": False,
+            "path": None,
+            "reason": "配置了多个知识库输出目录但未指定目标，已仅完成审核。",
+            "library_name": None,
+        }
+    assert selected_name is not None and root is not None
     try:
         content, title = _vault_artifact_content(runner, artifact_id)
         base = (title or "知识卡").replace('\\/:*?"<>|', "_").strip()[:100].rstrip("_").strip() or "知识卡"
-        result = write_vault_note(Path(root_value), f"{base}.md", content, None)
+        result = write_vault_note(root, f"{base}.md", content, None)
         if not result.written and result.conflict_path:
-            result = write_vault_note(Path(root_value), result.conflict_path, content, None)
+            result = write_vault_note(root, result.conflict_path, content, None)
         if result.written and result.path:
+            resolved_root = str(root.resolve(strict=True))
             with runner.database.transaction(write=True) as connection:
                 connection.execute(
                     """INSERT OR IGNORE INTO obsidian_writes (
@@ -5478,7 +6356,7 @@ def _auto_write_card_to_vault(runner: TaskRunner, artifact_id: str) -> dict[str,
                     (
                         uuid.uuid4().hex,
                         artifact_id,
-                        str(Path(root_value).resolve(strict=True)),
+                        resolved_root,
                         result.path,
                         hashlib.sha256(content.encode("utf-8")).hexdigest(),
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -5488,13 +6366,23 @@ def _auto_write_card_to_vault(runner: TaskRunner, artifact_id: str) -> dict[str,
                 if card_row is not None:
                     metadata = _json_object(card_row["metadata_json"])
                     metadata["vault_note_path"] = result.path
+                    metadata["vault_output_root"] = resolved_root
+                    metadata["vault_library_name"] = selected_name
+                    metadata["vault_filename_managed"] = True
                     connection.execute(
                         "UPDATE artifacts SET metadata_json = ? WHERE id = ?",
                         (json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")), artifact_id),
                     )
-        return {"written": result.written, "path": result.path, "reason": result.reason}
+        return {
+            "written": result.written,
+            "path": result.path,
+            "reason": result.reason,
+            "library_name": selected_name if result.written else None,
+        }
     except (KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
-        return {"written": False, "path": None, "reason": _safe_error(exc)}
+        return {"written": False, "path": None, "reason": _safe_error(exc), "library_name": None}
+
+
 def _task_payload(task: TaskRecord) -> dict[str, object]:
     source = task.source.to_dict()
     source["value"] = "公开链接（已隐藏地址）" if task.source.kind.value == "url" else "本地文件（原路径已隐藏）"
@@ -5726,6 +6614,18 @@ def _safe_error(exc: object) -> str:
         text,
     )
     return text[:500]
+
+
+def _safe_comment_text(value: object, max_length: int | None = None) -> str:
+    """Redact links and credential-like strings without truncating full comments."""
+    text = str(value)
+    text = _URL_PATTERN.sub("<链接已隐藏>", text)
+    text = re.sub(
+        r"(?i)(token|signature|sign|auth|authorization|api[_-]?key|cookie|secret)=([^&\s]+)",
+        r"\1=<已隐藏>",
+        text,
+    )
+    return text if max_length is None else text[:max_length]
 
 
 def _source_validation_message(exc: object) -> str:

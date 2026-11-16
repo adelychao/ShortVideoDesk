@@ -6,7 +6,10 @@ import type {
   ConfigResponse,
   ConfigSaveResponse,
   CommentPageResponse,
+  CommentItem,
   CommentInsights,
+  CommentAnalysisOptions,
+  CommentAnalysisPreview,
   CredentialStatus,
   ModelProfile,
   SaveModelProfileRequest,
@@ -40,6 +43,7 @@ import type {
   ArticleRecord,
   ArticlePublication,
   ArticleSourceScript,
+  ArticleFromTextRequest,
   ArticlePublishTarget,
   CsdnTagCatalog,
   ToutiaoAccountPublishOptions,
@@ -91,6 +95,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       headers,
     })
   } catch {
+    if (init.signal?.aborted) throw new DOMException('Request was aborted.', 'AbortError')
     throw new ApiError(0, '无法连接本机工作台服务，请确认服务正在运行。')
   }
 
@@ -319,6 +324,13 @@ export const api = {
     return request<ArticleRecord>('/articles/from-script', {
       method: 'POST',
       body: JSON.stringify({ artifact_id: artifactId, authorized }),
+    })
+  },
+
+  createArticleFromText(input: ArticleFromTextRequest): Promise<ArticleRecord> {
+    return request<ArticleRecord>('/articles/from-text', {
+      method: 'POST',
+      body: JSON.stringify(input),
     })
   },
 
@@ -597,6 +609,7 @@ export const api = {
       script_style_ids: input.scriptStyleIds ?? [],
       allow_first_frame: input.allowFirstFrame,
       comment_sort_order: input.commentSortOrder ?? 'likes_desc',
+      comment_analysis_options: input.commentAnalysisOptions,
       transcription_mode: input.transcriptionMode ?? 'cloud',
       ocr_mode: input.ocrMode ?? 'cloud',
       ocr_interval_seconds: input.ocrIntervalSeconds ?? 2,
@@ -665,17 +678,29 @@ export const api = {
     return request<{ artifact_id: string; sha256: string; content: string }>(`/artifacts/${encodeURIComponent(artifactId)}/text`)
   },
 
-  saveTextArtifactRevision(artifactId: string, expectedSha256: string, content: string): Promise<TaskArtifact> {
-    return request<TaskArtifact>(`/artifacts/${encodeURIComponent(artifactId)}/text`, {
+  saveTextArtifactRevision(
+    artifactId: string,
+    expectedSha256: string,
+    content: string,
+    title?: string,
+  ): Promise<TaskArtifact & { vault_sync?: { synced: boolean; path: string | null; renamed?: boolean; reason: string | null } }> {
+    return request<TaskArtifact & { vault_sync?: { synced: boolean; path: string | null; renamed?: boolean; reason: string | null } }>(`/artifacts/${encodeURIComponent(artifactId)}/text`, {
       method: 'PUT',
-      body: JSON.stringify({ expected_sha256: expectedSha256, content }),
+      body: JSON.stringify({
+        expected_sha256: expectedSha256,
+        content,
+        ...(title !== undefined ? { title } : {}),
+      }),
     })
   },
 
-  reviewGeneratedArtifact(artifactId: string, expectedSha256: string): Promise<TaskArtifact & { vault_write?: { written: boolean; path: string | null; reason: string | null } }> {
-    return request<TaskArtifact & { vault_write?: { written: boolean; path: string | null; reason: string | null } }>(`/artifacts/${encodeURIComponent(artifactId)}/review`, {
+  reviewGeneratedArtifact(artifactId: string, expectedSha256: string, libraryName?: string | null): Promise<TaskArtifact & { vault_write?: { written: boolean; path: string | null; reason: string | null; library_name?: string | null } }> {
+    return request<TaskArtifact & { vault_write?: { written: boolean; path: string | null; reason: string | null; library_name?: string | null } }>(`/artifacts/${encodeURIComponent(artifactId)}/review`, {
       method: 'POST',
-      body: JSON.stringify({ expected_sha256: expectedSha256 }),
+      body: JSON.stringify({
+        expected_sha256: expectedSha256,
+        ...(libraryName ? { library_name: libraryName } : {}),
+      }),
     })
   },
 
@@ -710,13 +735,65 @@ export const api = {
     })
   },
 
-  getComments(taskId: string, sort: CommentPageResponse['sort'], offset: number): Promise<CommentPageResponse> {
-    const query = new URLSearchParams({ sort, limit: '100', offset: String(offset) })
-    return request<CommentPageResponse>(`/tasks/${encodeURIComponent(taskId)}/comments?${query.toString()}`)
+  getComments(taskId: string, options: {
+    sort: CommentPageResponse['sort']
+    limit: number
+    offset: number
+    q?: string
+    revision?: string
+    signal?: AbortSignal
+  }): Promise<CommentPageResponse> {
+    const query = new URLSearchParams({ sort: options.sort, limit: String(options.limit), offset: String(options.offset), view: 'preview' })
+    if (options.q) query.set('q', options.q)
+    if (options.revision) query.set('revision', options.revision)
+    return request<CommentPageResponse>(`/tasks/${encodeURIComponent(taskId)}/comments?${query.toString()}`, { signal: options.signal })
   },
 
-  getCommentInsights(taskId: string): Promise<CommentInsights> {
-    return request<CommentInsights>(`/tasks/${encodeURIComponent(taskId)}/comment-insights`)
+  getComment(taskId: string, commentId: string, signal?: AbortSignal): Promise<CommentItem> {
+    return request<CommentItem>(`/tasks/${encodeURIComponent(taskId)}/comments/${encodeURIComponent(commentId)}`, { signal })
+  },
+
+  saveCommentResponseNote(taskId: string, commentId: string, input: {
+    owner_authorized: boolean
+    reply_draft: string
+    status: NonNullable<CommentItem['response_status']>
+  }): Promise<{ comment_id: string; owner_authorized_at: string; reply_draft: string; status: NonNullable<CommentItem['response_status']>; updated_at: string; delivery_status: 'not_sent' }> {
+    return request(`/tasks/${encodeURIComponent(taskId)}/comments/${encodeURIComponent(commentId)}/response-note`, {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })
+  },
+
+  getCommentInsights(taskId: string, options: {
+    category?: string
+    limit?: number
+    offset?: number
+    signal?: AbortSignal
+  } = {}): Promise<CommentInsights> {
+    const query = new URLSearchParams({
+      category: options.category ?? '全部',
+      limit: String(options.limit ?? 50),
+      offset: String(options.offset ?? 0),
+    })
+    return request<CommentInsights>(`/tasks/${encodeURIComponent(taskId)}/comment-insights?${query.toString()}`, { signal: options.signal })
+  },
+
+  previewCommentAnalysis(taskId: string, options: CommentAnalysisOptions): Promise<CommentAnalysisPreview> {
+    const query = new URLSearchParams({ mode: options.mode, batch_size: String(options.batch_size), candidate_limit: String(options.candidate_limit), max_output_tokens: String(options.max_output_tokens), input_price_per_million: String(options.input_price_per_million), output_price_per_million: String(options.output_price_per_million) })
+    return request(`/tasks/${encodeURIComponent(taskId)}/comment-analysis-preview?${query.toString()}`)
+  },
+
+  startCommentAnalysis(taskId: string, authorized: boolean, options: CommentAnalysisOptions, previewRevision: string): Promise<{ step_id: string; task: TaskDetail['task'] }> {
+    return request(`/tasks/${encodeURIComponent(taskId)}/comment-analysis`, {
+      method: 'POST',
+      body: JSON.stringify({ authorized, options, preview_revision: previewRevision }),
+    })
+  },
+
+  continueCommentAnalysis(taskId: string, stepId: string, budgetCny: number, tokenBudget: number): Promise<TaskDetail> {
+    return request(`/tasks/${encodeURIComponent(taskId)}/steps/${encodeURIComponent(stepId)}/continue-comment-analysis`, {
+      method: 'POST', body: JSON.stringify({ authorized: true, budget_cny: budgetCny, token_budget: tokenBudget }),
+    })
   },
 
   listTasks(filters: TaskListFilters = {}): Promise<TaskListResponse> {
@@ -906,20 +983,25 @@ export const api = {
     })
   },
 
-  previewVaultWrite(artifactId: string, relativePath: string): Promise<VaultPreview> {
+  previewVaultWrite(artifactId: string, relativePath: string, libraryName?: string | null): Promise<VaultPreview> {
     return request<VaultPreview>('/obsidian/preview-write', {
       method: 'POST',
-      body: JSON.stringify({ artifact_id: artifactId, relative_path: relativePath }),
+      body: JSON.stringify({
+        artifact_id: artifactId,
+        relative_path: relativePath,
+        ...(libraryName ? { library_name: libraryName } : {}),
+      }),
     })
   },
 
-  writeVaultNote(artifactId: string, relativePath: string, expectedSha256: string | null): Promise<VaultWriteResult> {
+  writeVaultNote(artifactId: string, relativePath: string, expectedSha256: string | null, libraryName?: string | null): Promise<VaultWriteResult> {
     return request<VaultWriteResult>('/obsidian/write', {
       method: 'POST',
       body: JSON.stringify({
         artifact_id: artifactId,
         relative_path: relativePath,
         expected_sha256: expectedSha256,
+        ...(libraryName ? { library_name: libraryName } : {}),
       }),
     })
   },

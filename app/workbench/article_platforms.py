@@ -261,7 +261,13 @@ def remove_platform_account(config: AppConfig, platform_id: str, account_id: str
     return next(item for item in platform_statuses(config) if item["id"] == platform_id)
 
 
-def account_credentials(config: AppConfig, platform_id: str, account_id: str | None) -> tuple[str, str]:
+def account_credentials(
+    config: AppConfig,
+    platform_id: str,
+    account_id: str | None,
+    *,
+    secret_override: str | None = None,
+) -> tuple[str, str]:
     key_name = _platform_key_name(platform_id)
     records = _platform_account_records(_read_account_config(config), platform_id)
     target_id = account_id or "legacy"
@@ -271,7 +277,9 @@ def account_credentials(config: AppConfig, platform_id: str, account_id: str | N
         target_id = str(record.get("id")) if record is not None else ""
     if record is None:
         raise RuntimeError("请先在「账号管理 → 文章发布」添加并选择该平台账号。")
-    secret = get_article_platform_secret(platform_id, "app_secret", None if target_id == "legacy" else target_id)
+    secret = secret_override.strip() if isinstance(secret_override, str) and secret_override.strip() else get_article_platform_secret(
+        platform_id, "app_secret", None if target_id == "legacy" else target_id,
+    )
     public_value = str(record.get(key_name, ""))
     if not public_value or not secret:
         raise RuntimeError("该平台账号凭据不完整；请检查 App ID / App Key 和 Secret。")
@@ -1176,7 +1184,17 @@ def _wechat_upload_body_image(token: str, path: Path, app_id: str, app_secret: s
     )
     result = _wechat_response(request, app_id, app_secret)
     image_url = result.get("url")
-    if not isinstance(image_url, str) or not image_url.startswith("https://"):
+    if not isinstance(image_url, str):
+        raise RuntimeError(_platform_error(result, "公众号没有接受正文配图。"))
+    try:
+        parsed_image_url = urllib.parse.urlsplit(image_url)
+    except ValueError:
+        parsed_image_url = None
+    if (
+        parsed_image_url is None
+        or parsed_image_url.scheme not in {"http", "https"}
+        or not parsed_image_url.hostname
+    ):
         raise RuntimeError(_platform_error(result, "公众号没有接受正文配图。"))
     return image_url
 

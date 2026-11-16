@@ -26,6 +26,9 @@ from ..errors import SiteIssueCode, classify_site_issue
 from ..browser_safety import BrowserSafetyError, browser_automation_paused, is_windows_platform, require_safe_browser, require_controlled_video_browser, reserve_xiaohongshu_login, xiaohongshu_login_slot
 from .archive import _assert_contained
 from .bilibili_login import BilibiliLoginError, bilibili_identity, check_bilibili_login, run_bilibili_login
+from .bilibili_options import fetch_bilibili_publish_status
+from .baijiahao_video_status import fetch_status as fetch_baijiahao_video_status
+from .wechat_channels_status import fetch_status as fetch_wechat_channels_status
 from .database import Database, PROJECT_ROOT
 from .image_storage import (
     IMAGE_FILENAME, VIDEO_COVER_LEASE_SECONDS, image_directory, registered_image_path,
@@ -734,8 +737,14 @@ class SocialAutoUploadAdapter:
             return {}
 
     def douyin_status(self, target: dict[str, Any], on_start: Callable[[subprocess.Popen[str]], None]) -> dict[str, Any]:
+        return self._browser_status(target, on_start, "douyin")
+
+    def kuaishou_status(self, target: dict[str, Any], on_start: Callable[[subprocess.Popen[str]], None]) -> dict[str, Any]:
+        return self._browser_status(target, on_start, "kuaishou")
+
+    def _browser_status(self, target: dict[str, Any], on_start: Callable[[subprocess.Popen[str]], None], platform: str) -> dict[str, Any]:
         try:
-            require_safe_browser("douyin status")
+            require_safe_browser("douyin status" if platform == "douyin" else "open platform workbench")
         except BrowserSafetyError as exc:
             return {"status": "unknown", "message": str(exc)}
         command, message = self.resolve_command()
@@ -743,17 +752,18 @@ class SocialAutoUploadAdapter:
             return {"status": "unknown", "message": message}
         python = command.cwd / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         if python.is_file():
-            argv = [str(python), "-m", "sau_commands.douyin_status"]
+            argv = [str(python), "-m", f"sau_commands.{platform}_status"]
         else:
             uv = shutil.which("uv")
             if not uv:
                 return {"status": "unknown", "message": "未找到 SAU 的 Python 运行环境。"}
-            argv = [uv, "run", "--project", str(command.cwd), "python", "-m", "sau_commands.douyin_status"]
+            argv = [uv, "run", "--project", str(command.cwd), "python", "-m", f"sau_commands.{platform}_status"]
         try:
             started = int(datetime.fromisoformat(str(target["schedule_at"] or target["started_at"])).timestamp())
         except (ValueError, TypeError):
             return {"status": "unknown", "message": "任务缺少可用于匹配作品的时间。"}
-        argv.extend(["--account", str(target["account_alias"]), "--title", str(target["effective_title"]), "--started", str(started)])
+        title = target["effective_title"] if platform == "douyin" else target["effective_caption"]
+        argv.extend(["--account", str(target["account_alias"]), "--title", str(title), "--started", str(started)])
         if target.get("remote_id"):
             argv.extend(["--remote-id", str(target["remote_id"])])
         try:
@@ -766,13 +776,13 @@ class SocialAutoUploadAdapter:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.communicate()
-                return {"status": "unknown", "message": "查询抖音作品状态超时。"}
-            marker = re.search(r"(?m)^DOUYIN_STATUS_JSON:(\{[^\r\n]*\})\s*$", output[-16000:])
+                return {"status": "unknown", "message": "查询平台作品状态超时。"}
+            marker = re.search(rf"(?m)^{platform.upper()}_STATUS_JSON:(\{{[^\r\n]*\}})\s*$", output[-16000:])
             result = json.loads(marker.group(1)) if marker else None
             if process.returncode != 0 or not isinstance(result, dict):
-                return {"status": "unknown", "message": "抖音状态查询进程未返回有效结果。"}
+                return {"status": "unknown", "message": "平台状态查询进程未返回有效结果。"}
             if result.get("status") not in {"unknown", "private", "present", "reviewing", "published", "rejected", "restricted"}:
-                return {"status": "unknown", "message": "抖音返回了暂不支持识别的状态。"}
+                return {"status": "unknown", "message": "平台返回了暂不支持识别的状态。"}
             return result
         except (OSError, ValueError, TypeError):
             return {"status": "unknown", "message": "无法启动或读取抖音状态查询。"}
@@ -3105,11 +3115,13 @@ class VideoPublishManager:
                 daemon=True,
             )
             self._deferred_thread = threading.Thread(target=self._resume_deferred_worker, name='video-publish-resume', daemon=True)
+            self._sync_thread = threading.Thread(target=self._status_sync_worker, name="video-publish-status-sync", daemon=True)
             self._started = True
             for thread in self._workers:
                 thread.start()
             self._cleanup_thread.start()
             self._deferred_thread.start()
+            self._sync_thread.start()
             for target_id in queued:
                 self._queue.put(("publish", target_id))
 
@@ -3570,23 +3582,70 @@ class VideoPublishManager:
 
     def enqueue_status_sync(self, target_id: str) -> bool:
         with self.database.transaction() as connection:
-            row = connection.execute("SELECT platform_id, status, remote_id, platform_observed_at FROM video_publish_targets WHERE id = ?", (target_id,)).fetchone()
+            row = connection.execute("SELECT platform_id, status, remote_id, platform_observed_at, options_json FROM video_publish_targets WHERE id = ?", (target_id,)).fetchone()
         if row is None:
             raise KeyError(target_id)
-        if row["platform_id"] != "douyin" or row["status"] in {"queued", "running", "cancelled"}:
-            raise VideoPublishError("sync_unavailable", "该任务当前不能同步抖音状态。", 409)
+        if row["platform_id"] not in {"douyin", "bilibili", "kuaishou", "wechat_channels", "baijiahao"} or row["status"] in {"queued", "running", "cancelled"}:
+            raise VideoPublishError("sync_unavailable", "该任务当前不能同步平台状态。", 409)
+        if row["platform_id"] == "wechat_channels" and _decode_object(row["options_json"]).get("save_as_draft"):
+            raise VideoPublishError("sync_unavailable", "视频号草稿状态暂不支持自动核实。", 409)
         if row["status"] in {"unknown", "failed"} and not (row["remote_id"] and row["platform_observed_at"]):
-            raise VideoPublishError("sync_identity_unknown", "该任务没有可确认的抖音作品标识，请先在平台核实，避免匹配到其他作品。", 409)
-        try:
-            require_safe_browser("manual douyin status")
-        except BrowserSafetyError as exc:
-            raise VideoPublishError("browser_safety_blocked", str(exc), 409) from exc
+            raise VideoPublishError("sync_identity_unknown", "该任务没有可确认的作品标识，请先在平台核实，避免匹配到其他作品。", 409)
+        if row["platform_id"] in {"douyin", "kuaishou"}:
+            try:
+                require_safe_browser("manual douyin status" if row["platform_id"] == "douyin" else "open platform workbench")
+            except BrowserSafetyError as exc:
+                raise VideoPublishError("browser_safety_blocked", str(exc), 409) from exc
         with self._lock:
             if target_id in self._sync_pending:
                 return False
             self._sync_pending.add(target_id)
         self._queue.put(("sync", target_id))
         return True
+
+    def _status_sync_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._schedule_status_sync_once()
+            except Exception:
+                _LOGGER.exception("automatic platform status scheduling failed")
+            if self._stop.wait(30):
+                return
+
+    def _schedule_status_sync_once(self, *, now: datetime | None = None) -> None:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        with self.database.transaction() as connection:
+            rows = connection.execute("""SELECT t.id, t.platform_id, t.status, t.remote_id, t.platform_observed_at,
+                t.platform_checked_at, t.options_json, b.schedule_at
+                FROM video_publish_targets t JOIN video_publish_batches b ON b.id = t.batch_id
+                WHERE t.platform_id IN ('douyin', 'bilibili', 'kuaishou', 'wechat_channels', 'baijiahao') AND
+                (t.status = 'pending_review' OR (t.status = 'unknown' AND t.remote_id IS NOT NULL
+                AND t.platform_observed_at IS NOT NULL))""").fetchall()
+        browser_paused = None
+        for row in rows:
+            options = _decode_object(row["options_json"])
+            if row["platform_id"] == "wechat_channels" and options.get("save_as_draft"):
+                continue
+            schedule = options.get("schedule_at_override", row["schedule_at"])
+            try:
+                # zhw 2026-11-15 22:46:12：定时时间按本机时区解释，等待计划时间后再核实。
+                if schedule and datetime.fromisoformat(str(schedule)).astimezone(timezone.utc) > current:
+                    continue
+                checked = row["platform_checked_at"]
+                if checked and current - datetime.fromisoformat(str(checked)).astimezone(timezone.utc) < timedelta(minutes=5):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                _LOGGER.warning("invalid platform status sync time for %s", row["id"])
+                continue
+            if row["platform_id"] in {"douyin", "kuaishou"}:
+                if browser_paused is None:
+                    browser_paused = browser_automation_paused()
+                if browser_paused:
+                    continue
+            try:
+                self.enqueue_status_sync(str(row["id"]))
+            except (VideoPublishError, KeyError):
+                continue
 
     def cancel_target(self, target_id: str) -> None:
         if cancel_queued_video_target(self.database, target_id):
@@ -3646,9 +3705,48 @@ class VideoPublishManager:
                         self._sync_pending.discard(item_id)
                 self._queue.task_done()
 
+    def _bilibili_status(self, target: dict[str, Any]) -> dict[str, object]:
+        account = _get_account(self.database, str(target["account_id"]))
+        if account is None or account.get("platform_id") != "bilibili" or account.get("status") != "connected":
+            return {"status": "unknown", "message": "B 站账号未连接，请检查登录状态。"}
+        try:
+            state = self._load_account_workbench_state(account)
+            cookies = {item["name"]: item["value"] for item in state["cookies"]}
+            return fetch_bilibili_publish_status(cookies, target)
+        except (VideoPublishError, KeyError, TypeError):
+            return {"status": "unknown", "message": "B 站登录状态不可用，请检查账号。"}
+
+    def _wechat_channels_status(self, target: dict[str, Any]) -> dict[str, object]:
+        account = _get_account(self.database, str(target["account_id"]))
+        if account is None or account.get("platform_id") != "wechat_channels" or account.get("status") != "connected":
+            return {"status": "unknown", "message": "视频号账号未连接，请检查登录状态。"}
+        try:
+            state = self._load_account_workbench_state(account)
+            host = "channels.weixin.qq.com"
+            cookies = {item["name"]: item["value"] for item in state["cookies"]
+                       if isinstance(item, dict) and isinstance(item.get("domain"), str)
+                       and (host == item["domain"].lstrip(".") or host.endswith("." + item["domain"].lstrip(".")))}
+            return fetch_wechat_channels_status(cookies, target)
+        except (VideoPublishError, KeyError, TypeError):
+            return {"status": "unknown", "message": "视频号登录状态不可用，请检查账号。"}
+
+    def _baijiahao_status(self, target: dict[str, Any]) -> dict[str, object]:
+        account = _get_account(self.database, str(target["account_id"]))
+        if account is None or account.get("platform_id") != "baijiahao" or account.get("status") != "connected":
+            return {"status": "unknown", "message": "百家号账号未连接，请检查登录状态。"}
+        try:
+            state = self._load_account_workbench_state(account)
+            host = "baijiahao.baidu.com"
+            cookies = {item["name"]: item["value"] for item in state["cookies"]
+                       if isinstance(item, dict) and isinstance(item.get("domain"), str)
+                       and (host == item["domain"].lstrip(".") or host.endswith("." + item["domain"].lstrip(".")))}
+            return fetch_baijiahao_video_status(cookies, target)
+        except (VideoPublishError, KeyError, TypeError):
+            return {"status": "unknown", "message": "百家号登录状态不可用，请检查账号。"}
+
     def _run_status_sync(self, target_id: str) -> None:
         with self.database.transaction() as connection:
-            row = connection.execute("""SELECT t.*, b.title, b.schedule_at FROM video_publish_targets t
+            row = connection.execute("""SELECT t.*, b.title, b.description, b.schedule_at FROM video_publish_targets t
                 JOIN video_publish_batches b ON b.id = t.batch_id WHERE t.id = ?""", (target_id,)).fetchone()
         if row is None or row["status"] in {"queued", "running", "cancelled"}:
             return
@@ -3659,30 +3757,61 @@ class VideoPublishManager:
         if not target["platform_observed_at"]:
             target["remote_id"] = None
         options = _decode_object(target["options_json"])
+        if target["platform_id"] == "wechat_channels" and options.get("save_as_draft"):
+            return
         target["schedule_at"] = options.get("schedule_at_override", target["schedule_at"])
         target["effective_title"] = str(options.get("title") or target["title"])
+        target["effective_description"] = str(options.get("description") or target["description"] or "")
+        target["effective_caption"] = target["effective_description"] or target["effective_title"]
         key = f"sync:{target_id}"
         with self._account_lock(str(target["account_id"])):
             if self._stop.is_set():
                 return
-            result = self.adapter.douyin_status(target, lambda process: self._register_process(key, process))
+            if target["platform_id"] == "douyin":
+                result = self.adapter.douyin_status(target, lambda process: self._register_process(key, process))
+            elif target["platform_id"] == "kuaishou":
+                result = self.adapter.kuaishou_status(target, lambda process: self._register_process(key, process))
+            elif target["platform_id"] == "bilibili":
+                result = self._bilibili_status(target)
+            elif target["platform_id"] == "wechat_channels":
+                result = self._wechat_channels_status(target)
+            elif target["platform_id"] == "baijiahao":
+                result = self._baijiahao_status(target)
+            else:
+                return
         with self._lock:
             self._processes.pop(key, None)
         state = str(result.get("status") or "unknown")
         remote_id = result.get("remote_id")
-        if not isinstance(remote_id, str) or not re.fullmatch(r"\d{5,30}", remote_id):
+        message = _safe_message(result.get("message") or "平台状态未确认。")
+        id_pattern = {"douyin": r"\d{5,30}", "bilibili": r"BV[A-Za-z0-9]{10}", "kuaishou": r"[A-Za-z0-9_-]{5,128}", "wechat_channels": r"[A-Za-z0-9_/-]{5,128}", "baijiahao": r"[A-Za-z0-9_-]{5,128}"}[target["platform_id"]]
+        if not isinstance(remote_id, str) or not re.fullmatch(id_pattern, remote_id):
             remote_id = None
+            if state != "unknown":
+                state = "unknown"
+                message = "平台返回的作品标识无法确认，结果待核实。"
         if target["remote_id"] and remote_id and target["remote_id"] != remote_id:
             state, remote_id = "unknown", None
+            message = "平台返回的作品标识与已核实的作品不一致，结果待核实。"
         now = _utc_now()
-        message = _safe_message(result.get("message") or "平台状态未确认。")
         with self.database.transaction(write=True) as connection:
             current = connection.execute("SELECT status, attempt_count, remote_id FROM video_publish_targets WHERE id = ?", (target_id,)).fetchone()
             if current is None or current["attempt_count"] != target["attempt_count"] or current["status"] != target["status"] or current["remote_id"] != previous_remote_id:
                 return
             if state != "unknown" and remote_id:
+                remote_url = {"douyin": f"https://www.douyin.com/video/{remote_id}",
+                              "bilibili": f"https://www.bilibili.com/video/{remote_id}",
+                              "kuaishou": f"https://www.kuaishou.com/short-video/{remote_id}",
+                              "wechat_channels": None, "baijiahao": None}[target["platform_id"]]
                 connection.execute("""UPDATE video_publish_targets SET platform_status = ?, platform_message = ?, platform_checked_at = ?, platform_observed_at = ?, remote_id = ?, remote_url = ?, updated_at = ? WHERE id = ?""",
-                    (state, message, now, now, remote_id, f"https://www.douyin.com/video/{remote_id}", now, target_id))
+                    (state, message, now, now, remote_id, remote_url, now, target_id))
+                if state == "published" and current["status"] in {"pending_review", "unknown"}:
+                    connection.execute("UPDATE video_publish_targets SET status = 'published', message = ?, finished_at = ?, updated_at = ? WHERE id = ?", (message, now, now, target_id))
+                    connection.execute("""UPDATE video_publish_attempts SET status = 'published', message = ?, finished_at = ?
+                        WHERE target_id = ? AND attempt_number = ?""", (message, now, target_id, target["attempt_count"]))
+                    _refresh_batch_status(connection, str(target["batch_id"]))
+                elif current["status"] in {"pending_review", "unknown"}:
+                    connection.execute("UPDATE video_publish_targets SET message = ? WHERE id = ?", (message, target_id))
             else:
                 connection.execute("UPDATE video_publish_targets SET platform_message = ?, platform_checked_at = ?, updated_at = ? WHERE id = ?", (message, now, now, target_id))
 

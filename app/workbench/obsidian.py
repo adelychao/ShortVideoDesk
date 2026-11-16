@@ -136,6 +136,139 @@ def write_vault_note(
     return WriteResult(True, relative, None, None)
 
 
+def update_vault_note_if_unchanged(
+    root: Path,
+    relative_path: str,
+    content: str,
+    expected_sha256: str,
+) -> WriteResult:
+    """仅当文件仍匹配工作台上次写入的校验值时更新。zhw，2026-11-15 20:46:13。"""
+    resolved_root = _root(root)
+    target, relative = _resolve_target(resolved_root, relative_path, require_exists=True)
+    if not isinstance(content, str) or "\x00" in content:
+        raise ValueError("笔记内容无效。")
+    payload = content.encode("utf-8")
+    if len(payload) > _MAX_NOTE_BYTES:
+        raise ValueError("笔记超过 5 MB。")
+    if len(expected_sha256) != 64 or any(character not in "0123456789abcdefABCDEF" for character in expected_sha256):
+        raise ValueError("缺少有效的原知识库文件校验信息，未覆盖。")
+
+    expected = expected_sha256.casefold()
+    proposed = _hash_bytes(payload)
+    if target.stat().st_size > _MAX_NOTE_BYTES:
+        return WriteResult(False, None, None, "原知识库文件超过 5 MB，未覆盖。")
+    current = _hash_bytes(target.read_bytes())
+    if current == proposed:
+        return WriteResult(True, relative, None, None)
+    if current != expected:
+        return WriteResult(False, None, None, "知识库文件在上次写入后已被修改，未覆盖；原文件关联已保留。")
+
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        _write_exclusive(temporary, payload)
+        # zhw 2026-11-15 20:46:13：替换前再次核对，避免常见外部修改被静默覆盖。
+        current_target, current_relative = _resolve_target(resolved_root, relative, require_exists=True)
+        if current_relative != relative or current_target.stat().st_size > _MAX_NOTE_BYTES:
+            return WriteResult(False, None, None, "知识库文件在更新前发生变化，未覆盖；原文件关联已保留。")
+        if _hash_bytes(current_target.read_bytes()) != expected:
+            return WriteResult(False, None, None, "知识库文件在更新前发生变化，未覆盖；原文件关联已保留。")
+        os.replace(temporary, current_target)
+    except OSError:
+        return WriteResult(False, None, None, "知识库文件无法安全更新；原文件关联已保留。")
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return WriteResult(True, relative, None, None)
+
+
+def rename_vault_note_if_unchanged(
+    root: Path,
+    old_relative_path: str,
+    new_relative_path: str,
+    expected_sha256: str,
+) -> WriteResult:
+    """为未变化的笔记建立新文件名，遇到重名时使用冲突编号。zhw，2026-11-15 21:05:39。"""
+    resolved_root = _root(root)
+    old_target, old_relative = _resolve_target(resolved_root, old_relative_path, require_exists=True)
+    requested_target, requested_relative = _resolve_target(resolved_root, new_relative_path, require_exists=False)
+    if old_relative.casefold() == requested_relative.casefold():
+        return WriteResult(True, old_relative, None, None)
+    if len(expected_sha256) != 64 or any(character not in "0123456789abcdefABCDEF" for character in expected_sha256):
+        raise ValueError("缺少有效的原知识库文件校验信息，未重命名。")
+    expected = expected_sha256.casefold()
+    if old_target.stat().st_size > _MAX_NOTE_BYTES or _hash_bytes(old_target.read_bytes()) != expected:
+        return WriteResult(False, None, None, "原知识库文件已变化，未重命名。")
+
+    if requested_target.exists() and not requested_target.is_symlink():
+        is_previous_link = False
+        try:
+            is_previous_link = os.path.samefile(old_target, requested_target) and _hash_bytes(requested_target.read_bytes()) == expected
+        except OSError:
+            is_previous_link = False
+        if is_previous_link:
+            return WriteResult(True, requested_relative, None, None)
+
+    candidate_relative = requested_relative
+    conflict = requested_target.exists()
+    if conflict:
+        candidate_relative = _next_conflict_path(requested_target, requested_relative)
+    for _ in range(100):
+        candidate_target, candidate_relative = _resolve_target(resolved_root, candidate_relative, require_exists=False)
+        try:
+            # zhw 2026-11-15 21:05:39：使用独占硬链接创建新名称，确保不会覆盖同名笔记。
+            os.link(old_target, candidate_target)
+        except FileExistsError:
+            candidate_relative = _next_conflict_path(requested_target, requested_relative)
+            conflict = True
+            continue
+        except OSError:
+            return WriteResult(False, None, None, "当前文件系统无法安全重命名；知识库内容已更新，文件名保持不变。")
+
+        try:
+            if not os.path.samefile(old_target, candidate_target) or _hash_bytes(candidate_target.read_bytes()) != expected:
+                if os.path.samefile(old_target, candidate_target):
+                    candidate_target.unlink()
+                return WriteResult(False, None, None, "原知识库文件在重命名时发生变化，文件名保持不变。")
+        except OSError:
+            cleanup_failed = False
+            try:
+                if os.path.samefile(old_target, candidate_target):
+                    candidate_target.unlink()
+            except OSError:
+                cleanup_failed = True
+            if cleanup_failed:
+                return WriteResult(False, None, None, f"无法确认新旧文件关联，新旧文件均保留（新文件：{candidate_relative}）。")
+            return WriteResult(False, None, None, "无法确认新旧知识库文件关联，文件名保持不变。")
+        reason = f"新标题对应的文件名已存在，已改用「{candidate_relative}」。" if conflict else None
+        return WriteResult(True, candidate_relative, None, reason)
+    return WriteResult(False, None, None, "新标题对应的文件名持续冲突，文件名保持不变。")
+
+
+def remove_vault_note_alias_if_unchanged(
+    root: Path,
+    old_relative_path: str,
+    new_relative_path: str,
+    expected_sha256: str,
+) -> bool:
+    """删除已转移关联的旧名称，且只删仍指向同一未变化文件的硬链接。zhw，2026-11-15 21:05:39。"""
+    try:
+        resolved_root = _root(root)
+        old_target, _ = _resolve_target(resolved_root, old_relative_path, require_exists=True)
+        new_target, _ = _resolve_target(resolved_root, new_relative_path, require_exists=True)
+        if (
+            os.path.samefile(old_target, new_target)
+            and old_target.stat().st_size <= _MAX_NOTE_BYTES
+            and _hash_bytes(old_target.read_bytes()) == expected_sha256.casefold()
+        ):
+            old_target.unlink()
+            return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return False
+
+
 def _root(root: Path) -> Path:
     candidate = Path(root)
     if candidate.is_symlink() or not candidate.is_dir():

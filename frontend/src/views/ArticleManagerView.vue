@@ -63,6 +63,13 @@ function errorMessage(cause: unknown): string {
   return cause instanceof ApiError ? cause.message : '文章管理请求失败，请稍后重试。'
 }
 
+function sourceLabel(item: ArticleListItem): string {
+  if (item.source_kind === 'pasted_script') return '手动输入文案'
+  if (item.source_title) return item.source_title
+  if (item.source_kind === 'final_script') return '口播稿定稿'
+  return '手动新建'
+}
+
 let requestSequence = 0
 
 async function load(page = currentPage.value, requestedPageSize = pageSize.value): Promise<void> {
@@ -297,8 +304,8 @@ onActivated(() => { void load(currentPage.value) })
               <span class="article-version">v{{ row.version }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="来源口播稿" min-width="180">
-            <template #default="{ row }"><span class="article-source-title">{{ row.source_title || '手动新建' }}</span><span class="article-summary">{{ row.summary || '暂无摘要' }}</span></template>
+          <el-table-column label="来源" min-width="180">
+            <template #default="{ row }"><span class="article-source-title">{{ sourceLabel(row as ArticleListItem) }}</span><span class="article-summary">{{ row.summary || '暂无摘要' }}</span></template>
           </el-table-column>
           <el-table-column label="平台状态" min-width="150">
             <template #default="{ row }">

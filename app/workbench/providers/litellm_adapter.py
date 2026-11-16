@@ -114,14 +114,10 @@ class LiteLLMModelProvider:
             usage=UsageUnits(audio_seconds=None),
         )
 
-    def analyze_text(self, prompt: str, text: str, model_id: str) -> TextResponse:
-        response = self._completion(
-            model_id,
-            [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ],
-        )
+    def analyze_text(self, prompt: str, text: str, model_id: str, *, max_output_tokens: int | None = None) -> TextResponse:
+        messages = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+        response = (self._completion(model_id, messages) if max_output_tokens is None else
+                    self._completion(model_id, messages, max_output_tokens=max_output_tokens))
         return TextResponse(
             text=_response_text(response),
             request_id=_string_field(response, "id"),
@@ -195,7 +191,7 @@ class LiteLLMModelProvider:
         del model_id
         return None
 
-    def _completion(self, model_id: str, messages: list[dict[str, object]]):
+    def _completion(self, model_id: str, messages: list[dict[str, object]], *, max_output_tokens: int | None = None):
         capability = self.get_model_capability(model_id)
         if capability is not None and not capability.supports("text"):
             raise ProviderCapabilityError()
@@ -212,6 +208,10 @@ class LiteLLMModelProvider:
             "timeout": self._timeout_seconds,
             "num_retries": 0,
         }
+        if max_output_tokens is not None:
+            if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
+                raise ProviderInputError()
+            kwargs["max_tokens"] = max_output_tokens
         if self._base_url:
             kwargs["api_base"] = self._base_url
         if self._request_id:

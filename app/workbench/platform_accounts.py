@@ -310,7 +310,7 @@ class PlatformAccountManager:
             status["message"] = f"已打开{definition['name']}工作台；平台可能仍要求重新登录。"
         return status
 
-    def cookies(self, platform: str) -> list[dict[str, object]]:
+    def cookies(self, platform: str, *, collection_access: bool = False) -> list[dict[str, object]]:
         self._platform(platform)
         window = self._get_open_window(platform)
         if window is not None:
@@ -322,7 +322,8 @@ class PlatformAccountManager:
                 raise PlatformAccountError(command.error)
             raw = command.result if isinstance(command.result, list) else []
         else:
-            raw = self._load_profile_cookies(platform)
+            raw = (self._load_profile_cookies(platform, collection_access=True)
+                   if collection_access else self._load_profile_cookies(platform))
         return [
             cookie for cookie in raw
             if self._cookie_matches_platform(platform, cookie) and not self._cookie_is_expired(cookie)
@@ -333,11 +334,12 @@ class PlatformAccountManager:
         platform: str,
         account_id: str | None = None,
         database: Database | None = None,
+        *, collection_access: bool = False,
     ) -> list[dict[str, object]]:
         if account_id:
             _account, cookies = resolve_video_publish_account(database or Database(), platform, account_id)
             return cookies
-        cookies = self.cookies(platform)
+        cookies = self.cookies(platform, collection_access=True) if collection_access else self.cookies(platform)
         if not self._has_auth_cookie(platform, cookies):
             raise PlatformAccountError("未检测到该平台的登录会话；请先在账号管理的“视频发布”中登录并刷新状态。")
         return cookies
@@ -532,14 +534,15 @@ class PlatformAccountManager:
                     pass
             self._forget_window(window)
 
-    def _load_profile_cookies(self, platform: str) -> list[dict[str, object]]:
+    def _load_profile_cookies(self, platform: str, *, collection_access: bool = False) -> list[dict[str, object]]:
         profile_path = self._profile_path(platform)
         if not profile_path.is_dir() or not any(profile_path.iterdir()):
             return []
-        try:
-            require_safe_browser("platform account session")
-        except BrowserSafetyError as exc:
-            raise PlatformAccountError(str(exc)) from exc
+        if not collection_access:
+            try:
+                require_safe_browser("platform account session")
+            except BrowserSafetyError as exc:
+                raise PlatformAccountError(str(exc)) from exc
         try:
             from playwright.sync_api import sync_playwright
 

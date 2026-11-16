@@ -2,9 +2,73 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 import requests
+
+
+def fetch_bilibili_publish_status(cookies: dict[str, str], target: dict[str, object]) -> dict[str, object]:
+    unknown = {"status": "unknown", "message": "无法唯一核实 B 站稿件，请稍后重试。"}
+    try:
+        started = int(datetime.fromisoformat(str(target["started_at"])).timestamp())
+        title = str(target["effective_title"]).strip()
+        if not title or not cookies.get("SESSDATA"):
+            return unknown
+        archives: list[dict] = []
+        count = None
+        for page in range(1, 11):
+            response = requests.get(
+                "https://member.bilibili.com/x/web/archives",
+                params={"status": "is_pubing,pubed,not_pubed", "pn": page, "ps": 50, "coop": 1},
+                cookies=cookies,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://member.bilibili.com/"},
+                timeout=10, allow_redirects=False,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload["data"]
+            current_count = data["page"]["count"]
+            items = data["arc_audits"]
+            if payload.get("code") != 0 or type(current_count) is not int or current_count < 0 or current_count > 500 or not isinstance(items, list):
+                return unknown
+            if count is not None and current_count != count:
+                return unknown
+            count = current_count
+            if len(items) != min(50, max(0, count - len(archives))):
+                return unknown
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("Archive"), dict):
+                    return unknown
+                archive = item["Archive"]
+                if not isinstance(archive.get("title"), str) or type(archive.get("ctime")) is not int or not re.fullmatch(r"BV[A-Za-z0-9]{10}", str(archive.get("bvid") or "")):
+                    return unknown
+                archives.append(archive)
+            if len(archives) == count:
+                break
+        else:
+            return unknown
+        remote_id = target.get("remote_id")
+        candidates = [item for item in archives if (item["bvid"] == remote_id if remote_id else
+                      item["title"].strip() == title and started - 30 <= item["ctime"] <= started + 7200)]
+        if len(candidates) != 1:
+            return unknown
+        item = candidates[0]
+        description = item.get("state_desc")
+        if item.get("is_only_self") == 1 or item.get("no_public") == 1:
+            status, message = "private", "B 站稿件当前为非公开状态。"
+        elif item.get("state") == 0 and description == "开放浏览" and item.get("is_only_self") == 0 and item.get("no_public") == 0:
+            status, message = "published", "B 站稿件管理显示开放浏览。"
+        elif isinstance(description, str) and ("审核中" in description or "待审核" in description):
+            status, message = "reviewing", "B 站稿件审核中。"
+        elif isinstance(description, str) and ("未通过" in description or "退回" in description):
+            status, message = "rejected", "B 站稿件审核未通过，请到创作中心查看原因。"
+        else:
+            status, message = "present", "已找到 B 站稿件，具体发布状态待确认。"
+        return {"status": status, "remote_id": item["bvid"], "message": message}
+    except (OSError, KeyError, TypeError, ValueError, AttributeError, requests.RequestException):
+        return unknown
 
 
 def _cookies(account_file: Path) -> dict[str, str]:

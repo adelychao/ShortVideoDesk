@@ -16,6 +16,7 @@ from .database import Database, PROJECT_ROOT
 from .providers.registry import get_provider_preset
 from .prompts import DEFAULT_KNOWLEDGE_CARD_PROMPT
 from .script_styles import default_script_style_templates, normalize_script_style_templates
+from .comment_analysis_settings import CommentAnalysisOptionsRequest
 
 
 IMAGE_DIRECTORY_DEFAULTS = {
@@ -26,6 +27,7 @@ SETTING_KEYS = (
     "archive_root",
     "obsidian_reference_root",
     "obsidian_output_root",
+    "obsidian_output_directories",
     "model_provider",
     "model_id",
     "asr_model_id",
@@ -34,6 +36,7 @@ SETTING_KEYS = (
     "local_asr_device",
     "knowledge_card_prompt",
     "script_style_templates",
+    "comment_analysis_options",
     "video_publish_auto_cleanup_enabled",
     "video_publish_retention_days",
     *IMAGE_DIRECTORY_DEFAULTS,
@@ -42,6 +45,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "archive_root": None,
     "obsidian_reference_root": None,
     "obsidian_output_root": None,
+    "obsidian_output_directories": [],
     "model_provider": "zhipu",
     "model_id": "glm-5.3-flash",
     "asr_model_id": "glm-asr-2512",
@@ -50,6 +54,7 @@ DEFAULT_SETTINGS: dict[str, object] = {
     "local_asr_device": "auto",
     "knowledge_card_prompt": DEFAULT_KNOWLEDGE_CARD_PROMPT,
     "script_style_templates": default_script_style_templates(),
+    "comment_analysis_options": CommentAnalysisOptionsRequest().model_dump(),
     "video_publish_auto_cleanup_enabled": True,
     "video_publish_retention_days": 15,
     **{key: str(path) for key, path in IMAGE_DIRECTORY_DEFAULTS.items()},
@@ -97,6 +102,15 @@ class AppConfig:
                 values[key] = str(_validated_local_path(raw))
             except ValueError:
                 values[key] = None
+        # The output library list is the source of truth; a legacy single root
+        # seeds it once so upgrades keep the user's configured directory. Once
+        # the list key exists in the database (even as an empty list) it wins.
+        has_directory_list_row = any(str(row["key"]) == "obsidian_output_directories" for row in rows)
+        directories = _lenient_output_directories(values["obsidian_output_directories"])
+        if not directories and not has_directory_list_row and isinstance(values["obsidian_output_root"], str):
+            directories = [{"name": _LEGACY_OUTPUT_LIBRARY_NAME, "directory": values["obsidian_output_root"]}]
+        values["obsidian_output_directories"] = directories
+        values["obsidian_output_root"] = directories[0]["directory"] if directories else None
         for key, default in IMAGE_DIRECTORY_DEFAULTS.items():
             raw = values[key]
             if isinstance(raw, str) and raw.strip():
@@ -148,6 +162,10 @@ class AppConfig:
         except ValueError:
             # Malformed historical values should fall back to editable defaults.
             values["script_style_templates"] = default_script_style_templates()
+        try:
+            values["comment_analysis_options"] = CommentAnalysisOptionsRequest.model_validate(values["comment_analysis_options"]).model_dump()
+        except ValueError:
+            values["comment_analysis_options"] = CommentAnalysisOptionsRequest().model_dump()
         return values
 
     def get_directory_conflicts(self) -> list[dict[str, str]]:
@@ -171,7 +189,6 @@ class AppConfig:
         path_modes = {
             "archive_root": (True, True),
             "obsidian_reference_root": (False, False),
-            "obsidian_output_root": (True, True),
         }
         for key, (create_missing, writable) in path_modes.items():
             raw = current[key]
@@ -183,6 +200,29 @@ class AppConfig:
             normalized[key] = str(
                 validate_directory(raw, create_missing=create_missing, writable=writable)
             )
+
+        # The library list is the source of truth for vault output. Legacy
+        # clients that only know the single root field rewrite the whole list
+        # with that one entry, matching what their UI can express.
+        previous_directories = _lenient_output_directories(previous.get("obsidian_output_directories"))
+        if "obsidian_output_directories" in values and values["obsidian_output_directories"] is not None:
+            raw_directories = values["obsidian_output_directories"]
+        elif "obsidian_output_root" in values:
+            legacy_root = values["obsidian_output_root"]
+            if legacy_root is None or (isinstance(legacy_root, str) and not legacy_root.strip()):
+                raw_directories = []
+            else:
+                raw_directories = [{
+                    "name": previous_directories[0]["name"] if previous_directories else _LEGACY_OUTPUT_LIBRARY_NAME,
+                    "directory": legacy_root,
+                }]
+        else:
+            raw_directories = previous_directories
+        normalized["obsidian_output_directories"] = _validated_output_directories(raw_directories)
+        normalized["obsidian_output_root"] = (
+            normalized["obsidian_output_directories"][0]["directory"]
+            if normalized["obsidian_output_directories"] else None
+        )
 
         for key, default in IMAGE_DIRECTORY_DEFAULTS.items():
             raw = current[key]
@@ -244,6 +284,7 @@ class AppConfig:
         normalized["knowledge_card_prompt"] = prompt.strip() or DEFAULT_KNOWLEDGE_CARD_PROMPT
 
         normalized["script_style_templates"] = normalize_script_style_templates(current["script_style_templates"])
+        normalized["comment_analysis_options"] = CommentAnalysisOptionsRequest.model_validate(current["comment_analysis_options"]).model_dump()
 
         conflicts = _directory_conflicts(normalized)
         now = datetime.now(timezone.utc).isoformat()
@@ -258,6 +299,79 @@ class AppConfig:
                 )
         normalized["directory_conflicts"] = conflicts
         return normalized
+
+
+_LEGACY_OUTPUT_LIBRARY_NAME = "默认知识库"
+_MAX_OUTPUT_DIRECTORIES = 20
+
+
+def _lenient_output_directories(raw: object) -> list[dict[str, str]]:
+    """Best-effort cleanup for stored values; malformed entries are dropped."""
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    seen_directories: set[str] = set()
+    for item in raw[:_MAX_OUTPUT_DIRECTORIES]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        directory = item.get("directory")
+        if not isinstance(name, str) or not isinstance(directory, str):
+            continue
+        name = name.strip()
+        if not name or len(name) > 64:
+            continue
+        try:
+            resolved = _validated_local_path(directory)
+        except ValueError:
+            continue
+        directory = str(resolved)
+        name_key = name.casefold()
+        directory_key = os.path.normcase(directory)
+        if name_key in seen_names or directory_key in seen_directories:
+            continue
+        seen_names.add(name_key)
+        seen_directories.add(directory_key)
+        entries.append({"name": name, "directory": directory})
+    return entries
+
+
+def _validated_output_directories(raw: object) -> list[dict[str, str]]:
+    """Strict validation used when saving; raises ValueError on problems."""
+    if not isinstance(raw, list):
+        raise ValueError("知识库输出目录配置无效。")
+    if len(raw) > _MAX_OUTPUT_DIRECTORIES:
+        raise ValueError(f"最多支持 {_MAX_OUTPUT_DIRECTORIES} 个知识库输出目录。")
+    entries: list[dict[str, str]] = []
+    seen_names: dict[str, str] = {}
+    seen_directories: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("知识库输出目录配置无效。")
+        name = item.get("name")
+        directory = item.get("directory")
+        if not isinstance(name, str) or not (name := name.strip()) or len(name) > 64:
+            raise ValueError("请为每个知识库目录填写 1 到 64 个字符的名称。")
+        if not isinstance(directory, str) or not directory.strip():
+            raise ValueError(f"请为知识库「{name}」选择输出目录。")
+        name_key = name.casefold()
+        if name_key in seen_names:
+            raise ValueError(f"知识库名称「{name}」与「{seen_names[name_key]}」重复，请换一个名称。")
+        try:
+            resolved = validate_directory(directory, create_missing=True, writable=True)
+        except ValueError as exc:
+            raise ValueError(f"知识库「{name}」：{exc}") from exc
+        directory = str(resolved)
+        directory_key = os.path.normcase(directory)
+        if directory_key in seen_directories:
+            raise ValueError(
+                f"知识库「{name}」与「{seen_directories[directory_key]}」使用了同一个输出目录，请分开目录。"
+            )
+        seen_names[name_key] = name
+        seen_directories[directory_key] = name
+        entries.append({"name": name, "directory": directory})
+    return entries
 
 
 def _validated_local_path(value: str | Path) -> Path:
@@ -366,26 +480,40 @@ def _validate_model_base_url(value: object) -> str | None:
 def _directory_conflicts(values: dict[str, object]) -> list[dict[str, str]]:
     paths: dict[str, Path] = {}
     for key, value in values.items():
-        if key not in {"archive_root", "obsidian_reference_root", "obsidian_output_root"} or not isinstance(value, str):
+        if key not in {"archive_root", "obsidian_reference_root"} or not isinstance(value, str):
             continue
         try:
             paths[key] = Path(value).resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             continue
+    outputs: list[tuple[str, Path]] = []
+    raw_entries = values.get("obsidian_output_directories")
+    if isinstance(raw_entries, list):
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            name, directory = item.get("name"), item.get("directory")
+            if not isinstance(name, str) or not isinstance(directory, str):
+                continue
+            try:
+                outputs.append((name, Path(directory).resolve(strict=False)))
+            except (OSError, RuntimeError, ValueError):
+                continue
     conflicts: list[dict[str, str]] = []
     reference = paths.get("obsidian_reference_root")
-    output = paths.get("obsidian_output_root")
     archive = paths.get("archive_root")
-    if reference is not None and output is not None and reference == output:
-        conflicts.append({"code": "reference_equals_output", "message": "知识库参考目录与输出目录相同。"})
-    if archive is not None and output is not None:
+    for name, output in outputs:
+        if reference is not None and reference == output:
+            conflicts.append({"code": "reference_equals_output", "message": f"知识库参考目录与输出目录「{name}」相同。"})
+        if archive is None:
+            continue
         try:
             output.relative_to(archive)
-            conflicts.append({"code": "output_inside_archive", "message": "知识库输出目录位于媒体归档目录内。"})
+            conflicts.append({"code": "output_inside_archive", "message": f"知识库输出目录「{name}」位于媒体归档目录内。"})
         except ValueError:
             try:
                 archive.relative_to(output)
-                conflicts.append({"code": "archive_inside_output", "message": "媒体归档目录位于知识库输出目录内。"})
+                conflicts.append({"code": "archive_inside_output", "message": f"媒体归档目录位于知识库输出目录「{name}」内。"})
             except ValueError:
                 pass
     return conflicts

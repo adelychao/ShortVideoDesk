@@ -83,7 +83,7 @@ def test_batch_preserves_each_platform_schedule_through_claim(tmp_path, monkeypa
     assert _claim_video_publish_target(db, targets["kuaishou"]["id"])["schedule_at"] == common.replace("T", " ")
 
 
-def test_retry_can_change_one_target_to_immediate_without_changing_batch(tmp_path):
+def test_retry_can_change_one_target_to_immediate_without_changing_batch(tmp_path, monkeypatch):
     db = Database(tmp_path / "test.sqlite")
     db.migrate()
     media = tmp_path / "video.mp4"
@@ -106,9 +106,7 @@ def test_retry_can_change_one_target_to_immediate_without_changing_batch(tmp_pat
         c.execute("UPDATE video_publish_batches SET schedule_at=? WHERE id='b'", (future,))
         c.execute("UPDATE video_publish_targets SET status='pending_review', created_at=? WHERE id='t'", (now,))
     manager = VideoPublishManager(db)
-    manager.start()
-    try:
-        assert manager._sync_thread is None
-        assert manager._queue.empty()
-    finally:
-        manager.stop()
+    monkeypatch.setattr("app.workbench.video_publishing.require_safe_browser", lambda reason: None)
+    monkeypatch.setattr("app.workbench.video_publishing.browser_automation_paused", lambda: False)
+    manager._schedule_status_sync_once()
+    assert manager._queue.get_nowait() == ("sync", "t")

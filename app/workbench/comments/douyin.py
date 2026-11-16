@@ -12,7 +12,6 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from ..models import CommentPage, SourceRecord
-from ...browser_safety import BrowserSafetyError, require_safe_browser
 from .base import CommentAdapterError, normalize_record
 
 
@@ -101,10 +100,6 @@ class DouyinCommentAdapter:
         media_id = source.source_id or ""
         if not _VIDEO_ID.fullmatch(media_id):
             raise CommentAdapterError("comments_source_id_missing", "评论采集需要完整的抖音作品链接。")
-        try:
-            require_safe_browser("douyin comments")
-        except BrowserSafetyError as exc:
-            raise CommentAdapterError("browser_safety_blocked", str(exc), retryable=False) from exc
         try:
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.chromium.launch(headless=True, timeout=20_000)

@@ -34,9 +34,16 @@ const emit = defineEmits<{
 }>()
 
 const busy = ref(false)
+const dragOver = ref(false)
+const dragUpload = ref(false)
+const uploadProgress = ref(0)
 const receipt = ref<UploadReceipt | null>(null)
 const error = ref('')
 const softLimit = 2 * 1024 ** 3
+const supportedMediaExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.mp3', '.m4a', '.wav'])
+// 与后端 video_publishing._VIDEO_SUFFIXES 保持一致：发布页只接受视频文件。
+const supportedVideoExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm'])
+let dragDepth = 0
 
 watch(() => props.restoredReceipt, (value) => {
   if (receipt.value?.uploadId === value?.uploadId) return
@@ -62,10 +69,10 @@ async function discardReceipt(prior: UploadReceipt): Promise<void> {
   await api.deleteUpload(prior.uploadId).catch(() => undefined)
 }
 
-async function applyReceipt(next: UploadReceipt): Promise<void> {
+async function applyReceipt(next: UploadReceipt, file?: File): Promise<void> {
   const prior = receipt.value
   receipt.value = next
-  emit('uploaded', next)
+  emit('uploaded', next, file)
   if (prior && prior.uploadId !== next.uploadId) await discardReceipt(prior)
 }
 
@@ -101,6 +108,95 @@ async function selectOriginalMedia(): Promise<void> {
   }
 }
 
+function onDragEnter(event: DragEvent): void {
+  event.preventDefault()
+  if (props.disabled || busy.value) {
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'none'
+    return
+  }
+  dragDepth += 1
+  dragOver.value = true
+}
+
+function onDragOver(event: DragEvent): void {
+  event.preventDefault()
+  if (props.disabled || busy.value) {
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'none'
+    return
+  }
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+}
+
+function onDragLeave(event: DragEvent): void {
+  event.preventDefault()
+  if (props.disabled || busy.value) {
+    dragDepth = 0
+    dragOver.value = false
+    return
+  }
+  dragDepth = Math.max(0, dragDepth - 1)
+  dragOver.value = dragDepth > 0
+}
+
+async function onDrop(event: DragEvent): Promise<void> {
+  event.preventDefault()
+  dragDepth = 0
+  dragOver.value = false
+  if (props.disabled || busy.value) return
+
+  const files = Array.from(event.dataTransfer?.files ?? [])
+  if (!files.length) return
+  if (files.length !== 1) {
+    error.value = props.publishTarget
+      ? '一次只能导入一个视频，请只拖入一个视频文件。'
+      : '一次只能导入一个文件，请只拖入一个视频或音频。'
+    return
+  }
+
+  const file = files[0]
+  const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+  if (props.publishTarget) {
+    if (!supportedVideoExtensions.has(extension)) {
+      error.value = '发布页仅支持视频文件，请拖入 MP4、MOV、MKV 或 WEBM。'
+      return
+    }
+  } else if (!supportedMediaExtensions.has(extension)) {
+    error.value = '文件格式不受支持。请选择 MP4、MOV、MKV、WEBM、MP3、M4A 或 WAV。'
+    return
+  }
+
+  busy.value = true
+  dragUpload.value = true
+  uploadProgress.value = 0
+  error.value = ''
+  emit('busyChange', true)
+  try {
+    let confirmOverLimit = false
+    if (file.size > softLimit) {
+      try {
+        await ElMessageBox.confirm(
+          `文件大小为 ${formatSize(file.size)}，超过 2 GB 软上限。文件会上传到本机暂存区，原文件不会被移动或删除。确定继续吗？`,
+          '确认上传大文件',
+          { confirmButtonText: '继续上传', cancelButtonText: '取消', type: 'warning', distinguishCancelAndClose: true },
+        )
+      } catch {
+        return
+      }
+      confirmOverLimit = true
+    }
+    const next = await api.uploadMedia(file, confirmOverLimit, (percent) => {
+      uploadProgress.value = percent
+    })
+    await applyReceipt(next, file)
+  } catch (cause) {
+    error.value = safeError(cause)
+  } finally {
+    busy.value = false
+    dragUpload.value = false
+    emit('busyChange', false)
+  }
+}
+
 function onKeydown(event: KeyboardEvent): void {
   if (props.disabled || busy.value) return
   if (event.key === 'Enter' || event.key === ' ') {
@@ -125,15 +221,22 @@ watch(() => props.resetToken, () => {
 </script>
 
 <template>
-  <div class="local-upload" :class="{ 'is-large': large, 'is-compact': compact && receipt?.detectedMediaType === 'video' }">
+  <div
+    class="local-upload"
+    :class="{ 'is-large': large, 'is-compact': compact && receipt?.detectedMediaType === 'video' }"
+    @dragenter="onDragEnter"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
+    @drop="onDrop"
+  >
     <template v-if="publishTarget">
-      <div v-if="receipt?.detectedMediaType === 'video'" class="local-upload-compact-card">
+      <div v-if="receipt?.detectedMediaType === 'video'" class="local-upload-compact-card" :class="{ 'is-dragover': dragOver && !disabled && !busy }">
         <figure class="local-upload-thumbnail">
           <img v-if="preview" :src="preview" alt="视频首帧预览" />
           <span v-else>{{ previewState === 'error' ? '首帧暂不可用' : '正在提取首帧…' }}</span>
         </figure>
         <div class="local-upload-compact-copy">
-          <span class="local-upload-status"><i aria-hidden="true">✓</i>已关联本机原创视频</span>
+          <span class="local-upload-status"><i aria-hidden="true">✓</i>{{ receipt.sourceType === 'local' ? '已关联本机原创视频' : '已上传视频副本' }}</span>
           <strong :title="receipt.sourcePath || receipt.filename">{{ receipt.filename }}</strong>
           <small>{{ formatSize(receipt.sizeBytes) }} · 视频格式<span v-if="details"> · {{ details }}</span></small>
         </div>
@@ -142,27 +245,27 @@ watch(() => props.resetToken, () => {
           <ElButton text class="text-button" :disabled="disabled || busy" @click="forgetReceipt">移除视频</ElButton>
         </div>
       </div>
-      <div v-else class="local-upload-zone" :class="{ 'is-disabled': disabled || busy }" @click="selectOriginalMedia">
+      <div v-else class="local-upload-zone" :class="{ 'is-disabled': disabled || busy, 'is-dragover': dragOver && !disabled && !busy }" @click="selectOriginalMedia">
         <span class="local-upload-icon" aria-hidden="true">↥</span>
-        <span class="local-upload-copy"><strong>{{ busy ? '正在读取视频…' : '选择本机原创视频' }}</strong><small>支持 MP4、MOV、MKV、WEBM；文件大小和时长要求以所选发布平台为准。发布前请保持原文件路径和内容不变。</small></span>
+        <span class="local-upload-copy"><strong>{{ busy ? (dragUpload ? `正在上传视频副本… ${uploadProgress}%` : '正在读取视频…') : dragOver ? '松开鼠标导入视频' : '选择本机原创视频' }}</strong><small>支持 MP4、MOV、MKV、WEBM；可点击选择，也可把视频文件直接拖入此处。文件大小和时长要求以所选发布平台为准。</small></span>
         <ElButton class="button button-secondary button-small" :disabled="disabled || busy" @click.stop="selectOriginalMedia">选择视频</ElButton>
       </div>
-      <p v-if="!receipt" class="field-note">选择后直接使用原视频，不会复制或移动原文件。</p>
+      <p v-if="!receipt" class="field-note">点击选择直接使用原视频，不会复制或移动原文件；拖入的视频会上传副本到本机暂存区，发布任务使用该副本。</p>
     </template>
     <div
       v-else
       class="local-upload-zone"
-      :class="{ 'is-disabled': disabled || busy }"
+      :class="{ 'is-disabled': disabled || busy, 'is-dragover': dragOver && !disabled && !busy }"
       role="button"
       tabindex="0"
-      :aria-label="receipt ? '更换本地媒体文件' : '选择本地媒体文件'"
+      :aria-label="receipt ? '更换本地媒体文件' : '拖放或选择本地媒体文件'"
       @click="selectOriginalMedia"
       @keydown="onKeydown"
     >
       <span class="local-upload-icon" aria-hidden="true">↥</span>
       <span class="local-upload-copy">
-        <strong>{{ busy ? '正在校验所选文件…' : receipt ? `${receipt.detectedMediaType === 'audio' ? '音频' : '视频'}已选择并通过格式校验` : '点击选择本机媒体文件' }}</strong>
-        <small>支持 MP4、MOV、MKV、WEBM、MP3、M4A、WAV；直接使用原文件，不会复制或移动；创建处理任务时校验后的副本写入归档目录。</small>
+        <strong aria-live="polite">{{ dragOver ? '松开鼠标以导入文件' : dragUpload ? `正在上传到本机暂存区… ${uploadProgress}%` : busy ? '正在校验所选文件…' : receipt ? `${receipt.detectedMediaType === 'audio' ? '音频' : '视频'}已选择并通过格式校验` : '点击选择或拖入本机媒体文件' }}</strong>
+        <small>支持 MP4、MOV、MKV、WEBM、MP3、M4A、WAV。点击选择会登记原文件路径；拖入会上传到本机暂存区。两种方式都不会移动或删除原文件，创建任务时校验后的副本写入归档目录。</small>
       </span>
       <ElButton class="button button-secondary button-small" native-type="button" :disabled="disabled || busy" @click.stop="selectOriginalMedia">
         {{ busy ? '校验中…' : receipt ? '更换文件' : '选择文件' }}
@@ -182,6 +285,7 @@ watch(() => props.resetToken, () => {
 .local-upload { display: grid; gap: 10px; }
 .local-upload-zone { display: flex; align-items: center; gap: 14px; min-height: 92px; padding: 16px; border: 1px dashed var(--line); border-radius: 12px; background: var(--paper-2); cursor: pointer; transition: border-color .18s ease, background .18s ease; }
 .local-upload-zone:hover { border-color: var(--pine); background: var(--pine-soft); }
+.local-upload-zone.is-dragover { border-style: solid; border-color: var(--pine); background: var(--pine-soft); }
 .local-upload-zone.is-disabled { opacity: .65; cursor: not-allowed; }
 .local-upload-icon { display: grid; width: 40px; height: 40px; place-items: center; flex: 0 0 auto; border-radius: 11px; background: var(--pine-soft); color: var(--pine); font-size: 24px; }
 .local-upload-copy { display: grid; gap: 5px; flex: 1; min-width: 0; }
@@ -190,6 +294,7 @@ watch(() => props.resetToken, () => {
 .local-upload-receipt { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 9px; background: var(--paper-2); color: var(--muted); font-size: var(--fs-body-sm); }
 .local-upload-receipt strong { color: var(--ink); }
 .local-upload-compact-card { display: grid; grid-template-columns: 58px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 96px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; transition: border-color .18s ease, background .18s ease; }
+.local-upload-compact-card.is-dragover { border-color: var(--pine); background: var(--pine-soft); }
 .local-upload-thumbnail { position: relative; display: grid; width: 58px; height: 74px; place-items: center; overflow: hidden; margin: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--paper-2); }
 .local-upload-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
 .local-upload-thumbnail > span { padding: 4px; color: var(--muted); font-size: var(--fs-caption); line-height: 1.3; text-align: center; }

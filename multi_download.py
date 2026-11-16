@@ -60,8 +60,6 @@ def info_for_xhs(note):
 
 
 def probe_public_page(source):
-    from app.browser_safety import require_safe_browser
-    require_safe_browser("public page probe")
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="chrome", headless=True, timeout=15_000)

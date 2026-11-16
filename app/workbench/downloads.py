@@ -113,7 +113,9 @@ def download_source(
                     initial_source.platform, account_id=account_id, database=database
                 )
             else:
-                browser_cookies = account_manager.require_authenticated_cookies(initial_source.platform)
+                browser_cookies = account_manager.require_authenticated_cookies(
+                    initial_source.platform, collection_access=True
+                )
         except PlatformAccountError as exc:
             raise DownloadIssue(str(exc), "platform_account_required") from exc
     elif access_mode != "anonymous":

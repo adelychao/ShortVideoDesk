@@ -2,7 +2,7 @@
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ApiError, api } from '../api/client'
-import type { CommentCollectionState, TaskArtifact, TaskDetail, TaskStep, TranscriptComparisonData, VaultPreview } from '../api/types'
+import type { CommentAnalysisOptions, CommentCollectionState, ObsidianOutputDirectory, TaskArtifact, TaskDetail, TaskStep, TranscriptComparisonData, VaultPreview } from '../api/types'
 import ArtifactViewer from '../components/ArtifactViewer.vue'
 import TaskSteps from '../components/TaskSteps.vue'
 import CommentList from '../components/CommentList.vue'
@@ -31,6 +31,20 @@ const titleExpanded = ref(false)
 const descriptionExpanded = ref(false)
 const activeDetailTab = ref<DetailTab>('files')
 const commentState = ref<CommentCollectionState | null>(null)
+const commentArtifact = computed(() => (detail.value?.artifacts ?? []).filter(item => item.kind === 'note' && item.metadata.scope === 'comments').sort((a, b) => b.created_at.localeCompare(a.created_at) || b.version - a.version)[0])
+const collectedCommentCount = computed(() => {
+  const value = commentArtifact.value?.metadata.collected_count
+  return typeof value === 'number' && Number.isFinite(value) ? value : (commentState.value?.collected_count ?? 0)
+})
+const commentAnalysisStep = computed(() => [...(detail.value?.task.steps ?? [])].reverse().find(step => step.kind === 'analyze_comments'))
+const hasCommentAnalysis = computed(() => (detail.value?.artifacts ?? []).some(item => item.kind === 'comment_analysis_json'))
+const commentAnalysisRevision = computed(() => (detail.value?.artifacts ?? []).filter(item => item.kind === 'comment_analysis_json').sort((a, b) => b.created_at.localeCompare(a.created_at) || b.version - a.version)[0]?.id ?? '')
+const commentSourceUrl = computed(() => {
+  const asset = detail.value?.asset
+  if (asset?.platform === 'douyin' && /^\d{1,30}$/.test(asset.source_id ?? '')) return 'https://www.douyin.com/video/' + asset.source_id
+  if (asset?.platform === 'bilibili' && /^BV[0-9A-Za-z]{10}$/.test(asset.source_id ?? '')) return 'https://www.bilibili.com/video/' + asset.source_id
+  return ''
+})
 const loading = ref(false)
 const actionBusy = ref(false)
 const error = ref('')
@@ -68,6 +82,8 @@ const vaultTargetPath = ref('')
 const vaultPreview = ref<VaultPreview | null>(null)
 const vaultBusy = ref(false)
 const vaultMessage = ref('')
+const vaultLibraries = ref<ObsidianOutputDirectory[]>([])
+const vaultLibraryName = ref('')
 const scriptEditor = ref<InstanceType<typeof ScriptEditor> | null>(null)
 const scriptRegenerationTarget = ref<HTMLElement | null>(null)
 const knowledgeEditor = ref<InstanceType<typeof KnowledgeCardReview> | null>(null)
@@ -782,6 +798,26 @@ async function retryStep(
   }
 }
 
+async function startCommentAnalysis(options: CommentAnalysisOptions, previewRevision: string): Promise<void> {
+  if (!detail.value || actionBusy.value) return
+  const id = detail.value.task.id
+  const sequence = ++requestSequence
+  if (pollTimer) clearTimeout(pollTimer)
+  actionBusy.value = true
+  actionError.value = ''
+  try {
+    await api.startCommentAnalysis(id, true, options, previewRevision)
+    const result = await api.getTask(id)
+    if (sequence !== requestSequence || id !== taskId.value) return
+    detail.value = result
+    schedulePoll()
+  } catch (cause) {
+    if (sequence === requestSequence && id === taskId.value) actionError.value = safeError(cause)
+  } finally {
+    if (sequence === requestSequence && id === taskId.value) actionBusy.value = false
+  }
+}
+
 
 async function authorizeCommentAnalysis(stepId: string, artifactId: string): Promise<void> {
   if (!detail.value || actionBusy.value) return
@@ -1058,7 +1094,11 @@ async function previewVaultArtifact(): Promise<void> {
   vaultMessage.value = ''
   vaultPreview.value = null
   try {
-    vaultPreview.value = await api.previewVaultWrite(selectedVaultArtifact.value, vaultTargetPath.value.trim())
+    vaultPreview.value = await api.previewVaultWrite(
+      selectedVaultArtifact.value,
+      vaultTargetPath.value.trim(),
+      vaultLibraryName.value || null,
+    )
     if (vaultPreview.value.conflict && vaultPreview.value.suggested_path) {
       vaultMessage.value = '目标文件已存在且内容不同；工作台不会覆盖。可以使用建议路径另存。'
     } else if (vaultPreview.value.exists) {
@@ -1084,9 +1124,10 @@ async function saveVaultArtifact(): Promise<void> {
       selectedVaultArtifact.value,
       preview.target_path,
       preview.exists ? preview.current_sha256 : null,
+      vaultLibraryName.value || null,
     )
     if (result.written) {
-      vaultMessage.value = `已写入：${result.path}`
+      vaultMessage.value = result.library_name ? `已写入「${result.library_name}」：${result.path}` : `已写入：${result.path}`
       vaultPreview.value = null
     } else {
       vaultMessage.value = `${result.reason ?? '未写入。'} 建议另存为：${result.conflict_path ?? '请更换目标路径'}`
@@ -1176,7 +1217,24 @@ watch(vaultArtifacts, (items) => {
       .replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 100)
     vaultTargetPath.value = `${base}.md`
   }
+  if (items.length) void loadVaultLibraries()
 }, { immediate: true })
+
+async function loadVaultLibraries(): Promise<void> {
+  try {
+    const configured = await api.getConfig()
+    vaultLibraries.value = configured.settings.obsidian_output_directories ?? []
+    if (!vaultLibraries.value.some((library) => library.name === vaultLibraryName.value)) {
+      vaultLibraryName.value = vaultLibraries.value[0]?.name ?? ''
+    }
+  } catch {
+    // 读取设置失败时保持为空；写入预览会返回更明确的错误。
+  }
+}
+
+function handleVaultLibraryChange(): void {
+  vaultPreview.value = null
+}
 onActivated(resumeTab)
 onDeactivated(pauseTab)
 onBeforeUnmount(pauseTab)
@@ -1226,7 +1284,7 @@ onBeforeUnmount(pauseTab)
         <div class="detail-main">
       <section class="task-detail-progress" :class="{ 'has-attention': taskNeedsAttention }" aria-labelledby="detail-progress-title">
         <div class="task-progress-metric">
-          <span id="detail-progress-title">任务进度</span>
+          <span id="detail-progress-title">步骤完成进度</span>
           <strong>{{ taskProgressPercent }}%</strong>
         </div>
         <div class="task-progress-main">
@@ -1237,7 +1295,7 @@ onBeforeUnmount(pauseTab)
               <span class="task-progress-state-copy">
                 <span class="task-progress-state-heading">
                   <strong>{{ detail.task.status === 'completed' ? '全部步骤已完成' : currentStepLabel }}</strong>
-                  <span v-if="taskDurationLabel" class="task-progress-state-duration">{{ detail.task.status === 'completed' ? '用时：' : '执行时长：' }}{{ taskDurationLabel }}</span>
+                  <span v-if="taskDurationLabel" class="task-progress-state-duration">任务总历时：{{ taskDurationLabel }}</span>
                 </span>
                 <span v-if="detail.task.status === 'completed'">暂无运行步骤</span>
                 <span v-else-if="taskNeedsAttention">请检查步骤与停止原因</span>
@@ -1433,8 +1491,9 @@ onBeforeUnmount(pauseTab)
           </div>
 
           <div id="detail-panel-comments" v-show="activeDetailTab === 'comments'" class="detail-tab-stack" role="tabpanel" aria-labelledby="detail-tab-comments" tabindex="0">
-            <CommentList v-if="detail.task.steps.some((step) => step.kind === 'comments')" :task-id="detail.task.id" :active="taskActive" @update:state="commentState = $event" />
-            <CommentInsights v-if="detail.artifacts.some((artifact) => artifact.kind === 'comment_analysis_json')" :task-id="detail.task.id" :transcript-artifact-id="scriptTranscriptSource?.id ?? ''" @update:selected-comment-ids="selectedCommentIds = $event" @merged="loadTask(false)" />
+            <CommentInsights v-if="detail.task.steps.some((step) => step.kind === 'comments') || hasCommentAnalysis" :task-id="detail.task.id" :transcript-artifact-id="scriptTranscriptSource?.id ?? ''" :source-url="commentSourceUrl" :active="activeDetailTab === 'comments'" :has-analysis="hasCommentAnalysis" :analysis-revision="commentAnalysisRevision" :analysis-step="commentAnalysisStep" :clock-now="taskDurationNow" :task-status="detail.task.status" :collected-count="collectedCommentCount" :comment-state="commentState" :busy="actionBusy" @update:selected-comment-ids="selectedCommentIds = $event" @merged="loadTask(false)" @start-analysis="startCommentAnalysis" @retry-analysis="retryStep" @open-scripts="activeDetailTab = 'scripts'">
+              <template #raw-comments="{ active }"><CommentList :task-id="detail.task.id" :active="active" @update:state="commentState = $event" /></template>
+            </CommentInsights>
             <section v-if="!detail.task.steps.some((step) => step.kind === 'comments') && !detail.artifacts.some((artifact) => artifact.kind === 'comment_analysis_json')" class="panel panel-pad" role="status">
               <h2>本次任务没有采集评论</h2><p class="helper">创建任务时选择评论采集后，评论和精选结果会显示在这里。</p>
             </section>
@@ -1453,6 +1512,7 @@ onBeforeUnmount(pauseTab)
               <div class="panel-head"><div><h2 id="vault-write-title">写入知识库</h2><p>从定稿口播稿中选择；先预览内容，再确认写入。</p></div></div>
               <div class="field-row">
                 <label class="settings-field"><span class="form-label">选择要写入的产物</span><select v-model="selectedVaultArtifact" class="select-control" @change="vaultPreview = null"><option v-for="artifact in vaultArtifacts" :key="artifact.id" :value="artifact.id">{{ artifact.name }} · 定稿</option></select></label>
+                <label v-if="vaultLibraries.length > 1" class="settings-field"><span class="form-label">目标知识库</span><select v-model="vaultLibraryName" class="select-control" @change="handleVaultLibraryChange"><option v-for="library in vaultLibraries" :key="library.name" :value="library.name" :title="library.directory">{{ library.name }}</option></select></label>
                 <label class="settings-field"><span class="form-label">输出目录内的相对路径</span><input v-model="vaultTargetPath" class="input" type="text" maxlength="1024" placeholder="定稿/标题.md" @input="vaultPreview = null" /></label>
               </div>
               <div class="panel-foot"><span class="helper">仅接受 `.md`；已有不同内容的文件不会被覆盖。</span><button class="button button-secondary button-small" type="button" :disabled="vaultBusy || !selectedVaultArtifact || !vaultTargetPath.trim()" @click="previewVaultArtifact">{{ vaultBusy ? '正在准备…' : '预览写入内容' }}</button></div>

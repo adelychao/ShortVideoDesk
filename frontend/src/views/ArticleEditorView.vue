@@ -16,6 +16,7 @@ import { ApiError, api } from '../api/client'
 import type { ArticleDocument, ArticleImageSettings, ArticleRecord } from '../api/types'
 import ArticleImageModeDialog from '../components/ArticleImageModeDialog.vue'
 import MarkdownPreview from '../components/MarkdownPreview.vue'
+import { createArticleEditorSnapshot, getArticlePublishEntryState } from '../articleFinalizePublish'
 import { approveDraftSave, beginDraftLeave, isCurrentDraftLeave, redirectDraftLeave } from '../router'
 
 const MarkdownRichTextEditor = defineAsyncComponent(() => import('../components/MarkdownRichTextEditor.vue'))
@@ -48,6 +49,7 @@ const imagePreviewUrl = ref('')
 const imagePreviewTitle = ref('')
 const errorDialogOpen = ref(false)
 const leaveDialogOpen = ref(false)
+const finalizeSuccessDialogOpen = ref(false)
 const editorActive = ref(false)
 const coverInput = ref<HTMLInputElement | null>(null)
 const bodyEditor = ref<{
@@ -70,8 +72,9 @@ watch(error, (value) => {
   void nextTick(() => { errorDialogOpen.value = true })
 })
 
-const isNewArticleSession = computed(() => route.name === 'article-new' || route.query.source === 'new-article')
-const isDirty = computed(() => Boolean(document.value && JSON.stringify(document.value) !== baseSnapshot.value))
+const isNewArticleSession = computed(() => route.name === 'article-manual' || route.query.source === 'new-article')
+const isDirty = computed(() => Boolean(document.value && createArticleEditorSnapshot(document.value) !== baseSnapshot.value))
+const publishEntryState = computed(() => getArticlePublishEntryState(article.value?.status, isDirty.value))
 const shouldProtectDraft = computed(() => editorActive.value && isNewArticleSession.value && isDirty.value)
 const visibleTitle = computed({
   get: () => document.value?.title || '',
@@ -177,7 +180,7 @@ function createDefaultDocument(): ArticleDocument {
 function initializeNewArticleDraft(): void {
   article.value = null
   document.value = createDefaultDocument()
-  baseSnapshot.value = JSON.stringify(document.value)
+  baseSnapshot.value = createArticleEditorSnapshot(document.value)
   imageSettings.value = null
   error.value = ''
   message.value = ''
@@ -187,7 +190,7 @@ function initializeNewArticleDraft(): void {
 function acceptArticle(value: ArticleRecord): void {
   article.value = value
   document.value = structuredClone(toRaw(value.document))
-  baseSnapshot.value = JSON.stringify(document.value)
+  baseSnapshot.value = createArticleEditorSnapshot(document.value)
 }
 
 async function loadArticle(): Promise<void> {
@@ -320,7 +323,7 @@ function deactivateEditor(): void {
 }
 
 async function openSavedArticle(fromPath: string): Promise<void> {
-  if (route.name !== 'article-new' || route.fullPath !== fromPath || !article.value) return
+  if (route.name !== 'article-manual' || route.fullPath !== fromPath || !article.value) return
   try {
     await router.replace({ name: 'article-edit', params: { articleId: article.value.id }, query: { source: 'new-article' } })
   } catch {
@@ -347,7 +350,7 @@ async function finalize(): Promise<void> {
   message.value = ''
   try {
     acceptArticle(await api.finalizeArticle(articleId.value))
-    message.value = '文章已设为定稿，可以进入发布页。'
+    finalizeSuccessDialogOpen.value = true
   } catch (cause) {
     reportError(errorMessage(cause))
     return
@@ -355,6 +358,20 @@ async function finalize(): Promise<void> {
     saving.value = false
   }
   await openSavedArticle(fromPath)
+}
+
+async function goToArticlePublisher(): Promise<void> {
+  if (!article.value || !publishEntryState.value.enabled || saving.value) return
+  const currentArticleId = article.value.id
+  finalizeSuccessDialogOpen.value = false
+  try {
+    const navigationFailure = await router.push({ name: 'article-publish', params: { articleId: currentArticleId } })
+    if (isNavigationFailure(navigationFailure)) {
+      reportError('暂时无法打开文章发布页，请在编辑页点击“去发布”重试。')
+    }
+  } catch {
+    reportError('暂时无法打开文章发布页，请在编辑页点击“去发布”重试。')
+  }
 }
 
 function updateParagraphPrompt(blockId: string, value: string): void {
@@ -576,7 +593,7 @@ async function uploadCover(event: Event): Promise<void> {
 }
 
 onActivated(() => {
-  if (route.name === 'article-new') {
+  if (route.name === 'article-manual') {
     if (!saving.value) initializeNewArticleDraft()
   } else {
     void loadArticle()
@@ -603,18 +620,29 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
 <template>
   <el-config-provider :locale="zhCn">
   <section class="article-editor-page" aria-labelledby="article-editor-title">
-    <h1 id="article-editor-title" class="sr-only">{{ route.name === 'article-new' ? '新建文章' : '编辑文章' }}</h1>
+    <h1 id="article-editor-title" class="sr-only">{{ route.name === 'article-manual' ? '手动创建文章' : '编辑文章' }}</h1>
     <header class="article-editor-toolbar" aria-label="文章操作栏">
       <div class="article-editor-actions">
         <el-button size="large" :disabled="!document || saving" @click="copyCurrentArticle">复制文章</el-button>
         <el-button size="large" :disabled="!document || saving" @click="saveFromToolbar">{{ saving ? '正在保存…' : article ? '保存版本' : '保存草稿' }}</el-button>
         <el-button size="large" :disabled="!document" @click="previewDialogOpen = true">预览</el-button>
         <p v-if="isNewArticleSession && document" class="helper article-save-status" role="status">{{ article && !isDirty ? '草稿已保存' : '未保存' }}</p>
+        <div v-if="publishEntryState.visible" class="article-publish-entry">
+          <el-button size="large" :disabled="!publishEntryState.enabled || saving" @click="goToArticlePublisher">去发布</el-button>
+          <p v-if="publishEntryState.helperText" class="helper article-publish-entry-helper" role="status">{{ publishEntryState.helperText }}</p>
+        </div>
         <el-button type="primary" size="large" :disabled="!document || saving" @click="finalize">保存并设为定稿</el-button>
       </div>
     </header>
 
     <el-alert v-if="message" class="article-editor-feedback" type="success" :closable="false" show-icon :title="message" role="status" />
+    <el-dialog v-model="finalizeSuccessDialogOpen" class="article-finalize-success-dialog" title="文章已设为定稿" :teleported="false" :close-on-click-modal="false">
+      <p class="article-dialog-copy">定稿版本已保存，可以继续编辑或前往发布页选择平台和账号。</p>
+      <template #footer>
+        <el-button size="large" @click="finalizeSuccessDialogOpen = false">继续编辑</el-button>
+        <el-button type="primary" size="large" :disabled="!publishEntryState.enabled || saving" @click="goToArticlePublisher">前往发布</el-button>
+      </template>
+    </el-dialog>
     <el-dialog v-model="leaveDialogOpen" class="article-leave-dialog" title="草稿尚未保存" :teleported="false" :show-close="false" :close-on-click-modal="false" :close-on-press-escape="false">
       <p class="article-dialog-copy">保存后将前往目标页面。放弃后会丢失本次未保存的修改。</p>
       <template #footer>
@@ -783,6 +811,9 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
 }
 .article-editor-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; width: auto; }
 .article-editor-actions > .el-button { box-sizing: border-box; flex: 0 1 160px; width: 160px; height: 48px; margin: 0; padding: 0 16px; font-size: var(--fs-body); font-weight: var(--fw-semibold); }
+.article-publish-entry { display: flex; flex: 0 1 auto; align-items: center; justify-content: center; gap: 8px; min-width: 0; }
+.article-publish-entry > .el-button { box-sizing: border-box; flex: 0 1 160px; width: 160px; height: 48px; margin: 0; padding: 0 16px; font-size: var(--fs-body); font-weight: var(--fw-semibold); }
+.article-publish-entry-helper { flex: 0 1 220px; max-width: 220px; margin: 0; font-size: var(--fs-body-sm); line-height: var(--lh-base); overflow-wrap: anywhere; }
 .article-image-actions > .el-button { min-width: 0; min-height: 34px; margin: 0; padding-inline: 8px; font-size: var(--fs-body-sm); font-weight: var(--fw-medium); }
 .article-save-status { margin: 0; padding-inline: 4px; font-size: var(--fs-body); }
 .article-editor-feedback { margin: 0; }
@@ -792,6 +823,8 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
 .article-dialog-copy { margin: 0; color: var(--text-primary); font-size: var(--fs-body); line-height: var(--lh-base); overflow-wrap: anywhere; }
 .article-leave-dialog :deep(.el-dialog__footer) { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .article-leave-dialog :deep(.el-dialog__footer .el-button + .el-button) { margin-left: 0; }
+.article-finalize-success-dialog :deep(.el-dialog__footer) { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.article-finalize-success-dialog :deep(.el-dialog__footer .el-button + .el-button) { margin-left: 0; }
 .article-editor-page :deep(.el-dialog__footer .el-button) { font-size: var(--fs-body-sm); font-weight: var(--fw-medium); }
 .article-editor-page :deep(.article-image-mode-dialog) { width: min(580px, calc(100vw - 28px)); }
 .article-editor-page :deep(.article-image-mode-dialog .el-dialog__body) { max-height: min(65vh, 580px); overflow: auto; }
@@ -864,6 +897,8 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
   .article-editor-page { padding-bottom: 140px; }
   .article-editor-actions { width: 100%; gap: 8px; }
   .article-editor-actions > .el-button { flex-basis: 160px; width: 160px; max-width: 100%; height: 48px; padding: 0 12px; font-size: var(--fs-body); }
+  .article-publish-entry { flex-wrap: wrap; flex: 1 1 100%; width: 100%; }
+  .article-publish-entry-helper { flex-basis: 220px; max-width: min(220px, 100%); }
   .article-editor-aside { grid-template-columns: 1fr; }
   .article-editor-aside > :first-child { grid-row: auto; }
   .article-editor-meta { grid-template-columns: 1fr; }

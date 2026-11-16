@@ -28,7 +28,7 @@ from yt_dlp.dependencies import requests
 from yt_dlp.extractor.tiktok import DouyinIE
 
 from app.douyin import verified_aweme_metadata
-from app.browser_safety import browser_automation_paused, require_safe_browser
+from app.browser_safety import browser_automation_paused
 from app.build_info import APP_ID, APP_VERSION, BUILD_ID, calculate_build_id
 from app.runtime import RUNTIME_STOP_EVENT, STOP_TOKEN_HEADER, current_runtime_identity
 from multi_sources import DownloadIssue, PLATFORMS, classify_failure, parse_source, resolve_source
@@ -75,7 +75,6 @@ def capture_public_detail(url: str, media_id: str, update, *, browser_cookies=No
 
     found: list[dict] = []
     update(message="正在加载抖音作品页", phase="解析")
-    require_safe_browser("anonymous douyin")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, timeout=20_000)
         try:

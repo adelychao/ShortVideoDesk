@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import asyncio
+import hashlib
 import inspect
+import json
 from io import BytesIO
 import subprocess
 
@@ -29,6 +31,177 @@ from app.workbench.database import Database, SCHEMA_VERSION, _MIGRATIONS
 from app.workbench.config import AppConfig
 from app.workbench.runner import TaskRunner
 from app.workbench import article_platforms
+
+
+def test_article_from_text_route_is_available_without_creating_a_task():
+    route = next(
+        (route for route in workbench_api._router.routes if route.path.endswith("/articles/from-text")),
+        None,
+    )
+
+    assert route is not None
+
+
+def test_article_from_text_creates_one_draft_and_reuses_completed_request(tmp_path: Path, monkeypatch) -> None:
+    database = Database(tmp_path / "article-from-text.sqlite3")
+    database.migrate()
+    config = AppConfig(database)
+    runner = SimpleNamespace(database=database, config=config)
+    source_text = "第一段口播稿。\n\n第二段口播稿。"
+    generated_document = default_document("由手动文案生成")
+    generated_document["body_markdown"] = "整理后的文章正文。"
+    calls: list[tuple[str, str, str]] = []
+
+    class Provider:
+        def set_client_request_id(self, _request_id: str) -> None:
+            return None
+
+        def analyze_text(self, prompt: str, content: str, model_id: str) -> SimpleNamespace:
+            calls.append((prompt, content, model_id))
+            return SimpleNamespace(text=json.dumps(generated_document, ensure_ascii=False), usage=None, request_id="provider-request")
+
+    monkeypatch.setattr(workbench_api, "_runner", lambda _request: runner)
+    monkeypatch.setattr(workbench_api, "get_default_model_profile", lambda _config: {
+        "id": "default-profile", "name": "默认文本模型", "provider_id": "zhipu", "model_id": "glm-4",
+        "model_base_url": None, "credential_id": "credential", "capabilities_json": '["text_generation"]',
+    })
+    monkeypatch.setattr(workbench_api, "_model_configuration_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(workbench_api, "task_profile_api_key", lambda _settings: "test-api-key")
+    monkeypatch.setattr(workbench_api, "create_provider", lambda *_args, **_kwargs: Provider())
+    body = workbench_api.ArticleFromTextRequest(
+        content=source_text,
+        idempotency_key="article-from-text-request-0001",
+        authorized=True,
+    )
+
+    first = workbench_api.create_article_from_text(body, SimpleNamespace())
+    second = workbench_api.create_article_from_text(body, SimpleNamespace())
+
+    assert first["id"] == second["id"]
+    assert first["source_kind"] == "pasted_script"
+    assert first["source_task_id"] is None
+    assert first["source_artifact_id"] is None
+    assert calls == [(calls[0][0], source_text, "glm-4")]
+    assert "用户提供的口播稿原文" in calls[0][0]
+    with database.transaction() as connection:
+        rows = connection.execute("SELECT * FROM article_generation_runs").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "completed"
+    assert rows[0]["article_id"] == first["id"]
+    assert rows[0]["input_sha256"] == hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+
+
+def test_article_from_text_requires_explicit_authorization() -> None:
+    body = workbench_api.ArticleFromTextRequest(
+        content="需要生成的口播稿。",
+        idempotency_key="article-from-text-request-0002",
+        authorized=False,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        workbench_api.create_article_from_text(body, SimpleNamespace())
+
+    assert exc.value.status_code == 422
+
+
+def test_article_from_text_rejects_a_default_model_without_text_generation(tmp_path: Path, monkeypatch) -> None:
+    database = Database(tmp_path / "article-from-text-image-only-model.sqlite3")
+    database.migrate()
+    runner = SimpleNamespace(database=database, config=AppConfig(database))
+    monkeypatch.setattr(workbench_api, "_runner", lambda _request: runner)
+    monkeypatch.setattr(workbench_api, "get_default_model_profile", lambda _config: {
+        "id": "image-profile", "name": "图片模型", "provider_id": "zhipu", "model_id": "image-v1",
+        "model_base_url": None, "credential_id": "image-credential", "capabilities_json": '["image_generation"]',
+    })
+    body = workbench_api.ArticleFromTextRequest(
+        content="需要生成的口播稿。",
+        idempotency_key="article-from-text-image-only-0001",
+        authorized=True,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        workbench_api.create_article_from_text(body, SimpleNamespace())
+
+    assert exc.value.status_code == 409
+    assert "不支持文本生成" in exc.value.detail
+
+
+def test_article_from_text_rejects_whitespace_only_source_before_model_lookup(monkeypatch) -> None:
+    monkeypatch.setattr(workbench_api, "_runner", lambda _request: pytest.fail("不应读取模型或创建任务"))
+    body = workbench_api.ArticleFromTextRequest(
+        content=" \n\t ",
+        idempotency_key="article-from-text-whitespace-0001",
+        authorized=True,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        workbench_api.create_article_from_text(body, SimpleNamespace())
+
+    assert exc.value.status_code == 422
+
+
+def test_article_from_text_recovers_a_draft_saved_before_the_run_completed(tmp_path: Path, monkeypatch) -> None:
+    database = Database(tmp_path / "article-from-text-recovery.sqlite3")
+    database.migrate()
+    config = AppConfig(database)
+    runner = SimpleNamespace(database=database, config=config)
+    body = workbench_api.ArticleFromTextRequest(
+        content="需要生成的口播稿。",
+        idempotency_key="article-from-text-recovery-0001",
+        authorized=True,
+    )
+    source_hash = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
+    key_hash = hashlib.sha256(body.idempotency_key.encode("utf-8")).hexdigest()
+    generated_document = default_document("已经生成的草稿")
+    generated_document["body_markdown"] = "保存成功，但调用结果还未更新。"
+    article = create_article(
+        database,
+        generated_document,
+        source_kind="pasted_script",
+        generation_key_sha256=key_hash,
+        note="由手动输入文案生成",
+    )
+    monkeypatch.setattr(workbench_api, "_runner", lambda _request: runner)
+    monkeypatch.setattr(workbench_api, "get_default_model_profile", lambda _config: {
+        "id": "default-profile", "name": "默认文本模型", "provider_id": "zhipu", "model_id": "glm-4",
+        "model_base_url": None, "credential_id": "credential", "capabilities_json": '["text_generation"]',
+    })
+    monkeypatch.setattr(workbench_api, "_model_configuration_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(workbench_api, "create_provider", lambda *_args, **_kwargs: pytest.fail("不应重复调用模型"))
+    run_id, article_id = workbench_api._begin_article_generation_run(
+        runner,
+        run_id="article-run-recovery",
+        idempotency_key=body.idempotency_key,
+        input_sha256=source_hash,
+        provider_id="zhipu",
+        model_id="glm-4",
+    )
+    assert article_id is None
+
+    recovered = workbench_api.create_article_from_text(body, SimpleNamespace())
+
+    assert recovered["id"] == article["id"]
+    with database.transaction() as connection:
+        row = connection.execute("SELECT * FROM article_generation_runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["status"] == "completed"
+    assert row["article_id"] == article["id"]
+
+
+def test_article_source_kind_is_returned_for_generated_and_manual_articles(tmp_path: Path) -> None:
+    database = Database(tmp_path / "article-source-kind.sqlite3")
+    database.migrate()
+    pasted_document = default_document("手动输入文案")
+    pasted_document["body_markdown"] = "生成的文章正文。"
+    manual_document = default_document("手动创建")
+    manual_document["body_markdown"] = "手工编写的文章正文。"
+    pasted = create_article(database, pasted_document, source_kind="pasted_script")
+    manual = create_article(database, manual_document)
+
+    result = list_articles(database)
+    source_kinds = {item["id"]: item["source_kind"] for item in result["items"]}
+
+    assert source_kinds[pasted["id"]] == "pasted_script"
+    assert source_kinds[manual["id"]] == "manual"
 
 
 def _finalized_article(database: Database) -> dict:

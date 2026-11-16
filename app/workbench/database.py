@@ -10,7 +10,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "workbench.sqlite3"
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 34
 BUSY_TIMEOUT_MS = 15_000
 
 
@@ -509,6 +509,49 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
             size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, mtime_ns INTEGER NOT NULL,
             confirmed_over_limit INTEGER NOT NULL DEFAULT 0
         )""",
+    ),
+    32: (
+        "ALTER TABLE articles ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'manual' CHECK (source_kind IN ('manual', 'final_script', 'pasted_script'))",
+        "ALTER TABLE articles ADD COLUMN generation_key_sha256 TEXT",
+        "CREATE UNIQUE INDEX idx_articles_generation_key ON articles(generation_key_sha256) WHERE generation_key_sha256 IS NOT NULL",
+        "UPDATE articles SET source_kind = 'final_script' WHERE source_artifact_id IS NOT NULL",
+        """CREATE TABLE article_generation_runs (
+            id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            input_sha256 TEXT NOT NULL,
+            article_id TEXT REFERENCES articles(id) ON DELETE SET NULL,
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            request_id TEXT,
+            usage_json TEXT NOT NULL,
+            cost_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            error_code TEXT,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""",
+        "CREATE INDEX idx_article_generation_runs_created ON article_generation_runs(created_at DESC, id DESC)",
+    ),
+    33: (
+        """CREATE TABLE comment_response_notes (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+            owner_authorized_at TEXT NOT NULL,
+            reply_draft TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'drafted', 'marked_replied', 'ignore')),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, comment_id)
+        )""",
+        "CREATE INDEX idx_comment_response_notes_task_status ON comment_response_notes(task_id, status, updated_at DESC)",
+    ),
+    34: (
+        """CREATE TABLE comment_analysis_options (
+            step_id TEXT PRIMARY KEY REFERENCES task_steps(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            options_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX idx_comment_analysis_options_task ON comment_analysis_options(task_id)",
     ),
 }
 

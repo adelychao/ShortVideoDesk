@@ -5,14 +5,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import sqlite3
 from typing import Callable
 
 from ..archive import _assert_contained
-from ..models import CommentRecord, StepStatus
+from ..models import ArtifactRecord, CommentRecord, StepStatus
 from ..providers import get_model_capability
 from ..model_profiles import task_model_settings
 from ..runner import RunnerError, StepContext, StepResult, TaskCancelled
@@ -21,8 +21,13 @@ from .artifact_store import register_bytes
 from .model_call import authorized_model_call, configured_model_id, configured_provider_id
 
 
-_FALLBACK_INPUT_BUDGET = 800_000
-_CATEGORY_NAMES = frozenset({"有用", "高赞", "有趣"})
+_FALLBACK_INPUT_BUDGET = 48 * 1024
+_MAX_COMMENTS_PER_BATCH = 100
+_COMMENT_ANALYSIS_PROMPT_VERSION = "comment-insights-v2"
+_CATEGORY_NAMES = frozenset({"有用", "有趣"})
+_CLASSIFICATION_LABELS = frozenset({
+    "观众提问", "选题请求", "经验与观点", "纠错与具体反馈", "普通互动", "垃圾信息", "待复核",
+})
 
 
 @dataclass(frozen=True)
@@ -35,8 +40,15 @@ class SelectedComment:
 
 
 @dataclass(frozen=True)
+class ClassifiedComment:
+    comment_id: str
+    labels: list[str]
+
+
+@dataclass(frozen=True)
 class CommentAnalysis:
     selected: list[SelectedComment]
+    classifications: list[ClassifiedComment]
     themes: list[str]
     audience_questions: list[str]
     disagreements: list[str]
@@ -81,7 +93,7 @@ def partition_comments(
     for comment in comments:
         item_bytes = len(_comments_json([comment]).encode("utf-8")) - 2
         candidate_bytes = current_bytes + item_bytes + (1 if current else 0)
-        if current and candidate_bytes > budget:
+        if current and (candidate_bytes > budget or len(current) >= _MAX_COMMENTS_PER_BATCH):
             if current:
                 batches.append(current)
             current = [comment]
@@ -115,8 +127,9 @@ def analyze_comments(
         raise ValueError("select_count must not be negative")
     ranked = rank_comment_candidates(comments)
     if not ranked:
-        return CommentAnalysis([], [], [], [], [], [])
+        return CommentAnalysis([], [], [], [], [], [], [])
     model_id = configured_model_id(context)
+    provider_id = configured_provider_id(context)
 
     comment_note = _comment_note_artifact(context)
     source_artifact_id = comment_note.id
@@ -124,11 +137,23 @@ def analyze_comments(
     batches = partition_comments(ranked, max_tokens, lambda _text: None)
     raw_batches: list[dict[str, object]] = []
     selected_by_id: dict[str, tuple[str, str]] = {}
+    labels_by_id: dict[str, list[str]] = {}
+    high_like_slots = min(5, select_count)
+    for comment in ranked:
+        if len(selected_by_id) >= high_like_slots:
+            break
+        if comment.like_count is None or comment.like_count <= 0:
+            continue
+        selected_by_id[comment.platform_comment_id] = (
+            "高赞",
+            "按本次采集记录中的真实点赞数排序。",
+        )
     themes: list[str] = []
     questions: list[str] = []
     disagreements: list[str] = []
     claims: list[str] = []
 
+    cached_batches = _load_resumable_batches(context, source_artifact_id, provider_id, model_id)
     for index, batch in enumerate(batches, start=1):
         if context.cancel_event.is_set():
             raise TaskCancelled
@@ -140,32 +165,47 @@ def analyze_comments(
             round((index - 1) / max(1, len(batches)) * 90),
             f"正在分析第 {index}/{len(batches)} 批评论（本批 {len(batch)} 条）",
         )
-        response = authorized_model_call(
-            context,
-            model_id=model_id,
-            input_artifact_ids=[source_artifact_id],
-            consent_artifact_ids=[source_artifact_id],
-            input_detail={
-                "batch_index": index,
-                "batch_count": len(batches),
-                "comment_ids": ids,
-                "comment_count": len(ids),
-                "partition_basis": "all-comments; token count unavailable, conservative UTF-8 byte budget",
-            },
-            operation=lambda provider, prompt=prompt, text=user_text: provider.analyze_text(  # type: ignore[attr-defined]
-                prompt, text, model_id
-            ),
-        )
-        if context.cancel_event.is_set():
-            raise TaskCancelled
-        raw_text = str(response.text)  # type: ignore[attr-defined]
-        raw_artifact = register_bytes(
-            context,
-            "comment_analysis_raw",
-            ".json",
-            _json_bytes({"batch_index": index, "comment_ids": ids, "request_id": getattr(response, "request_id", None), "raw_response_text": raw_text}),
-            {"media_type": "application/json", "model_id": model_id, "comment_ids": ids, "source_artifact_ids": [source_artifact_id]},
-        )
+        cached = cached_batches.get(index)
+        if cached is not None and cached[0].get("comment_ids") == ids:
+            cached_payload, raw_artifact = cached
+            raw_text = str(cached_payload["raw_response_text"])
+            request_id = cached_payload.get("request_id")
+        else:
+            response = authorized_model_call(
+                context,
+                model_id=model_id,
+                input_artifact_ids=[source_artifact_id],
+                consent_artifact_ids=[source_artifact_id],
+                input_detail={
+                    "batch_index": index,
+                    "batch_count": len(batches),
+                    "comment_ids": ids,
+                    "comment_count": len(ids),
+                    "partition_basis": "max 100 comments or 48 KiB UTF-8 JSON; comments are not truncated",
+                },
+                operation=lambda provider, prompt=prompt, text=user_text: provider.analyze_text(  # type: ignore[attr-defined]
+                    prompt, text, model_id
+                ),
+            )
+            if context.cancel_event.is_set():
+                raise TaskCancelled
+            raw_text = str(response.text)  # type: ignore[attr-defined]
+            request_id = getattr(response, "request_id", None)
+            raw_artifact = register_bytes(
+                context,
+                "comment_analysis_raw",
+                ".json",
+                _json_bytes({"batch_index": index, "comment_ids": ids, "request_id": request_id, "raw_response_text": raw_text}),
+                {
+                    "media_type": "application/json",
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "prompt_version": _COMMENT_ANALYSIS_PROMPT_VERSION,
+                    "batch_index": index,
+                    "comment_ids": ids,
+                    "source_artifact_ids": [source_artifact_id],
+                },
+            )
         parsed = _parse_object(raw_text)
         batch_known = set(ids)
         for row in _object_list(parsed.get("selected")):
@@ -181,6 +221,17 @@ def analyze_comments(
                 and reason.strip()
             ):
                 selected_by_id.setdefault(comment_id, (category, reason.strip()[:500]))
+        for row in _object_list(parsed.get("classifications")):
+            comment_id = row.get("comment_id")
+            raw_labels = row.get("labels")
+            if not isinstance(comment_id, str) or comment_id not in batch_known or not isinstance(raw_labels, list):
+                continue
+            labels = _unique_strings([
+                value for value in raw_labels
+                if isinstance(value, str) and value in _CLASSIFICATION_LABELS and value != "待复核"
+            ])[:3]
+            if labels:
+                labels_by_id[comment_id] = labels
         themes.extend(_string_list(parsed.get("themes")))
         questions.extend(_string_list(parsed.get("audience_questions")))
         disagreements.extend(_string_list(parsed.get("disagreements")))
@@ -188,7 +239,7 @@ def analyze_comments(
         raw_batches.append({
             "batch_index": index,
             "processed_comment_ids": ids,
-            "request_id": getattr(response, "request_id", None),
+            "request_id": request_id,
             "raw_artifact_id": raw_artifact.id,
         })
     setattr(context, "_comment_analysis_raw", raw_batches)
@@ -208,8 +259,17 @@ def analyze_comments(
         if len(selected) >= select_count:
             break
 
+    classifications = [
+        ClassifiedComment(
+            comment_id=comment.platform_comment_id,
+            labels=labels_by_id.get(comment.platform_comment_id, ["待复核"]),
+        )
+        for comment in ranked
+    ]
+
     return CommentAnalysis(
         selected=selected,
+        classifications=classifications,
         themes=_unique_strings(themes),
         audience_questions=_unique_strings(questions),
         disagreements=_unique_strings(disagreements),
@@ -222,16 +282,32 @@ def analyze_collected_comments(context: StepContext) -> StepResult:
     comments = _load_collected_comments(context)
     if context.cancel_event.is_set():
         raise TaskCancelled
-    analysis = analyze_comments(context, comments)
+    from ..comment_analysis_policy import comment_snapshot, load_options
+    options = load_options(context.repository.database, context.task.id, context.step.id)
+    if options and options.get("preview_snapshot") and options["preview_snapshot"] != comment_snapshot(comments):
+        raise RunnerError("comments_analysis_stale", "预览后评论内容或点赞已变化；请重新预览后开始分析。", status_code=409)
+    if options is not None and comments:
+        from .analyze_comments_economy import analyze_economically
+        analysis = analyze_economically(context, comments, options)
+    else:
+        analysis = analyze_comments(context, comments)
     model_id = configured_model_id(context) if comments else None
     provider_id = configured_provider_id(context) if comments else None
     payload = {
-        "schema_version": 1,
+        "schema_version": 3 if options is not None else 2,
         "provider_id": provider_id,
         "model_id": model_id,
         "source_artifact_ids": [_comment_note_artifact(context).id] if comments else [],
         **asdict(analysis),
     }
+    classification_counts: dict[str, int] = {label: 0 for label in sorted(_CLASSIFICATION_LABELS)}
+    for item in analysis.classifications:
+        for label in item.labels:
+            classification_counts[label] += 1
+    payload["classification_counts"] = classification_counts
+    coverage = getattr(context, "_comment_analysis_coverage", None)
+    if isinstance(coverage, dict):
+        payload["coverage"] = coverage
     raw_batches = getattr(context, "_comment_analysis_raw", [])
     if raw_batches:
         payload["batches"] = raw_batches
@@ -245,6 +321,7 @@ def analyze_collected_comments(context: StepContext) -> StepResult:
             "model_id": model_id,
             "processed_comment_ids": analysis.processed_comment_ids,
             "selected_count": len(analysis.selected),
+            "classified_count": len(analysis.classifications),
             "comment_count": len(comments),
         },
     )
@@ -299,7 +376,7 @@ def analyze_collected_comments(context: StepContext) -> StepResult:
     except (OSError, RuntimeError, ValueError, UnicodeError, sqlite3.Error) as exc:
         summary_error = f"汇总资料未生成：{exc}；评论和分析原件仍可查看。"
     return StepResult(
-        status=StepStatus.COMPLETED.value,
+        status=StepStatus.PARTIAL.value if isinstance(coverage, dict) and (coverage.get("unanalysed_original_count") or coverage.get("stop_reason")) else StepStatus.COMPLETED.value,
         artifact_ids=[
             *[str(item["raw_artifact_id"]) for item in raw_batches if isinstance(item.get("raw_artifact_id"), str)],
             json_artifact.id,
@@ -328,17 +405,27 @@ def _load_collected_comments(context: StepContext) -> list[CommentRecord]:
     for row in rows:
         try:
             created_at = datetime.fromisoformat(row["created_at"]) if row["created_at"] else None
+        except (TypeError, ValueError):
+            created_at = None
+        try:
             collected_at = datetime.fromisoformat(row["collected_at"])
+        except (TypeError, ValueError):
+            collected_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        try:
             raw = json.loads(row["raw_fields_json"]) if row["raw_fields_json"] else {}
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        try:
+            like_count = int(row["like_count"]) if row["like_count"] is not None else None
+        except (TypeError, ValueError):
+            like_count = None
         values.append(CommentRecord(
             id=str(row["id"]),
             platform_comment_id=str(row["platform_comment_id"]),
             parent_id=str(row["parent_id"]) if row["parent_id"] is not None else None,
             author=str(row["author"]) if row["author"] is not None else None,
             text=str(row["text"]),
-            like_count=int(row["like_count"]) if row["like_count"] is not None else None,
+            like_count=like_count,
             created_at=created_at,
             collected_at=collected_at,
             raw_fields=raw if isinstance(raw, dict) else {},
@@ -365,6 +452,60 @@ def _comment_note_artifact(context: StepContext):
     raise RunnerError("comments_artifact_missing", "本次任务没有可校验的评论资料产物。", status_code=409)
 
 
+def _load_resumable_batches(
+    context: StepContext,
+    source_artifact_id: str,
+    provider_id: str | None,
+    model_id: str,
+) -> dict[int, tuple[dict[str, object], ArtifactRecord]]:
+    """Reuse only verified, successful batches from this exact step and input snapshot."""
+    with context.repository.database.transaction() as connection:
+        rows = connection.execute(
+            """SELECT * FROM artifacts
+               WHERE task_id = ? AND step_id = ? AND kind = 'comment_analysis_raw'
+               ORDER BY created_at DESC, version DESC, id DESC""",
+            (context.task.id, context.step.id),
+        ).fetchall()
+    cached: dict[int, tuple[dict[str, object], ArtifactRecord]] = {}
+    for row in rows:
+        artifact = _artifact_from_row(row)
+        metadata = artifact.metadata
+        source_ids = metadata.get("source_artifact_ids")
+        if (
+            metadata.get("prompt_version") != _COMMENT_ANALYSIS_PROMPT_VERSION
+            or metadata.get("model_id") != model_id
+            or metadata.get("provider_id") != provider_id
+            or source_ids != [source_artifact_id]
+        ):
+            continue
+        try:
+            path = _assert_contained(Path(artifact.path), context.archive_root, strict=True)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 5_000_000:
+                continue
+            if _sha256(path).casefold() != artifact.sha256.casefold():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            index = payload.get("batch_index")
+            comment_ids = payload.get("comment_ids")
+            raw_text = payload.get("raw_response_text")
+            if (
+                not isinstance(index, int)
+                or index < 1
+                or metadata.get("batch_index") != index
+                or not isinstance(comment_ids, list)
+                or not all(isinstance(value, str) for value in comment_ids)
+                or not isinstance(raw_text, str)
+            ):
+                continue
+            _parse_object(raw_text)
+            cached.setdefault(index, (payload, artifact))
+        except (OSError, RuntimeError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, RunnerError):
+            continue
+    return cached
+
+
 def _model_input_limit(context: StepContext) -> int:
     if context.app_config is not None:
         settings = task_model_settings(context.app_config, context.task.id)
@@ -386,10 +527,6 @@ def _comments_json(comments: list[CommentRecord]) -> str:
             {
                 "comment_id": comment.platform_comment_id,
                 "text": comment.text,
-                "like_count": comment.like_count,
-                "author": comment.author,
-                "created_at": comment.created_at.isoformat() if comment.created_at else None,
-                "parent_id": comment.parent_id,
             }
             for comment in comments
         ],
@@ -401,10 +538,15 @@ def _comments_json(comments: list[CommentRecord]) -> str:
 def _analysis_prompt() -> str:
     return (
         "你正在整理本次采集到的公开短视频评论。所有输入评论都必须逐条纳入分析；"
-        "不得补造、改写或合并评论，不得推断点赞数；只能引用输入中的 comment_id。"
-        "选择有代表性的评论并标为‘有用’、‘高赞’或‘有趣’，每条给出简短理由。"
+        "不得补造、改写或合并评论；只能引用输入中的 comment_id。"
+        "请为每条输入评论返回 classifications 项，准确覆盖所有 comment_id；"
+        "labels 可多选，枚举为‘观众提问’、‘选题请求’、‘经验与观点’、‘纠错与具体反馈’、‘普通互动’、‘垃圾信息’、‘待复核’。"
+        "只在评论含糊、文本为空或无法判断时使用‘待复核’。"
+        "选择有代表性的评论并标为‘有用’或‘有趣’，每条给出简短理由。"
         "区分评论者的个人经历、观点与可核实事实，不得把评论经历说成创作者经历。"
-        "请仅返回 JSON 对象，字段为 selected[{comment_id,category,reason}], themes[], "
+        "点赞、作者和时间等字段未提供，禁止推断或编造互动数据。"
+        "请仅返回 JSON 对象，字段为 classifications[{comment_id,labels[]}], "
+        "selected[{comment_id,category,reason}], themes[], "
         "audience_questions[], disagreements[], claims_to_verify[]。"
         "主题、问题、分歧及事实主张应依据输入；没有内容时返回空数组。"
     )
@@ -457,14 +599,28 @@ def _analysis_markdown(analysis: CommentAnalysis) -> str:
         else None
     )
     lines = [
-        "# 评论精选与摘要",
+        "# 评论洞察与摘要",
         "",
         f"- 已分析评论：{len(analysis.processed_comment_ids)} 条",
+        f"- 已分类评论：{len(analysis.classifications)} 条；标签可重叠，分类计数不可直接相加",
         f"- 精选评论：{len(analysis.selected)} 条；仅依据已采集评论，不代表全部平台评论",
+        "",
+        "## 评论类型分布",
+        "",
+    ]
+    classification_counts: dict[str, int] = {}
+    for item in analysis.classifications:
+        for label in item.labels:
+            classification_counts[label] = classification_counts.get(label, 0) + 1
+    lines.extend(
+        f"- {label}：{count} 条"
+        for label, count in sorted(classification_counts.items(), key=lambda item: (-item[1], item[0]))
+    ) if classification_counts else lines.append("（无）")
+    lines.extend([
         "",
         "## 精选评论",
         "",
-    ]
+    ])
     if analysis.selected:
         for index, item in enumerate(analysis.selected, start=1):
             category = _without_comment_ids(item.category, comment_id_pattern)

@@ -11,6 +11,7 @@ import PlatformLogo from '../components/PlatformLogo.vue'
 import type { LocalAsrStatus, ModelCapabilityStatus, ModelProfile, ScriptStyleTemplate, SourcePreview, StepConsent, StepKind, TaskSummary, UploadReceipt, VideoPublishAccount } from '../api/types'
 import LocalMediaUpload from '../components/LocalMediaUpload.vue'
 import StepSelector from '../components/StepSelector.vue'
+import { defaultCommentAnalysisOptions, validateCommentAnalysisOptions } from '../commentAnalysisOptions'
 import { useConfigStore } from '../stores/config'
 import { useTasksStore } from '../stores/tasks'
 import { localModelAdvice, localModelLabel } from '../utils/localWhisperModels'
@@ -41,6 +42,23 @@ const scriptStyleTemplates = ref<ScriptStyleTemplate[]>([])
 const scriptStyleTemplatesLoading = ref(false)
 const scriptStyleTemplatesError = ref('')
 const commentSortOrder = ref<'likes_desc' | 'time_desc' | 'time_asc'>('likes_desc')
+const commentAnalysisOptions = ref(defaultCommentAnalysisOptions())
+const commentSettingsReady = ref(false)
+const commentSettingsError = ref('')
+let commentSettingsSequence = 0
+async function loadCommentSettings(): Promise<void> {
+  const current = ++commentSettingsSequence
+  commentSettingsReady.value = false; commentSettingsError.value = ''
+  try {
+    const config = await api.getConfig()
+    if (current !== commentSettingsSequence) return
+    const saved = config.settings.comment_analysis_options
+    if (!saved) throw new Error('本机服务版本较旧，请重启工作台后读取评论分析设置。')
+    const invalid = validateCommentAnalysisOptions(saved)
+    if (invalid) throw new Error(invalid)
+    commentAnalysisOptions.value = { ...saved }; commentSettingsReady.value = true
+  } catch (error) { if (current === commentSettingsSequence) commentSettingsError.value = error instanceof Error ? error.message : '无法读取评论分析设置。' }
+}
 const allowFirstFrame = ref(true)
 const transcriptionModePreferenceKey = 'local-video-workbench.transcription-mode'
 function loadTranscriptionModePreference(): 'cloud' | 'local' {
@@ -352,6 +370,11 @@ async function submitTask(): Promise<void> {
   taskError.value = ''
   submitReminder.value = ''
   taskSuccess.value = null
+  if (selectedSteps.value.includes('analyze_comments') && !commentSettingsReady.value) {
+    taskError.value = commentSettingsError.value || '正在读取评论分析设置，请稍后重试。'
+    submitReminder.value = taskError.value
+    return
+  }
 
   if (selectedSteps.value.includes('generate_scripts') && scriptStyleSelectionInvalid.value) {
     taskError.value = '请至少选择一个已启用的口播稿风格模板。'
@@ -450,6 +473,7 @@ async function submitTask(): Promise<void> {
       scriptStyleIds: selectedSteps.value.includes('generate_scripts') ? scriptStyleIds.value : [],
       allowFirstFrame: allowFirstFrame.value,
       commentSortOrder: commentSortOrder.value,
+      commentAnalysisOptions: selectedSteps.value.includes('analyze_comments') ? { ...commentAnalysisOptions.value } : undefined,
       consents: createConsents(),
       transcriptionMode: transcriptionMode.value,
       ocrMode: ocrMode.value,
@@ -481,6 +505,7 @@ function switchSourceMode(mode: 'url' | 'file'): void {
 }
 
 onMounted(() => {
+  void loadCommentSettings()
   void configStore.loadOverview()
   void refreshLocalStatus()
   void refreshOcrStatus()
@@ -488,6 +513,7 @@ onMounted(() => {
 })
 
 onActivated(() => {
+  void loadCommentSettings()
   void loadModelProfiles()
   void loadScriptStyleTemplates()
 })
@@ -638,6 +664,12 @@ onActivated(() => {
             :script-style-templates-error="scriptStyleTemplatesError"
             @settings="openStepSettings"
           />
+          <div v-if="selectedSteps.includes('analyze_comments')" class="info-box" role="note">
+            <span v-if="commentSettingsReady">评论分析使用全局设置：{{ commentAnalysisOptions.mode === 'economy' ? '经济模式' : '全量模式' }}，每批最多 {{ commentAnalysisOptions.batch_size }} 条，预算 {{ commentAnalysisOptions.budget_cny }} 元 / {{ commentAnalysisOptions.token_budget }} Token。请核对模型及单价。</span>
+            <span v-else>{{ commentSettingsError || '正在读取评论分析设置…' }}</span>
+            <button v-if="commentSettingsError" class="text-button" type="button" @click="loadCommentSettings">重试读取</button>
+            <RouterLink class="text-button" :to="{ name: 'settings', query: { tab: 'comments' } }">评论分析设置 →</RouterLink>
+          </div>
           <div v-if="selectedOcr" class="info-box task-cloud-consent" role="note">
             {{ ocrMode === 'local' ? `本地 OCR 每 ${ocrInterval} 秒抽取画面，覆盖视频全时长；图片不上传。短暂出现的文字可能遗漏。` : `云端 OCR 会把抽取的图片发送给 ${providerName}，可能产生费用；目前最多抽取 8 张。` }}
           </div>

@@ -618,6 +618,124 @@ class TaskRunner:
             self._queue.put(_QueueItem(task_id, "", False, None, step_id))
         return step_id
 
+    def enqueue_followup_comment_analysis(self, task_id: str, *, options: dict[str, object] | None = None) -> str:
+        """Append an explicitly authorized analysis step for saved public comments."""
+        self.start()
+        root = self.require_archive_root()
+        from .model_profiles import task_model_settings
+
+        with self._lock:
+            task = self.repository.get_task(task_id)
+            if task is None:
+                raise KeyError("task not found")
+            eligible_statuses = {TaskStatus.COMPLETED.value, TaskStatus.PARTIAL.value}
+            if options is not None:
+                eligible_statuses |= {TaskStatus.FAILED.value, TaskStatus.BLOCKED.value, TaskStatus.INTERRUPTED.value, TaskStatus.CANCELLED.value}
+            if task.status not in eligible_statuses:
+                raise RunnerError("task_not_terminal", "任务仍在执行，暂不能追加评论分析。")
+            if task_id in self._queued_ids:
+                raise RunnerError("task_active", "任务正在排队，暂不能追加评论分析。")
+            terminal = {StepStatus.COMPLETED.value, StepStatus.PARTIAL.value, StepStatus.SKIPPED.value}
+            if options is not None:
+                terminal |= {StepStatus.FAILED.value, StepStatus.BLOCKED.value, StepStatus.INTERRUPTED.value, StepStatus.CANCELLED.value}
+            if any(step.status not in terminal for step in task.steps):
+                raise RunnerError("task_steps_incomplete", "原任务仍有未完成步骤，暂不能追加评论分析。")
+            comments_step = next((step for step in task.steps if step.kind is StepKind.COMMENTS), None)
+            if comments_step is None or comments_step.status not in {
+                StepStatus.COMPLETED.value, StepStatus.PARTIAL.value,
+            }:
+                raise RunnerError("comments_not_ready", "请先完成评论采集，再开始评论分析。", status_code=409)
+            if options is None and any(
+                step.kind is StepKind.ANALYZE_COMMENTS
+                and step.status in {
+                    StepStatus.QUEUED.value, StepStatus.RUNNING.value,
+                    StepStatus.INTERRUPTED.value, StepStatus.FAILED.value,
+                    StepStatus.BLOCKED.value, StepStatus.AWAITING_AUTHORIZATION.value,
+                }
+                for step in task.steps
+            ):
+                raise RunnerError("comment_analysis_step_exists", "请先在现有评论分析步骤中继续或重试。", status_code=409)
+
+            with self.database.transaction() as connection:
+                note_rows = connection.execute(
+                    """SELECT * FROM artifacts WHERE task_id = ? AND kind = 'note'
+                       ORDER BY created_at DESC, version DESC, id DESC""",
+                    (task_id,),
+                ).fetchall()
+                collection_state = connection.execute(
+                    "SELECT collected_count, status FROM comment_collection_state WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            note = None
+            for row in note_rows:
+                artifact = _artifact_from_row(row)
+                if artifact.metadata.get("scope") != "comments":
+                    continue
+                try:
+                    path = _assert_contained(Path(artifact.path), root, strict=True)
+                    if path.is_file() and not path.is_symlink() and _hash_file(path)[0].casefold() == artifact.sha256.casefold():
+                        note = artifact
+                        break
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            if note is None:
+                raise RunnerError("comments_artifact_missing", "本次任务没有可校验的评论资料产物。", status_code=409)
+            note_count = note.metadata.get("collected_count")
+            if collection_state is None or not isinstance(note_count, int) or note_count != int(collection_state["collected_count"]):
+                raise RunnerError("comments_artifact_stale", "评论资料未包含当前已保存的全部评论，请先刷新评论资料。", status_code=409)
+            if collection_state["status"] == "running":
+                raise RunnerError("comments_running", "评论仍在采集，请等待采集完成后再分析。", status_code=409)
+
+            settings = task_model_settings(self.config, task_id)
+            provider_id = settings.get("model_provider")
+            model_id = settings.get("model_id")
+            if not isinstance(provider_id, str) or not isinstance(model_id, str):
+                raise RunnerError("model_configuration_missing", "当前任务没有可用的文本模型配置。", status_code=409)
+            step_id, now = uuid.uuid4().hex, _utc_now_iso()
+            input_ids = json.dumps([note.id], separators=(",", ":"))
+            with self.database.transaction(write=True) as connection:
+                current = connection.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if current is None or current["status"] != task.status:
+                    raise RunnerError("task_state_changed", "任务状态已变化，请刷新后重试。")
+                current_note = connection.execute(
+                    "SELECT sha256 FROM artifacts WHERE id = ? AND task_id = ? AND kind = 'note'",
+                    (note.id, task_id),
+                ).fetchone()
+                if current_note is None or str(current_note["sha256"]).casefold() != note.sha256.casefold():
+                    raise RunnerError("comments_artifact_stale", "评论资料已变化，请刷新后重新确认。", status_code=409)
+                ordinal = connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM task_steps WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    """INSERT INTO task_steps (
+                           id, task_id, kind, ordinal, status, depends_on_json,
+                           input_artifact_ids_json, output_artifact_ids_json, progress,
+                           message, error_code, retry_count, started_at, finished_at
+                       ) VALUES (?, ?, ?, ?, 'queued', '[]', ?, '[]', NULL, ?, NULL, 0, NULL, NULL)""",
+                    (step_id, task_id, StepKind.ANALYZE_COMMENTS.value, ordinal, input_ids, "等待评论分析授权"),
+                )
+                connection.execute(
+                    """INSERT INTO consents (
+                           id, task_id, step_kind, provider_id, model_id, artifact_ids_json,
+                           authorized, authorized_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                    (uuid.uuid4().hex, task_id, StepKind.ANALYZE_COMMENTS.value, provider_id, model_id, input_ids, now),
+                )
+                if options is not None:
+                    connection.execute(
+                        "INSERT INTO comment_analysis_options (step_id, task_id, options_json, created_at) VALUES (?, ?, ?, ?)",
+                        (step_id, task_id, json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(",", ":")), now),
+                    )
+                connection.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (TaskStatus.QUEUED.value, now, task_id),
+                )
+            self._queued_ids.add(task_id)
+            self._cancel_events[task_id] = threading.Event()
+            self._queue.put(_QueueItem(task_id, "", False, None, step_id))
+        return step_id
+
     def enqueue_followup_scripts(
         self,
         task_id: str,
@@ -1881,6 +1999,8 @@ class TaskRunner:
                     if pending.kind is StepKind.OCR
                     else "本地媒体导入完成"
                     if pending.kind is StepKind.IMPORT
+                    else "评论分析部分完成；请查看覆盖范围与停止原因"
+                    if pending.kind is StepKind.ANALYZE_COMMENTS and step_result.status == StepStatus.PARTIAL.value
                     else "评论分析完成；精选结果可逐条审核"
                     if pending.kind is StepKind.ANALYZE_COMMENTS
                     else "结构分析已保存，部分引用待核对" if pending.kind is StepKind.ANALYZE_STRUCTURE and step_result.status == StepStatus.PARTIAL.value

@@ -21,8 +21,8 @@ try:
         browser = p.chromium.launch()
         page = browser.new_page()
         config = {"archive_root": "F:/old", "obsidian_reference_root": None, "obsidian_output_root": None,
-                  "model_provider": "zhipu", "model_id": "glm-5.3-flash", "asr_model_id": "glm-asr-2512",
-                  "model_base_url": None, "vector_search_enabled": False}
+                  "obsidian_output_directories": [], "model_provider": "zhipu", "model_id": "glm-5.3-flash",
+                  "asr_model_id": "glm-asr-2512", "model_base_url": None, "vector_search_enabled": False}
         response = {"settings": config, "model_base_url_default": None, "model_providers": [],
                     "directory_conflicts": [], "credential": {"configured": False, "available": True}}
         choices = iter(["F:/新归档", None, "error", "F:/参考", "F:/输出"])
@@ -67,14 +67,16 @@ try:
         expect(page.locator("#obsidian-reference-root")).to_have_text("尚未选择文件夹")
         page.get_by_role("button", name="选择知识库风格参考目录").click()
         expect(page.locator("#obsidian-reference-root")).to_have_text("F:/参考")
-        page.get_by_role("button", name="选择知识库输出目录").click()
-        expect(page.locator("#obsidian-output-root")).to_have_text("F:/输出")
+        page.get_by_role("button", name="添加知识库输出目录").click()
+        page.get_by_label("知识库 1 名称").fill("主知识库")
+        page.get_by_role("button", name="选择知识库 1 输出目录").click()
+        expect(page.get_by_role("status", name="知识库 1 输出目录")).to_have_text("F:/输出")
         assert not saved
         page.get_by_role("button", name="检查并保存设置").click()
-        page.get_by_text("本机设置已保存。").wait_for()
+        page.get_by_text("设置已保存。").first.wait_for()
         assert saved[0]["archive_root"] == "F:/新归档"
         assert saved[0]["obsidian_reference_root"] == "F:/参考"
-        assert saved[0]["obsidian_output_root"] == "F:/输出"
+        assert saved[0]["obsidian_output_directories"] == [{"name": "主知识库", "directory": "F:/输出"}]
         browser.close()
         print("Folder selection, cancellation and explicit save passed")
 finally:

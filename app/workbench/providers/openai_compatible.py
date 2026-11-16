@@ -120,17 +120,13 @@ class ZhipuOpenAICompatibleProvider:
         # The transcription endpoint does not return segments, timestamps, or usage.
         return TranscriptResponse(text=text, segments=[], request_id=request_id, usage=UsageUnits())
 
-    def analyze_text(self, prompt: str, text: str, model_id: str) -> TextResponse:
+    def analyze_text(self, prompt: str, text: str, model_id: str, *, max_output_tokens: int | None = None) -> TextResponse:
         self._require_model_modality(model_id, "text")
         _require_nonempty_text(prompt)
         _require_nonempty_text(text)
-        payload = self._chat_completion(
-            model_id,
-            [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ],
-        )
+        messages = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+        payload = (self._chat_completion(model_id, messages) if max_output_tokens is None else
+                   self._chat_completion(model_id, messages, max_output_tokens=max_output_tokens))
         result_text = _chat_text(payload)
         return TextResponse(
             text=result_text,
@@ -210,8 +206,12 @@ class ZhipuOpenAICompatibleProvider:
             raise ProviderCapabilityError()
         return capability
 
-    def _chat_completion(self, model_id: str, messages: list[dict[str, object]]) -> dict[str, object]:
+    def _chat_completion(self, model_id: str, messages: list[dict[str, object]], *, max_output_tokens: int | None = None) -> dict[str, object]:
         request_payload: dict[str, object] = {"model": model_id, "messages": messages, "stream": False}
+        if max_output_tokens is not None:
+            if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
+                raise ProviderInputError()
+            request_payload["max_tokens"] = max_output_tokens
         if self._client_request_id is not None:
             request_payload["request_id"] = self._client_request_id
         body = json.dumps(

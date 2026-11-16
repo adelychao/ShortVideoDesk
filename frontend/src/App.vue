@@ -6,7 +6,7 @@ import brandLogo from './assets/digua-logo.svg'
 
 const route = useRoute()
 const pageTitle = computed(() => String(route.meta.title ?? '工作区'))
-const isNewArticleNavActive = computed(() => route.name === 'article-new'
+const isNewArticleNavActive = computed(() => ['article-new', 'article-from-text', 'article-manual'].includes(String(route.name))
   || (route.name === 'article-edit' && route.query.source === 'new-article'))
 const isArticleManagerNavActive = computed(() => route.name === 'articles'
   || route.name === 'article-publish'

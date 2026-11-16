@@ -61,3 +61,14 @@ def test_missing_detail_after_retry_has_actionable_error(monkeypatch):
         anonymous_poc.capture_public_detail('https://www.douyin.com/video/123', '123', lambda **_: None)
     assert error.value.code == 'media_unavailable'
     assert page.reloads == 1
+
+
+def test_download_detail_does_not_depend_on_windows_account_check(monkeypatch):
+    from app import browser_safety
+
+    setup_page(monkeypatch, True)
+    monkeypatch.setattr(browser_safety, '_is_windows', lambda: True)
+    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: True)
+    monkeypatch.setattr(browser_safety, '_account_safe', lambda: False)
+    result = anonymous_poc.capture_public_detail('https://www.douyin.com/video/123', '123', lambda **_: None)
+    assert result['aweme_id'] == '123'

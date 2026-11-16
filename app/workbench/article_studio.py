@@ -211,9 +211,14 @@ def create_article(
     allow_empty_body: bool = False,
     source_task_id: str | None = None,
     source_artifact_id: str | None = None,
+    source_kind: str | None = None,
+    generation_key_sha256: str | None = None,
     note: str = "初始版本",
 ) -> dict[str, Any]:
     clean = normalize_document(document, allow_empty_body=allow_empty_body)
+    resolved_source_kind = source_kind or ("final_script" if source_artifact_id else "manual")
+    if resolved_source_kind not in {"manual", "final_script", "pasted_script"}:
+        raise ValueError("文章来源类型无效。")
     article_id = uuid.uuid4().hex
     now = utc_now()
     encoded = _encode(clean)
@@ -221,9 +226,9 @@ def create_article(
         connection.execute(
             """INSERT INTO articles (
                    id, title, summary, document_json, status, version,
-                   source_task_id, source_artifact_id, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?)""",
-            (article_id, clean["title"], clean["summary"], encoded, source_task_id, source_artifact_id, now, now),
+                   source_task_id, source_artifact_id, source_kind, generation_key_sha256, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?, ?, ?)""",
+            (article_id, clean["title"], clean["summary"], encoded, source_task_id, source_artifact_id, resolved_source_kind, generation_key_sha256, now, now),
         )
         connection.execute(
             """INSERT INTO article_versions (id, article_id, version, title, document_json, note, created_at)
@@ -709,6 +714,7 @@ def _article_list_item(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
         "source_title": source_metadata.get("title"),
+        "source_kind": str(row["source_kind"]),
         "source_task_id": row["source_task_id"],
         "source_artifact_id": row["source_artifact_id"],
         "publication_statuses": publication_map,

@@ -65,7 +65,9 @@ def collect_comments(context: StepContext) -> StepResult:
                     source.platform, account_id=account_id, database=database
                 )
             else:
-                cookies = get_platform_account_manager().require_authenticated_cookies(source.platform)
+                cookies = get_platform_account_manager().require_authenticated_cookies(
+                    source.platform, collection_access=True
+                )
         except PlatformAccountError as exc:
             raise RunnerError("platform_account_required", str(exc), status_code=409) from exc
     adapter = _create_comment_adapter(source, access_mode, cookies)

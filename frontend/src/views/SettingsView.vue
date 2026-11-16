@@ -19,17 +19,21 @@ import 'element-plus/es/components/tag/style/css'
 import 'element-plus/es/components/switch/style/css'
 import { ApiError, api } from '../api/client'
 import PlatformLogo from '../components/PlatformLogo.vue'
-import type { AppSettings, DiagnosticResult, ModelProfile, ModelProviderOption, ScriptStyleTemplate } from '../api/types'
+import type { AppSettings, DiagnosticResult, ModelProfile, ModelProviderOption, ObsidianOutputDirectory, ScriptStyleTemplate } from '../api/types'
 import { useConfigStore } from '../stores/config'
 import DiagnosticsPanel from '../components/DiagnosticsPanel.vue'
 import LocalAsrSettings from '../components/LocalAsrSettings.vue'
 import ModelProfilesPanel from '../components/ModelProfilesPanel.vue'
+import CommentAnalysisOptionsForm from '../components/CommentAnalysisOptionsForm.vue'
+import { defaultCommentAnalysisOptions, validateCommentAnalysisOptions } from '../commentAnalysisOptions'
 
 function emptySettings(): AppSettings {
   return {
+    comment_analysis_options: defaultCommentAnalysisOptions(),
     archive_root: null,
     obsidian_reference_root: null,
     obsidian_output_root: null,
+    obsidian_output_directories: [],
     model_provider: 'zhipu',
     model_id: 'glm-5.3-flash',
     asr_model_id: 'glm-asr-2512',
@@ -47,7 +51,7 @@ function emptySettings(): AppSettings {
 
 const settings = reactive<AppSettings>(emptySettings())
 const route = useRoute()
-const settingsTabs = ['folders', 'models', 'knowledge', 'script-styles', 'checks', 'other'] as const
+const settingsTabs = ['folders', 'models', 'knowledge', 'script-styles', 'checks', 'comments', 'other'] as const
 type SettingsTab = typeof settingsTabs[number]
 const tabLabels: Record<SettingsTab, string> = {
   folders: '目录与知识库',
@@ -55,6 +59,7 @@ const tabLabels: Record<SettingsTab, string> = {
   knowledge: '知识卡提示词',
   'script-styles': '口播稿风格',
   checks: '运行检查',
+  comments: '评论分析',
   other: '其他设置',
 }
 const activeTab = ref<SettingsTab>('folders')
@@ -86,7 +91,7 @@ const imageFolders = [
   { field: 'article_image_root', label: '文章图片目录' },
 ] as const
 type ImageFolderSetting = typeof imageFolders[number]['field']
-type FolderSetting = 'archive_root' | 'obsidian_reference_root' | 'obsidian_output_root' | ImageFolderSetting
+type FolderSetting = 'archive_root' | 'obsidian_reference_root' | ImageFolderSetting
 const selectingFolder = ref<FolderSetting | null>(null)
 const folderError = ref('')
 const retentionDaysInput = ref<number | undefined>(settings.video_publish_retention_days)
@@ -113,6 +118,50 @@ async function selectFolder(field: FolderSetting): Promise<void> {
   }
 }
 
+const selectingLibraryIndex = ref<number | null>(null)
+
+async function selectLibraryFolder(index: number): Promise<void> {
+  if (selectingLibraryIndex.value !== null || selectingFolder.value) return
+  selectingLibraryIndex.value = index
+  folderError.value = ''
+  try {
+    const result = await api.selectLocalFolder()
+    if (result.path !== null && settings.obsidian_output_directories[index]) {
+      settings.obsidian_output_directories[index].directory = result.path
+      saveMessage.value = ''
+    }
+  } catch (error) {
+    folderError.value = errorMessage(error)
+  } finally {
+    selectingLibraryIndex.value = null
+  }
+}
+
+function addOutputDirectory(): void {
+  settings.obsidian_output_directories.push({ name: '', directory: '' })
+  saveMessage.value = ''
+}
+
+function removeOutputDirectory(index: number): void {
+  settings.obsidian_output_directories.splice(index, 1)
+  saveMessage.value = ''
+}
+
+function outputDirectoryError(): string {
+  const entries = settings.obsidian_output_directories
+  const unnamed = entries.find((item) => !item.name.trim())
+  if (unnamed) return '请为每个知识库目录填写名称。'
+  const unselected = entries.find((item) => !item.directory.trim())
+  if (unselected) return '请为每个知识库目录选择输出文件夹。'
+  const seen = new Set<string>()
+  for (const item of entries) {
+    const key = item.name.trim().toLowerCase()
+    if (seen.has(key)) return '知识库名称不能重复，请换一个名称。'
+    seen.add(key)
+  }
+  return ''
+}
+
 const selectedProvider = computed(() => modelProviders.value.find((item) => item.id === settings.model_provider) ?? null)
 
 function errorMessage(error: unknown): string {
@@ -120,7 +169,10 @@ function errorMessage(error: unknown): string {
 }
 
 function applySettings(value: AppSettings): void {
-  Object.assign(settings, value)
+  Object.assign(settings, value, {
+    comment_analysis_options: value.comment_analysis_options ?? defaultCommentAnalysisOptions(),
+    obsidian_output_directories: value.obsidian_output_directories ?? [],
+  })
   if (!settings.script_style_templates.some((item) => item.id === activeScriptStyleId.value)) {
     activeScriptStyleId.value = settings.script_style_templates[0]?.id ?? ''
   }
@@ -212,9 +264,16 @@ function applyProviderOptions(value: unknown): boolean {
 function requiredSettingsMessage(): string {
   saveFieldErrors.archive_root = ''
 
+  const commentError = validateCommentAnalysisOptions(settings.comment_analysis_options)
+  if (commentError) return commentError
+
   if (activeTab.value === 'folders' && !settings.archive_root?.trim()) {
     saveFieldErrors.archive_root = '请选择媒体归档目录。'
     return saveFieldErrors.archive_root
+  }
+  if (activeTab.value === 'folders') {
+    const libraryError = outputDirectoryError()
+    if (libraryError) return libraryError
   }
   if (activeTab.value === 'script-styles') {
     const invalid = settings.script_style_templates.find((item) => !item.name.trim() || !item.instructions.trim())
@@ -239,6 +298,7 @@ function validateRequiredSettings(): boolean {
 
   formError.value = saveReminder.value
   if (saveFieldErrors.archive_root) document.querySelector<HTMLButtonElement>('[aria-label="选择媒体归档目录"]')?.focus()
+  else if (validateCommentAnalysisOptions(settings.comment_analysis_options)) activeTab.value = 'comments'
   else document.querySelector<HTMLInputElement>('#video-publish-retention-days')?.focus()
   return false
 }
@@ -389,13 +449,56 @@ onMounted(() => {
                 </div>
                 <p class="helper">工作台只会读取你明确选择的参考范围；该目录必须已存在。</p>
 
-                <span id="obsidian-output-root-label" class="form-label settings-field">知识库输出目录</span>
-                <div class="folder-setting">
-                  <output id="obsidian-output-root" class="folder-path" aria-labelledby="obsidian-output-root-label" aria-live="polite">{{ settings.obsidian_output_root || '尚未选择文件夹' }}</output>
-                  <el-button size="small" aria-label="选择知识库输出目录" :disabled="!!selectingFolder || saving" @click="selectFolder('obsidian_output_root')">{{ selectingFolder === 'obsidian_output_root' ? '选择中…' : '选择文件夹' }}</el-button>
-                  <el-button v-if="settings.obsidian_output_root" size="small" link type="primary" aria-label="清除知识库输出目录" :disabled="!!selectingFolder || saving" @click="settings.obsidian_output_root = null; saveMessage = ''">清除</el-button>
+                <div class="settings-divider"></div>
+                <div class="library-list-head">
+                  <span id="obsidian-output-libraries-label" class="form-label settings-field">知识库输出目录</span>
+                  <el-button size="small" aria-label="添加知识库输出目录" :disabled="saving || !!selectingFolder || selectingLibraryIndex !== null" @click="addOutputDirectory">＋ 添加知识库目录</el-button>
                 </div>
-                <p class="helper">未来生成的 Markdown 只写入该目录；写入前仍会检查冲突。</p>
+                <p class="helper">审核通过的知识卡会写入这些目录；配置多个时，审核通过前会让你选择写入哪个知识库。</p>
+                <div v-if="settings.obsidian_output_directories.length" class="output-library-list" role="list">
+                  <div
+                    v-for="(entry, index) in settings.obsidian_output_directories"
+                    :key="index"
+                    class="output-library-row"
+                    role="listitem"
+                    :aria-label="`知识库目录 ${index + 1}`"
+                  >
+                    <el-input
+                      v-model="entry.name"
+                      class="output-library-name"
+                      maxlength="64"
+                      :disabled="saving"
+                      :aria-label="`知识库 ${index + 1} 名称`"
+                      placeholder="知识库名称，例如：职场干货"
+                    />
+                    <output class="folder-path output-library-path" :aria-label="`知识库 ${index + 1} 输出目录`" aria-live="polite">{{ entry.directory || '尚未选择文件夹' }}</output>
+                    <el-button
+                      size="small"
+                      :aria-label="`选择知识库 ${index + 1} 输出目录`"
+                      :disabled="saving || !!selectingFolder || selectingLibraryIndex !== null"
+                      @click="selectLibraryFolder(index)"
+                    >{{ selectingLibraryIndex === index ? '选择中…' : '选择文件夹' }}</el-button>
+                    <el-button
+                      v-if="entry.directory"
+                      size="small"
+                      link
+                      type="primary"
+                      :aria-label="`清除知识库 ${index + 1} 输出目录`"
+                      :disabled="saving || !!selectingFolder || selectingLibraryIndex !== null"
+                      @click="entry.directory = ''; saveMessage = ''"
+                    >清除</el-button>
+                    <el-button
+                      size="small"
+                      link
+                      type="danger"
+                      :aria-label="`移除知识库目录 ${index + 1}`"
+                      :disabled="saving || !!selectingFolder || selectingLibraryIndex !== null"
+                      @click="removeOutputDirectory(index)"
+                    >移除</el-button>
+                  </div>
+                </div>
+                <p v-else class="helper">尚未配置知识库输出目录；审核通过的知识卡将只完成审核，不写入文件。</p>
+                <p class="helper">写入前仍会逐个检查目录权限与文件冲突。</p>
                 <el-alert v-if="folderError" class="settings-form-alert" type="error" :closable="false" show-icon role="alert">{{ folderError }}</el-alert>
 
                 <el-collapse class="settings-advanced">
@@ -594,6 +697,18 @@ onMounted(() => {
             </div>
           </el-tab-pane>
 
+          <el-tab-pane :label="tabLabels.comments" name="comments">
+            <div class="settings-grid settings-single-column"><section class="panel settings-section">
+              <div class="panel-head"><div><h2>评论分析设置</h2><p>作为新建分析的默认设置；已开始的分析保留原有配置。开始分析前仍需确认范围和费用。</p></div></div>
+              <CommentAnalysisOptionsForm v-model="settings.comment_analysis_options" />
+              <p v-if="validateCommentAnalysisOptions(settings.comment_analysis_options)" class="required-field-error" role="alert">{{ validateCommentAnalysisOptions(settings.comment_analysis_options) }}</p>
+              <div class="settings-form-actions">
+                <el-alert v-if="formError" class="settings-form-alert" type="error" :closable="false" show-icon role="alert">{{ formError }}</el-alert>
+                <el-alert v-if="saveMessage" class="settings-form-alert" type="success" :closable="false" show-icon role="status">{{ saveMessage }}</el-alert>
+                <el-button type="primary" :disabled="saving || !!validateCommentAnalysisOptions(settings.comment_analysis_options)" @click="saveSettings">{{ saving ? '正在保存…' : '保存评论分析设置' }}</el-button>
+              </div>
+            </section></div>
+          </el-tab-pane>
           <el-tab-pane :label="tabLabels.other" name="other">
             <div class="settings-grid settings-single-column"><div class="stack">
               <section class="panel settings-section" aria-labelledby="image-storage-title">
@@ -701,6 +816,32 @@ onMounted(() => {
 .settings-view :deep(.el-collapse-item__wrap) { border-bottom: 0; background: transparent; }
 .settings-view :deep(.el-collapse-item__content) { padding-bottom: 4px; color: var(--text-secondary); }
 .settings-advanced { margin-top: 16px; }
+
+/* —— 知识库输出目录：多行（名称 + 目录）配置 —— */
+.library-list-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.output-library-list { display: grid; gap: 10px; }
+.output-library-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.output-library-row .output-library-path { align-self: stretch; display: flex; align-items: center; }
+.settings-view :deep(.output-library-name .el-input__inner) { font-size: var(--fs-body-sm); }
+@media (max-width: 900px) {
+  .output-library-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .output-library-row .output-library-path { grid-column: 1 / -1; }
+  .output-library-row :deep(.el-button) { justify-self: start; }
+}
+@media (max-width: 520px) {
+  .output-library-row { grid-template-columns: minmax(0, 1fr); }
+  .output-library-row :deep(.el-button) { justify-self: start; }
+}
 .settings-view :deep(.reference-notes) { margin-top: 10px; }
 .settings-view :deep(.reference-notes .el-collapse-item__header) { color: var(--ink); }
 .reference-note-pre { max-height: 360px; overflow: auto; margin: 4px 0 8px; color: var(--muted); font: inherit; font-size: var(--fs-caption); line-height: var(--lh-loose); white-space: pre-wrap; }

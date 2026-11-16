@@ -3,6 +3,9 @@ import type { TaskArtifact } from '../api/types'
 
 defineProps<{ artifact: TaskArtifact; label: string; icon: string; tone: string; description: string; previewLabel: string; busy: boolean; versions?: number; historyOpen?: boolean; historical?: boolean; sequence?: number }>()
 defineEmits<{ (event: 'preview', item: TaskArtifact): void; (event: 'open', item: TaskArtifact, reveal: boolean): void; (event: 'info', item: TaskArtifact): void; (event: 'history'): void }>()
+function previewUnavailable(artifact: TaskArtifact): boolean {
+  return artifact.file_available === false && !(artifact.kind === 'note' && artifact.metadata.scope === 'comments')
+}
 </script>
 
 <template>
@@ -13,7 +16,7 @@ defineEmits<{ (event: 'preview', item: TaskArtifact): void; (event: 'open', item
       <div class="artifact-row-copy"><strong>{{ label }} <span class="artifact-row-tag">{{ artifact.file_available === false ? '文件不可用' : description }}</span></strong><small :title="artifact.name">{{ artifact.name }}</small></div>
     </div>
     <div class="artifact-row-actions">
-      <button v-if="previewLabel" class="button button-secondary button-small artifact-primary" type="button" :disabled="artifact.file_available === false" @click="$emit('preview', artifact)">{{ previewLabel }}</button>
+      <button v-if="previewLabel" class="button button-secondary button-small artifact-primary" type="button" :disabled="previewUnavailable(artifact)" @click="$emit('preview', artifact)">{{ previewLabel }}</button>
       <button class="text-button" type="button" :disabled="artifact.file_available === false || busy" @click="$emit('open', artifact, false)">打开文件</button>
       <button class="text-button" type="button" :disabled="artifact.file_available === false || busy" @click="$emit('open', artifact, true)">目录</button>
       <button class="text-button" type="button" @click="$emit('info', artifact)">详情</button>

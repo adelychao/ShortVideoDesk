@@ -45,6 +45,65 @@ def test_new_comments_mark_existing_analysis_stale_without_queuing(tmp_path: Pat
     assert "重新授权" in row["message"]
 
 
+@pytest.mark.parametrize(("platform", "source_id", "domain", "cookie_name"), [
+    ("douyin", "123", ".douyin.com", "sessionid"),
+    ("bilibili", "BV1234567890", ".bilibili.com", "SESSDATA"),
+])
+def test_legacy_comment_account_does_not_depend_on_windows_check(
+    tmp_path, monkeypatch, platform, source_id, domain, cookie_name
+):
+    import playwright.sync_api
+    from app import browser_safety
+    from app.workbench.platform_accounts import PlatformAccountManager
+
+    database = Database(tmp_path / "workbench.sqlite3")
+    database.migrate()
+    now = datetime.now(timezone.utc)
+    source = SourceRecord(kind=SourceKind.URL, value="https://example.test/video", platform=platform, source_id=source_id)
+    with database.transaction(write=True) as connection:
+        connection.execute("INSERT INTO assets (id, identity_key, source_kind, platform, source_id, created_at) VALUES ('a', 'a', 'url', ?, ?, ?)", (platform, source_id, now.isoformat()))
+        connection.execute("INSERT INTO tasks (id, asset_id, source_json, status, created_at, updated_at) VALUES ('t', 'a', ?, 'running', ?, ?)", (json.dumps(source.to_dict()), now.isoformat(), now.isoformat()))
+        connection.execute("INSERT INTO task_steps (id, task_id, kind, ordinal, status, depends_on_json, input_artifact_ids_json, output_artifact_ids_json) VALUES ('c', 't', 'comments', 1, 'running', '[]', '[]', '[]')")
+
+    profile_root = tmp_path / "profiles"
+    profile = profile_root / platform
+    profile.mkdir(parents=True)
+    (profile / "marker").write_text("profile", encoding="utf-8")
+    cookie = {"name": cookie_name, "value": "session", "domain": domain, "expires": -1}
+    browser_context = SimpleNamespace(cookies=lambda: [cookie], close=lambda: None)
+    class PlaywrightManager:
+        def __enter__(self):
+            return SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=lambda **_: browser_context))
+        def __exit__(self, *_):
+            return None
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", lambda: PlaywrightManager())
+    monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
+    monkeypatch.setattr(browser_safety, "_session_unlocked", lambda: True)
+    monkeypatch.setattr(browser_safety, "_account_safe", lambda: False)
+    monkeypatch.setattr(comments_step_module, "get_task_access_mode", lambda *_: "account")
+    monkeypatch.setattr(comments_step_module, "get_task_access_account", lambda *_: (None, ""))
+    monkeypatch.setattr(comments_step_module, "get_platform_account_manager", lambda: PlatformAccountManager(profile_root))
+
+    class Adapter:
+        def fetch_page(self, _source, _cursor):
+            comment = CommentRecord(id="x", platform_comment_id="x", parent_id=None, author=None, text="评论", like_count=1, created_at=None, collected_at=now)
+            return CommentPage([comment], None, "平台已返回末页", False)
+        def close(self):
+            pass
+    def make_adapter(_platform, *, cookies, authenticated):
+        assert cookies == [cookie] and authenticated is True
+        return Adapter()
+    monkeypatch.setattr(comments_step_module, "adapter_for", make_adapter)
+    monkeypatch.setattr(comments_step_module, "_write_comment_note", lambda *_: "note")
+    context = SimpleNamespace(
+        repository=SimpleNamespace(database=database),
+        task=TaskRecord(id="t", asset_id="a", source=source, status="running", created_at=now, updated_at=now),
+        step=StepRecord(id="c", kind=StepKind.COMMENTS, ordinal=1, status="running"),
+        archive_root=tmp_path, cancel_event=threading.Event(), progress=lambda *_: None,
+    )
+    assert comments_step_module.collect_comments(context).status == "completed"
+
+
 @pytest.mark.parametrize("retry_succeeds", [True, False])
 def test_retryable_comment_failure_retries_once_without_waiting_for_other_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry_succeeds: bool
