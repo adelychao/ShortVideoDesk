@@ -1,3 +1,13 @@
+import type { VideoPublishBatch, VideoPublishTarget } from '../api/types'
+
+export function isDouyinScheduled(target: VideoPublishTarget): boolean {
+  return target.platform_id === 'douyin' && target.status === 'pending_review' && !target.options.save_as_draft && target.platform_status === 'scheduled' && !!target.platform_observed_at
+}
+
+export function isBatchScheduled(batch: VideoPublishBatch): boolean {
+  return batch.status === 'pending_review' && batch.targets.length > 0 && batch.targets.every(isDouyinScheduled)
+}
+
 const legacyMessageRewrites: Array<[string, string]> = [
   ['正在调用 SAU 上传。', '正在上传视频…'],
   ['SAU 发布流程已结束，平台作品状态等待单独同步确认。', '发布任务已提交，请到平台确认作品状态。'],

@@ -34,6 +34,9 @@ import type {
   UploadReceipt,
   CollectionMediaSelectResult,
   VideoPublishPoiSearchResult,
+  DouyinCreatorTag,
+  DouyinCreatorTagSearchCategory,
+  DouyinHotTopic,
   WorkbenchHealth,
   ArticleDocument,
   ArticleDeleteResult,
@@ -171,8 +174,24 @@ export const api = {
     return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/repost-history`, { method: 'POST', body: JSON.stringify({}) })
   },
 
+  getDouyinCollections(accountId: string): Promise<{ items: string[] }> {
+    return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/collections`, { method: 'POST', body: JSON.stringify({}) })
+  },
+
   searchDouyinPoi(accountId: string, keyword: string, cityCode: string | null): Promise<VideoPublishPoiSearchResult> {
     return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/poi-search`, { method: 'POST', body: JSON.stringify({ keyword, city_code: cityCode }) })
+  },
+
+  prewarmDouyinPoi(accountId: string): Promise<{ scheduled: boolean }> {
+    return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/poi-prewarm`, { method: 'POST', body: JSON.stringify({}) })
+  },
+
+  searchDouyinCreatorTags(accountId: string, category: DouyinCreatorTagSearchCategory, keyword: string): Promise<{ items: DouyinCreatorTag[] }> {
+    return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/creator-tag-search`, { method: 'POST', body: JSON.stringify({ category, keyword }) })
+  },
+
+  searchDouyinHotTopics(accountId: string, keyword?: string): Promise<{ items: DouyinHotTopic[] }> {
+    return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/hot-topic-search`, { method: 'POST', body: JSON.stringify({ keyword: keyword || null }) })
   },
 
   searchXhsPoi(accountId: string, keyword: string): Promise<{ items: import('./types').VideoPublishXhsPoi[] }> {
@@ -612,7 +631,7 @@ export const api = {
       comment_analysis_options: input.commentAnalysisOptions,
       transcription_mode: input.transcriptionMode ?? 'cloud',
       ocr_mode: input.ocrMode ?? 'cloud',
-      ocr_interval_seconds: input.ocrIntervalSeconds ?? 2,
+      ocr_interval_seconds: input.ocrIntervalSeconds ?? 1,
       ocr_scan_profile: input.ocrScanProfile ?? 'full',
       local_model: input.localModel ?? 'small',
       local_language: input.localLanguage ?? 'auto',

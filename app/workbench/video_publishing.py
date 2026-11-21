@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -16,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -30,6 +32,8 @@ from .bilibili_options import fetch_bilibili_publish_status
 from .baijiahao_video_status import fetch_status as fetch_baijiahao_video_status
 from .wechat_channels_status import fetch_status as fetch_wechat_channels_status
 from .database import Database, PROJECT_ROOT
+from .douyin_hot_topics import DouyinHotRecommendations, DouyinHotTopicsError
+from .douyin_lookup import DouyinLookup, DouyinLookupError
 from .image_storage import (
     IMAGE_FILENAME, VIDEO_COVER_LEASE_SECONDS, image_directory, registered_image_path,
     remove_registered_image, store_image,
@@ -68,6 +72,10 @@ _XHS_MANUAL_SUBMIT_CODE = "xhs_manual_submit"
 _VIDEO_PUBLISH_HEARTBEAT_STALE_SECONDS = 45
 _VIDEO_PUBLISH_STALL_SECONDS = 5 * 60
 _VIDEO_PUBLISH_RETRY_WARNING_COUNT = 3
+_DOUYIN_POI_CACHE_TTL_SECONDS = 180
+_DOUYIN_POI_CACHE_MAX_ENTRIES = 128
+_DOUYIN_POI_ACCOUNT_WAIT_SECONDS = 45
+_DOUYIN_POI_WARMUP_WAIT_SECONDS = 20
 _URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _SECRET_PATTERN = re.compile(r"(?i)(token|signature|sign|auth|authorization|api[_-]?key|cookie|secret)=([^&\s]+)")
 _PUBLISH_MEDIA_ROOT = PROJECT_ROOT / "data" / "workbench" / "video-publish"
@@ -187,13 +195,74 @@ def validate_douyin_location_options(options: dict[str, Any]) -> None:
     address = str(options.get("location_address") or "").strip()
     city_code = str(options.get("location_city_code") or "")
     city_name = str(options.get("location_city_name") or "").strip()
-    if not any((name, poi_id, address, city_code, city_name)):
+    search_tab_code = str(options.get("location_search_tab_code") or "")
+    if not any((name, poi_id, address, city_code, city_name, search_tab_code)):
         return
-    if not name or len(name) > 100 or not re.fullmatch(r"\d{5,30}", poi_id) or not address or len(address) > 300 or not re.fullmatch(r"\d{6}", city_code) or len(city_name) > 100:
+    if (not name or len(name) > 100 or not re.fullmatch(r"\d{5,30}", poi_id) or not address or len(address) > 300
+            or (city_code and not re.fullmatch(r"\d{6}", city_code))
+            or (search_tab_code and search_tab_code not in {"local", "domestic", "overseas"})
+            or (not city_code and not search_tab_code) or len(city_name) > 100):
         raise VideoPublishError("douyin_location_incomplete", "地点信息不完整，请重新搜索并选择具体地点。")
-    options.update(location=name, location_id=poi_id, location_address=address, location_city_code=city_code)
+    options.update(location=name, location_id=poi_id, location_address=address, location_city_code=city_code,
+                   location_search_tab_code=search_tab_code or "local")
     if city_name:
         options["location_city_name"] = city_name
+
+
+def validate_douyin_creator_metadata_options(options: dict[str, Any]) -> None:
+    allowed_categories = {"media_entertainment", "mini_program", "game_handle", "mark_anything"}
+    raw_tags = options.get("douyin_creator_tags", [])
+    if raw_tags is None:
+        raw_tags = []
+    if not isinstance(raw_tags, list) or len(raw_tags) > 4:
+        raise VideoPublishError("douyin_creator_tag_invalid", "抖音官方标签最多只能选择四种非位置标签。")
+    tags: list[dict[str, str]] = []
+    categories: set[str] = set()
+    for raw in raw_tags:
+        if not isinstance(raw, dict):
+            raise VideoPublishError("douyin_creator_tag_invalid", "抖音官方标签数据无效，请重新搜索选择。")
+        category = raw.get("category")
+        item_id = raw.get("id")
+        name_value = raw.get("name")
+        name = name_value.strip() if isinstance(name_value, str) else ""
+        if (not isinstance(category, str) or category not in allowed_categories or category in categories
+                or not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id)
+                or not name or len(name) > 160):
+            raise VideoPublishError("douyin_creator_tag_invalid", "抖音官方标签类别或平台实体无效，请重新搜索选择。")
+        categories.add(category)
+        item: dict[str, str] = {"id": item_id, "category": category, "name": name}
+        if category == "mini_program":
+            share_url = raw.get("share_url")
+            try:
+                parsed = urlsplit(share_url) if isinstance(share_url, str) else None
+            except ValueError:
+                parsed = None
+            if (parsed is None or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                    or len(share_url) > 2048 or any(ord(char) < 32 for char in share_url)):
+                raise VideoPublishError("douyin_mini_program_link_invalid", "抖音小程序分享链接无效，请重新粘贴并搜索。")
+            item["share_url"] = share_url
+        if category == "game_handle":
+            option_id = raw.get("mount_option_id")
+            if not isinstance(option_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", option_id):
+                raise VideoPublishError("douyin_game_mount_option_required", "请选择有效的游戏挂载方式。")
+            item["mount_option_id"] = option_id
+        tags.append(item)
+    if tags:
+        options["douyin_creator_tags"] = tags
+    else:
+        options.pop("douyin_creator_tags", None)
+
+    raw_hot = options.get("douyin_hot_topic")
+    if raw_hot is None:
+        options.pop("douyin_hot_topic", None)
+        return
+    if (not isinstance(raw_hot, dict)
+            or not isinstance(raw_hot.get("id"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", raw_hot["id"])
+            or not isinstance(raw_hot.get("title"), str)
+            or not raw_hot["title"].strip() or len(raw_hot["title"].strip()) > 120):
+        raise VideoPublishError("douyin_hot_topic_invalid", "抖音关联热点数据无效，请重新搜索选择。")
+    options["douyin_hot_topic"] = {"id": raw_hot["id"], "title": raw_hot["title"].strip()}
 
 
 def normalize_video_publish_schedule(value: str | None, platforms: list[str], *, now: datetime | None = None) -> str | None:
@@ -781,7 +850,7 @@ class SocialAutoUploadAdapter:
             result = json.loads(marker.group(1)) if marker else None
             if process.returncode != 0 or not isinstance(result, dict):
                 return {"status": "unknown", "message": "平台状态查询进程未返回有效结果。"}
-            if result.get("status") not in {"unknown", "private", "present", "reviewing", "published", "rejected", "restricted"}:
+            if result.get("status") not in {"unknown", "private", "present", "reviewing", "scheduled", "published", "rejected", "restricted"}:
                 return {"status": "unknown", "message": "平台返回了暂不支持识别的状态。"}
             return result
         except (OSError, ValueError, TypeError):
@@ -899,7 +968,7 @@ class SocialAutoUploadAdapter:
             if error:
                 return SauResult(None, "", launch_error=error)
 
-        if platform_id in {"kuaishou", "wechat_channels"} and options.get("collection_name"):
+        if platform_id in {"douyin", "kuaishou", "wechat_channels"} and options.get("collection_name"):
             argv.extend(["--collection", str(options["collection_name"])])
         if platform_id == "baijiahao":
             declaration = options.get("baijiahao_declaration")
@@ -956,6 +1025,12 @@ class SocialAutoUploadAdapter:
                 argv.extend(["--location-address", str(options["location_address"])])
             if options.get("location_city_code"):
                 argv.extend(["--location-city-code", str(options["location_city_code"])])
+            if options.get("location_search_tab_code"):
+                argv.extend(["--location-search-tab-code", str(options["location_search_tab_code"])])
+            if options.get("douyin_creator_tags"):
+                argv.extend(["--creator-tags-json", json.dumps(options["douyin_creator_tags"], ensure_ascii=False, separators=(",", ":"))])
+            if options.get("douyin_hot_topic"):
+                argv.extend(["--hot-topic-json", json.dumps(options["douyin_hot_topic"], ensure_ascii=False, separators=(",", ":"))])
             if options.get("visibility"):
                 argv.extend(["--visibility", str(options["visibility"])])
             if "allow_download" in options:
@@ -1574,14 +1649,14 @@ def _normalize_video_publish_target_options(
         allowed_options.add("cover_upload_id")
     if platform_id == "baijiahao":
         allowed_options.update({"cover_portrait_upload_id", "cover_16_9_upload_id"})
-    if platform_id in {"kuaishou", "wechat_channels"}:
+    if platform_id in {"douyin", "kuaishou", "wechat_channels"}:
         allowed_options.add("collection_name")
     if platform_id in {"kuaishou", "xiaohongshu"}:
         allowed_options.add("cover_ratio")
     if platform_id == "wechat_channels":
         allowed_options.update({"short_title", "save_as_draft"})
     if platform_id == "douyin":
-        allowed_options.update({"declaration", "repost_source", "repost_title", "repost_id", "location", "location_id", "location_address", "location_city_code", "location_city_name", "visibility", "allow_download"})
+        allowed_options.update({"declaration", "repost_source", "repost_title", "repost_id", "location", "location_id", "location_address", "location_city_code", "location_city_name", "location_search_tab_code", "douyin_creator_tags", "douyin_hot_topic", "visibility", "allow_download"})
     if platform_id == "xiaohongshu":
         allowed_options.update({"xhs_original", "xhs_declaration", "xhs_repost_source", "xhs_visibility", "xhs_location", "xhs_location_id", "xhs_location_address"})
     if platform_id == "baijiahao":
@@ -1622,6 +1697,7 @@ def _normalize_video_publish_target_options(
             options["declaration"] = declaration
         validate_douyin_repost_options(options)
         validate_douyin_location_options(options)
+        validate_douyin_creator_metadata_options(options)
         if "visibility" in options and options["visibility"] not in {"public", "friends", "private"}:
             raise VideoPublishError("douyin_visibility_invalid", "抖音可见范围选项无效。")
         if "allow_download" in options and not isinstance(options["allow_download"], bool):
@@ -1945,7 +2021,7 @@ def _normalize_video_publish_draft_form(form: dict[str, object]) -> tuple[dict[s
         "title", "description", "tags", "schedule_mode", "schedule_at", "platform_schedules",
         "selected_account_ids", "active_platform_id", "overrides", "poi_selections",
         "poi_queries", "poi_city_codes", "xhs_poi_selections", "xhs_poi_queries",
-        "repost_selections", "tag_draft", "cover_preferences",
+        "repost_selections", "collection_selections", "tag_draft", "cover_preferences", "douyin_metadata",
     }
     if not isinstance(form, dict) or set(form) - allowed:
         raise VideoPublishError("draft_form_invalid", "本地草稿表单数据无效，请刷新页面后重试。")
@@ -1958,11 +2034,83 @@ def _normalize_video_publish_draft_form(form: dict[str, object]) -> tuple[dict[s
         raise VideoPublishError("draft_form_too_large", "本地草稿设置过多，无法保存。")
     if not isinstance(normalized, dict):
         raise VideoPublishError("draft_form_invalid", "本地草稿表单数据无效。")
+    metadata = normalized.get("douyin_metadata", {})
+    if not isinstance(metadata, dict) or len(metadata) > _MAX_TARGETS:
+        raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音标签设置无效。")
+    safe_metadata: dict[str, object] = {}
+    valid_categories = {"location", "media_entertainment", "mini_program", "game_handle", "mark_anything"}
+    for account_id, value in metadata.items():
+        if not isinstance(account_id, str) or not account_id or len(account_id) > 64 or not isinstance(value, dict):
+            raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音标签账号数据无效。")
+        category = value.get("category", "location")
+        queries = value.get("queries", {})
+        selected = value.get("creator_tags", [])
+        hot_query = value.get("hot_topic_query", "")
+        hot = value.get("hot_topic")
+        if (not isinstance(category, str) or category not in valid_categories or not isinstance(queries, dict) or len(queries) > 5
+                or any(not isinstance(key, str) or key not in valid_categories or not isinstance(query, str) or len(query) > 2048 for key, query in queries.items())
+                or not isinstance(selected, list) or len(selected) > 5
+                or not isinstance(hot_query, str) or len(hot_query) > 100):
+            raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音标签或热点搜索内容无效。")
+        safe_tags: list[dict[str, object]] = []
+        seen_categories: set[str] = set()
+        for tag in selected:
+            if not isinstance(tag, dict):
+                raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音标签数据无效。")
+            tag_category, tag_id, name = tag.get("category"), tag.get("id"), tag.get("name")
+            if (not isinstance(tag_category, str) or tag_category not in valid_categories or tag_category in seen_categories
+                    or not isinstance(tag_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", tag_id)
+                    or not isinstance(name, str) or not name.strip() or len(name.strip()) > 160):
+                raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音标签实体无效。")
+            seen_categories.add(tag_category)
+            clean_tag: dict[str, object] = {"id": tag_id, "category": tag_category, "name": name.strip()}
+            if tag_category == "location":
+                address, city_code = tag.get("address"), tag.get("city_code")
+                city_name = tag.get("city_name", "")
+                search_tab_code = tag.get("search_tab_code", "local")
+                if (not isinstance(address, str) or not address.strip() or len(address) > 300
+                        or not isinstance(city_code, str) or (city_code and not re.fullmatch(r"\d{6}", city_code))
+                        or not isinstance(search_tab_code, str) or search_tab_code not in {"local", "domestic", "overseas"}
+                        or (not city_code and search_tab_code != "overseas")
+                        or not isinstance(city_name, str) or len(city_name) > 100):
+                    raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音地点数据无效。")
+                clean_tag.update({"address": address.strip(), "city_code": city_code, "city_name": city_name,
+                                  "search_tab_code": search_tab_code})
+            if tag_category == "mini_program":
+                share_url = tag.get("share_url")
+                try:
+                    parsed = urlsplit(share_url) if isinstance(share_url, str) else None
+                except ValueError:
+                    parsed = None
+                if parsed is None or parsed.scheme != "https" or not parsed.hostname or len(share_url) > 2048:
+                    raise VideoPublishError("draft_form_invalid", "本地草稿中的小程序分享链接无效。")
+                clean_tag["share_url"] = share_url
+            if tag_category == "game_handle":
+                mount_id = tag.get("mount_option_id")
+                if not isinstance(mount_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mount_id):
+                    raise VideoPublishError("draft_form_invalid", "本地草稿中的游戏挂载方式无效。")
+                clean_tag["mount_option_id"] = mount_id
+                mount_description = tag.get("mount_option_description", "")
+                if not isinstance(mount_description, str) or len(mount_description) > 80:
+                    raise VideoPublishError("draft_form_invalid", "本地草稿中的游戏挂载说明无效。")
+                if mount_description:
+                    clean_tag["mount_option_description"] = mount_description
+            safe_tags.append(clean_tag)
+        if hot is not None:
+            if (not isinstance(hot, dict) or not isinstance(hot.get("id"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", hot["id"])
+                    or not isinstance(hot.get("title"), str) or not hot["title"].strip() or len(hot["title"].strip()) > 120):
+                raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音关联热点无效。")
+            hot = {"id": hot["id"], "title": hot["title"].strip()}
+        safe_metadata[account_id] = {"category": category, "queries": queries, "creator_tags": safe_tags,
+                                     "hot_topic_query": hot_query, "hot_topic": hot}
+    normalized["douyin_metadata"] = safe_metadata
     title = normalized.get("title", "")
     description = normalized.get("description", "")
     tags = normalized.get("tags", [])
     schedule_mode = normalized.get("schedule_mode", "immediate")
     selected_ids = normalized.get("selected_account_ids", [])
+    collection_selections = normalized.get("collection_selections", {})
     if (
         not isinstance(title, str) or len(title) > 200
         or not isinstance(description, str) or len(description) > 1000
@@ -1971,8 +2119,13 @@ def _normalize_video_publish_draft_form(form: dict[str, object]) -> tuple[dict[s
         or not isinstance(schedule_mode, str) or schedule_mode not in {"immediate", "scheduled"}
         or not isinstance(selected_ids, list) or len(selected_ids) > _MAX_TARGETS
         or any(not isinstance(item, str) or len(item) > 64 for item in selected_ids)
+        or not isinstance(collection_selections, dict) or len(collection_selections) > _MAX_TARGETS
+        or any(not isinstance(key, str) or len(key) > 64 or not isinstance(value, str) or len(value) > 100 for key, value in collection_selections.items())
     ):
         raise VideoPublishError("draft_form_invalid", "本地草稿中的标题、简介、标签或账号设置无效。")
+    serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(serialized.encode("utf-8")) > 512 * 1024:
+        raise VideoPublishError("draft_form_too_large", "本地草稿设置过多，无法保存。")
     return normalized, serialized
 
 
@@ -3075,6 +3228,8 @@ class VideoPublishManager:
     def __init__(self, database: Database, *, worker_count: int = 2) -> None:
         self.database = database
         self.adapter = SocialAutoUploadAdapter(database)
+        self._douyin_lookup = DouyinLookup()
+        self._douyin_hot_recommendations = DouyinHotRecommendations()
         self.worker_count = max(1, min(worker_count, 3))
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._stop = threading.Event()
@@ -3084,6 +3239,9 @@ class VideoPublishManager:
         self._cancel_requests: set[str] = set()
         self._account_login_cancel_events: dict[str, threading.Event] = {}
         self._account_locks: dict[str, threading.Lock] = {}
+        self._douyin_poi_cache: OrderedDict[tuple[str, str, str], tuple[float, dict[str, object]]] = OrderedDict()
+        self._douyin_poi_warmups: set[str] = set()
+        self._douyin_poi_warmup_events: dict[str, threading.Event] = {}
         self._last_output_write: dict[str, float] = {}
         self._sync_pending: set[str] = set()
         self._sync_thread: threading.Thread | None = None
@@ -3162,6 +3320,7 @@ class VideoPublishManager:
             scheduler.join(timeout=2)
         if cleanup_thread:
             cleanup_thread.join(timeout=2)
+        self._douyin_lookup.close()
         self.account_workbench_browser.close_all()
 
     def open_account_workbench(self, account_id: str) -> dict[str, str]:
@@ -3381,8 +3540,6 @@ class VideoPublishManager:
             _LOGGER.warning('could not inspect saved xiaohongshu account identities')
 
     def _restore_saved_xhs_profiles(self) -> None:
-        if not browser_automation_paused():
-            return
         with self.database.transaction() as connection:
             rows = connection.execute("""SELECT id, account_alias FROM video_publish_accounts
                 WHERE platform_id='xiaohongshu' AND enabled=1 AND status='connected'
@@ -3503,6 +3660,41 @@ class VideoPublishManager:
                 if isinstance(item, dict) and isinstance(item.get("id"), str) and re.fullmatch(r"\d{5,30}", item["id"])
                 and isinstance(item.get("title"), str) and 0 < len(item["title"]) <= 500]
 
+    def get_douyin_collections(self, account_id: str) -> list[str]:
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        if account["platform_id"] != "douyin" or account["status"] != "connected":
+            raise VideoPublishError("douyin_collection_account_unavailable", "请先连接要读取合集的抖音账号。", 409)
+        key = f"douyin-collections:{account_id}"
+        try:
+            with self._account_lock(account_id):
+                result = self.adapter.run(
+                    ["douyin", "list-collections", "--account", str(account["account_alias"])],
+                    lambda process: self._register_process(key, process), 90,
+                )
+        finally:
+            with self._lock:
+                self._processes.pop(key, None)
+        if result.launch_error:
+            raise VideoPublishError("douyin_collections_unavailable", result.launch_error, 409)
+        if result.timed_out or result.returncode != 0:
+            raise VideoPublishError("douyin_collections_unavailable", "无法读取该账号的抖音合集，请确认账号登录状态后重试。", 409)
+        marker = re.search(r"(?m)^DOUYIN_COLLECTIONS_JSON:(\{[^\r\n]*\})\s*$", result.output)
+        try:
+            payload = json.loads(marker.group(1)) if marker else None
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise VideoPublishError("douyin_collections_unavailable", "抖音合集列表返回的数据无法识别，请重试。", 502)
+        names = []
+        for item in payload["items"][:100]:
+            if isinstance(item, str):
+                name = item.strip()
+                if name and len(name) <= 100 and name not in names:
+                    names.append(name)
+        return names
+
     def search_xhs_poi(self, account_id: str, keyword: str) -> dict[str, object]:
         from .xhs_poi import XhsPoiError, search_poi
         account = _get_account(self.database, account_id)
@@ -3527,58 +3719,353 @@ class VideoPublishManager:
         finally:
             lock.release()
 
-    def search_douyin_poi(self, account_id: str, keyword: str, city_code: str | None = None) -> dict[str, object]:
+    def _douyin_poi_cache_key(self, account_id: str, keyword: str, city_code: str | None) -> tuple[str, str, str]:
+        return account_id, keyword.strip(), city_code or ""
+
+    def _lookup_douyin_in_browser(self, operation: str, account: dict, keyword: str,
+                                 city_code: str | None = None) -> dict | None:
+        project_path = self.adapter.configured_project_path()
+        if not project_path or not DouyinLookup.available(project := Path(project_path)):
+            return None
+        try:
+            require_safe_browser("video publishing")
+            return self._douyin_lookup.search(project, operation, str(account["account_alias"]), keyword, city_code)
+        except (DouyinLookupError, BrowserSafetyError) as exc:
+            raise VideoPublishError("douyin_metadata_search_unavailable", str(exc), 409) from None
+
+    def _read_douyin_poi_cache(self, cache_key: tuple[str, str, str]) -> dict[str, object] | None:
+        with self._lock:
+            entry = self._douyin_poi_cache.get(cache_key)
+            if entry is None:
+                return None
+            fetched_at, result = entry
+            if time.monotonic() - fetched_at > _DOUYIN_POI_CACHE_TTL_SECONDS:
+                self._douyin_poi_cache.pop(cache_key, None)
+                return None
+            self._douyin_poi_cache.move_to_end(cache_key)
+            return copy.deepcopy(result)
+
+    def _write_douyin_poi_cache(self, cache_key: tuple[str, str, str], result: dict[str, object]) -> None:
+        with self._lock:
+            self._douyin_poi_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+            self._douyin_poi_cache.move_to_end(cache_key)
+            while len(self._douyin_poi_cache) > _DOUYIN_POI_CACHE_MAX_ENTRIES:
+                self._douyin_poi_cache.popitem(last=False)
+
+    def _clear_douyin_poi_cache(self, account_id: str) -> None:
+        with self._lock:
+            for cache_key in [key for key in self._douyin_poi_cache if key[0] == account_id]:
+                self._douyin_poi_cache.pop(cache_key, None)
+
+    def _schedule_douyin_poi_warmup(self, account_id: str) -> bool:
+        if self._read_douyin_poi_cache(self._douyin_poi_cache_key(account_id, "", "local")) is not None:
+            return False
+        with self._lock:
+            if self._stop.is_set() or account_id in self._douyin_poi_warmups:
+                return False
+            self._douyin_poi_warmups.add(account_id)
+            self._douyin_poi_warmup_events[account_id] = threading.Event()
+        self._queue.put(("poi-warmup", account_id))
+        return True
+
+    def prewarm_douyin_poi(self, account_id: str) -> bool:
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        if account["platform_id"] != "douyin" or account["status"] != "connected":
+            raise VideoPublishError("poi_account_unavailable", "请先连接要搜索地点的抖音账号。", 409)
+        return self._schedule_douyin_poi_warmup(account_id)
+
+    def _run_douyin_poi_warmup(self, account_id: str) -> None:
+        # 自检成功后异步预热本地默认地点，不延长账号勾选等待。作者：zhw，时间：2026-11-18 23:16:55（Asia/Shanghai）
+        try:
+            self.search_douyin_poi(account_id, "", "local", wait_for_warmup=False)
+        except Exception as exc:
+            _LOGGER.info("Douyin location prefetch failed for %s: %s", account_id, _safe_message(exc))
+        finally:
+            with self._lock:
+                self._douyin_poi_warmups.discard(account_id)
+                event = self._douyin_poi_warmup_events.pop(account_id, None)
+                if event is not None:
+                    event.set()
+
+    def search_douyin_poi(
+        self,
+        account_id: str,
+        keyword: str,
+        city_code: str | None = None,
+        *,
+        wait_for_warmup: bool = True,
+    ) -> dict[str, object]:
         account = _get_account(self.database, account_id)
         if account is None:
             raise KeyError(account_id)
         if account["platform_id"] != "douyin" or account["status"] != "connected":
             raise VideoPublishError("poi_account_unavailable", "请先连接要搜索地点的抖音账号。", 409)
         keyword = keyword.strip()
-        if not keyword or len(keyword) > 100 or (city_code and not re.fullmatch(r"\d{6}", city_code)):
+        if len(keyword) > 100 or (city_code and not (re.fullmatch(r"\d{6}", city_code) or city_code in {"local", "domestic", "overseas"})):
             raise VideoPublishError("poi_search_invalid", "请输入有效的地点关键词和城市。")
+        cache_key = self._douyin_poi_cache_key(account_id, keyword, city_code)
+        cached_result = self._read_douyin_poi_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
         args = ["douyin", "poi-search", "--account", str(account["account_alias"]), "--keyword", keyword]
         if city_code:
             args.extend(["--city-code", city_code])
         key = f"poi-search:{account_id}"
         account_lock = self._account_lock(account_id)
-        if not account_lock.acquire(blocking=False):
+        lock_acquired = account_lock.acquire(blocking=False)
+        if not lock_acquired and wait_for_warmup:
+            wait_started = time.monotonic()
+            with self._lock:
+                warmup_event = self._douyin_poi_warmup_events.get(account_id)
+            if warmup_event is not None:
+                warmup_event.wait(timeout=min(
+                    _DOUYIN_POI_WARMUP_WAIT_SECONDS,
+                    _DOUYIN_POI_ACCOUNT_WAIT_SECONDS,
+                ))
+            cached_result = self._read_douyin_poi_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
+            remaining = max(0.0, _DOUYIN_POI_ACCOUNT_WAIT_SECONDS - (time.monotonic() - wait_started))
+            lock_acquired = remaining > 0 and account_lock.acquire(timeout=remaining)
+        if not lock_acquired:
+            cached_result = self._read_douyin_poi_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
+            if wait_for_warmup:
+                raise VideoPublishError("poi_account_busy", "抖音账号仍在处理其他操作，等待超时，请稍后重试地点搜索。", 409)
             raise VideoPublishError("poi_account_busy", "该抖音账号正在执行其他操作，请稍后再搜索地点。", 409)
         try:
-            result = self.adapter.run(args, lambda process: self._register_process(key, process), 90)
+            cached_result = self._read_douyin_poi_cache(cache_key)
+            if cached_result is not None:
+                return cached_result
+            account = _get_account(self.database, account_id)
+            if not account or account["status"] != "connected":
+                raise VideoPublishError("poi_account_unavailable", "请先连接要搜索地点的抖音账号。", 409)
+            payload = self._lookup_douyin_in_browser("poi", account, keyword, city_code)
+            if payload is None:
+                result = self.adapter.run(args, lambda process: self._register_process(key, process), 90)
+                if result.launch_error:
+                    raise VideoPublishError("poi_search_unavailable", result.launch_error, 409)
+                if result.timed_out or result.returncode != 0:
+                    raise VideoPublishError("poi_search_unavailable", "无法读取抖音地点，请检查该账号登录状态或稍后重试。", 409)
+                marker = re.search(r"(?m)^DOUYIN_POI_JSON:(\{[^\r\n]*\})\s*$", result.output)
+                try:
+                    payload = json.loads(marker.group(1)) if marker else None
+                except (TypeError, json.JSONDecodeError, RecursionError):
+                    payload = None
+            normalized = self._normalize_douyin_poi_result(payload, city_code)
+            self._write_douyin_poi_cache(cache_key, normalized)
+            return normalized
         finally:
-            account_lock.release()
             with self._lock:
                 self._processes.pop(key, None)
-        if result.launch_error:
-            raise VideoPublishError("poi_search_unavailable", result.launch_error, 409)
-        if result.timed_out or result.returncode != 0:
-            raise VideoPublishError("poi_search_unavailable", "无法读取抖音地点，请检查该账号登录状态或稍后重试。", 409)
-        marker = re.search(r"(?m)^DOUYIN_POI_JSON:(\{[^\r\n]*\})\s*$", result.output)
-        try:
-            payload = json.loads(marker.group(1)) if marker else None
-        except (TypeError, json.JSONDecodeError):
-            payload = None
+            account_lock.release()
+
+    @staticmethod
+    def _normalize_douyin_poi_result(payload: object, city_code: str | None) -> dict[str, object]:
         if not isinstance(payload, dict) or not isinstance(payload.get("items"), list) or not isinstance(payload.get("cities"), list):
             raise VideoPublishError("poi_search_unavailable", "抖音地点搜索结果无法识别，请重试。", 502)
         selected = str(payload.get("selected_city_code") or "")
-        if not re.fullmatch(r"\d{6}", selected) or (city_code and selected != city_code):
+        if not (re.fullmatch(r"\d{6}", selected) or selected in {"local", "domestic", "overseas"}) or (city_code and selected != city_code):
             raise VideoPublishError("poi_search_invalid_city", "无法确认抖音返回的搜索城市，请重试。", 502)
         cities = [{"code": item["code"], "name": item["name"]} for item in payload["cities"][:50]
                   if isinstance(item, dict) and isinstance(item.get("code"), str) and re.fullmatch(r"\d{6}", item["code"])
                   and isinstance(item.get("name"), str) and 0 < len(item["name"]) <= 100]
+        official_tab_names = {"local": "本地", "domestic": "国内", "overseas": "国际"}
+        raw_tabs = payload.get("tabs")
+        tabs = [{"code": item["code"], "name": item["name"]} for item in raw_tabs[:3]
+                if isinstance(raw_tabs, list) and isinstance(item, dict) and item.get("code") in official_tab_names
+                and item.get("name") == official_tab_names[item["code"]]] if isinstance(raw_tabs, list) else []
+        if not tabs:
+            tabs = [{"code": code, "name": name} for code, name in official_tab_names.items()]
         items = []
         for item in payload["items"][:30]:
             if not isinstance(item, dict):
                 continue
+            item_city_code = item.get("city_code")
+            if not isinstance(item_city_code, str) or (item_city_code and not re.fullmatch(r"\d{6}", item_city_code)):
+                continue
+            if not item_city_code and selected != "overseas":
+                continue
+            if re.fullmatch(r"\d{6}", selected) and item_city_code != selected:
+                continue
+            item_city_name = item.get("city_name")
+            if not isinstance(item_city_name, str) or len(item_city_name.strip()) > 100:
+                item_city_name = ""
+            distance = item.get("distance")
+            if not isinstance(distance, str) or len(distance.strip()) > 32:
+                distance = ""
             candidate = {"location": item.get("name"), "location_id": item.get("id"), "location_address": item.get("address"),
-                         "location_city_code": selected, "location_city_name": next((c["name"] for c in cities if c["code"] == selected), "")}
+                         "location_city_code": item_city_code,
+                         "location_search_tab_code": selected,
+                         "location_city_name": item_city_name.strip() or next((c["name"] for c in cities if c["code"] == item_city_code), "")}
             try:
                 validate_douyin_location_options(candidate)
             except VideoPublishError:
                 continue
             items.append({"id": candidate["location_id"], "name": candidate["location"], "address": candidate["location_address"],
-                          "city_code": selected, "city_name": candidate.get("location_city_name", "")})
-        return {"items": items, "cities": cities, "selected_city_code": selected}
+                          "city_code": item_city_code, "city_name": candidate.get("location_city_name", ""),
+                          "search_tab_code": selected, "distance": distance.strip()})
+        return {"items": items, "tabs": tabs, "cities": cities, "selected_city_code": selected}
+
+    def _search_douyin_metadata(self, account_id: str, args: list[str], marker_name: str, lock_suffix: str,
+                                *, hot_keyword: str | None = None) -> dict[str, object]:
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        if account["platform_id"] != "douyin" or account["status"] != "connected":
+            raise VideoPublishError("douyin_metadata_account_unavailable", "请先连接要搜索的抖音账号。", 409)
+        key = f"{lock_suffix}:{account_id}"
+        account_lock = self._account_lock(account_id)
+        wait = _DOUYIN_POI_ACCOUNT_WAIT_SECONDS if hot_keyword is not None else 0
+        if not account_lock.acquire(timeout=wait):
+            raise VideoPublishError("douyin_metadata_account_busy", "该抖音账号正在执行其他操作，请稍后再搜索。", 409)
+        try:
+            if hot_keyword is not None:
+                account = _get_account(self.database, account_id)
+                if not account or account["status"] != "connected":
+                    raise VideoPublishError("douyin_metadata_account_unavailable", "请先连接要搜索的抖音账号。", 409)
+                payload = self._lookup_douyin_in_browser("hot", account, hot_keyword)
+                if payload is not None:
+                    return payload
+            result = self.adapter.run(args, lambda process: self._register_process(key, process), 90)
+        finally:
+            with self._lock:
+                self._processes.pop(key, None)
+            account_lock.release()
+        if result.launch_error or result.timed_out or result.returncode != 0 or len(result.output) > 2 * 1024 * 1024:
+            raise VideoPublishError("douyin_metadata_search_unavailable", "无法读取抖音官方搜索结果，请检查账号登录状态或稍后重试。", 409)
+        prefix = marker_name + ":"
+        lines = [line[len(prefix):] for line in result.output.splitlines() if line.startswith(prefix)]
+        if len(lines) != 1 or len(lines[0]) > 1024 * 1024:
+            raise VideoPublishError("douyin_metadata_search_unavailable", "抖音搜索结果无法识别，请重试。", 502)
+        try:
+            payload = json.loads(lines[0])
+        except (TypeError, json.JSONDecodeError, RecursionError):
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise VideoPublishError("douyin_metadata_search_unavailable", "抖音搜索结果无法识别，请重试。", 502)
+        return payload
+
+    def search_douyin_creator_tags(self, account_id: str, category: str, keyword: str) -> dict[str, object]:
+        categories = {"media_entertainment", "mini_program", "game_handle", "mark_anything"}
+        keyword = keyword.strip()
+        if category not in categories or not keyword or len(keyword) > 2048:
+            raise VideoPublishError("douyin_creator_tag_search_invalid", "请输入有效的抖音官方标签类别和搜索内容。")
+        if category == "mini_program":
+            try:
+                parsed = urlsplit(keyword)
+            except ValueError:
+                parsed = None
+            if parsed is None or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                raise VideoPublishError("douyin_mini_program_link_invalid", "请粘贴有效的抖音小程序分享链接。")
+        elif len(keyword) > 100:
+            raise VideoPublishError("douyin_creator_tag_search_invalid", "标签搜索词不能超过 100 个字符。")
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        payload = self._search_douyin_metadata(
+            account_id,
+            ["douyin", "creator-tag-search", "--account", str(account["account_alias"]), "--category", category, "--keyword", keyword],
+            "DOUYIN_CREATOR_TAGS_JSON", "creator-tag-search",
+        )
+        rows: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for raw in payload["items"][:30]:
+            if not isinstance(raw, dict):
+                continue
+            item_id, name = raw.get("id"), raw.get("name")
+            if (raw.get("category") != category or not isinstance(item_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id)
+                    or not isinstance(name, str) or not name.strip() or len(name.strip()) > 160 or item_id in seen):
+                continue
+            item: dict[str, object] = {"id": item_id, "category": category, "name": name.strip()}
+            detail = raw.get("detail")
+            if isinstance(detail, str) and detail.strip():
+                item["detail"] = detail.strip()[:200]
+            if category == "mini_program":
+                link = raw.get("share_url")
+                if not isinstance(link, str) or link != keyword:
+                    continue
+                item["share_url"] = link
+            if category == "game_handle":
+                options = raw.get("mount_options")
+                if not isinstance(options, list):
+                    continue
+                mount_options = []
+                for option in options[:10]:
+                    if (isinstance(option, dict) and isinstance(option.get("id"), str)
+                            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", option["id"])
+                            and isinstance(option.get("description"), str) and option["description"].strip()):
+                        mount_options.append({"id": option["id"], "description": option["description"].strip()[:80]})
+                if not mount_options:
+                    continue
+                item["mount_options"] = mount_options
+            thumbnail = raw.get("thumbnail_url")
+            if isinstance(thumbnail, str) and len(thumbnail) <= 2048:
+                try:
+                    parsed_image = urlsplit(thumbnail)
+                    image_port = parsed_image.port
+                except ValueError:
+                    parsed_image = None
+                    image_port = None
+                allow = {"p11-sign.douyinpic.com", "p26-sign.douyinpic.com", "p9-sign.douyinpic.com", "p5-ex-gddgtc-sign.douyinpic.com"}
+                if parsed_image and parsed_image.scheme == "https" and image_port in (None, 443) and parsed_image.hostname in allow and not parsed_image.username and not parsed_image.password:
+                    item["thumbnail_url"] = thumbnail
+            seen.add(item_id)
+            rows.append(item)
+        return {"items": rows}
+
+    def search_douyin_hot_topics(self, account_id: str, keyword: str | None = None) -> dict[str, object]:
+        keyword = keyword.strip() if isinstance(keyword, str) else ""
+        if len(keyword) > 100:
+            raise VideoPublishError("douyin_hot_topic_search_invalid", "热点搜索词不能超过 100 个字符。")
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        if account["platform_id"] != "douyin" or account["status"] != "connected":
+            raise VideoPublishError("douyin_metadata_account_unavailable", "请先连接要搜索的抖音账号。", 409)
+        if keyword:
+            args = ["douyin", "hot-topic-search", "--account", str(account["account_alias"]), "--keyword", keyword]
+            raw_items = self._search_douyin_metadata(
+                account_id, args, "DOUYIN_HOT_TOPICS_JSON", "hot-topic-search", hot_keyword=keyword,
+            )["items"]
+        else:
+            try:
+                raw_items = self._douyin_hot_recommendations.read()
+            except DouyinHotTopicsError as exc:
+                raise VideoPublishError("douyin_hot_topic_search_unavailable", str(exc), 502) from None
+        items: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for raw in raw_items[:50]:
+            if not isinstance(raw, dict):
+                continue
+            item_id, title = raw.get("id"), raw.get("title")
+            if (not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id)
+                    or not isinstance(title, str) or not title.strip() or len(title.strip()) > 120 or item_id in seen):
+                continue
+            try:
+                count = int(raw.get("view_count", 0))
+            except (TypeError, ValueError, OverflowError):
+                count = 0
+            item = {"id": item_id, "title": title.strip(), "view_count": max(0, count),
+                    "view_count_text": str(raw.get("view_count_text") or "")[:80]}
+            thumbnail = raw.get("thumbnail_url")
+            if isinstance(thumbnail, str) and len(thumbnail) <= 2048:
+                try:
+                    parsed_image = urlsplit(thumbnail)
+                    image_port = parsed_image.port
+                except ValueError:
+                    parsed_image = None
+                    image_port = None
+                allow = {"p11-sign.douyinpic.com", "p26-sign.douyinpic.com", "p9-sign.douyinpic.com", "p5-ex-gddgtc-sign.douyinpic.com"}
+                if parsed_image and parsed_image.scheme == "https" and image_port in (None, 443) and parsed_image.hostname in allow and not parsed_image.username and not parsed_image.password:
+                    item["thumbnail_url"] = thumbnail
+            seen.add(item_id)
+            items.append(item)
+        return {"items": items}
 
     def enqueue_status_sync(self, target_id: str) -> bool:
         with self.database.transaction() as connection:
@@ -3628,8 +4115,8 @@ class VideoPublishManager:
                 continue
             schedule = options.get("schedule_at_override", row["schedule_at"])
             try:
-                # zhw 2026-11-15 22:46:12：定时时间按本机时区解释，等待计划时间后再核实。
-                if schedule and datetime.fromisoformat(str(schedule)).astimezone(timezone.utc) > current:
+                # 抖音可在计划时间之前核实作品卡片的定时发布状态。
+                if row["platform_id"] != "douyin" and schedule and datetime.fromisoformat(str(schedule)).astimezone(timezone.utc) > current:
                     continue
                 checked = row["platform_checked_at"]
                 if checked and current - datetime.fromisoformat(str(checked)).astimezone(timezone.utc) < timedelta(minutes=5):
@@ -3675,6 +4162,8 @@ class VideoPublishManager:
                     self._run_publish(item_id)
                 elif action == "sync":
                     self._run_status_sync(item_id)
+                elif action == "poi-warmup":
+                    self._run_douyin_poi_warmup(item_id)
                 else:
                     self._run_account_action(item_id, action)
             except Exception as exc:
@@ -3686,6 +4175,8 @@ class VideoPublishManager:
                     )
                 elif action == "sync":
                     _LOGGER.warning("douyin status sync failed for %s", item_id)
+                elif action == "poi-warmup":
+                    _LOGGER.info("Douyin location prefetch skipped for %s: %s", item_id, _safe_message(exc))
                 else:
                     try:
                         update_video_publish_account_status(self.database, item_id, "error", _safe_message(exc))
@@ -3958,7 +4449,17 @@ class VideoPublishManager:
         with self._account_lock(account_id):
             if action == "login" and self._account_login_cancellation_requested(account_id):
                 return
+            account = _get_account(self.database, account_id)
+            if action == "login" and account and account["platform_id"] == "douyin":
+                self._clear_douyin_poi_cache(account_id)
             self._run_account_action_locked(account_id, action)
+        if action == "check":
+            account = _get_account(self.database, account_id)
+            if account and account["platform_id"] == "douyin":
+                if account["status"] == "connected":
+                    self._schedule_douyin_poi_warmup(account_id)
+                else:
+                    self._clear_douyin_poi_cache(account_id)
 
     def _account_login_cancellation_requested(self, account_id: str) -> bool:
         with self._lock:
@@ -4600,14 +5101,16 @@ class VideoPublishManager:
             elif account["platform_id"] == "baijiahao":
                 self._refresh_baijiahao_account_profile(account_id, str(account["account_alias"]), key)
             else:
-                try:
-                    profile = self.adapter.read_account_profile(
-                        str(account["platform_id"]), str(account["account_alias"]),
-                        lambda process: self._register_process(key, process),
-                    )
-                except Exception:
-                    _LOGGER.warning("could not read video account profile for %s", account_id)
-                    profile = {}
+                profile = _parse_douyin_check_profile_output(result.output) if account["platform_id"] == "douyin" else None
+                if profile is None:
+                    try:
+                        profile = self.adapter.read_account_profile(
+                            str(account["platform_id"]), str(account["account_alias"]),
+                            lambda process: self._register_process(key, process),
+                        )
+                    except Exception:
+                        _LOGGER.warning("could not read video account profile for %s", account_id)
+                        profile = {}
                 with self._lock:
                     self._processes.pop(key, None)
                 if profile:
@@ -5452,6 +5955,32 @@ def _account_check_expired(result: SauResult) -> bool:
     )):
         return True
     return classify_site_issue(output) == SiteIssueCode.LOGIN_REQUIRED
+
+
+def _parse_douyin_check_profile_output(output: str) -> dict[str, str] | None:
+    prefix = "DOUYIN_ACCOUNT_PROFILE_JSON:"
+    lines = [line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)]
+    if len(lines) != 1 or len(lines[0]) > 16_384:
+        return None
+    try:
+        payload = json.loads(lines[0])
+    except (TypeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    profile: dict[str, str] = {}
+    name = payload.get("name")
+    if isinstance(name, str) and name.strip() and len(name.strip()) <= 80:
+        profile["name"] = name.strip()
+    avatar = payload.get("avatar_url")
+    if isinstance(avatar, str) and len(avatar) <= 2048:
+        try:
+            parsed = urlsplit(avatar)
+        except ValueError:
+            parsed = None
+        if parsed and parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password:
+            profile["avatar_url"] = avatar
+    return profile
 
 
 def _wechat_channels_cookie_expired(value: str) -> bool:

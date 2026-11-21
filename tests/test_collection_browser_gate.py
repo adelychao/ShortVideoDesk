@@ -52,6 +52,4 @@ def test_legacy_collection_account_can_read_session_despite_windows_account_chec
     monkeypatch.setattr(browser_safety, '_account_safe', lambda: False)
     assert manager.require_authenticated_cookies('douyin', collection_access=True) == [cookie]
 
-    from app.workbench.platform_accounts import PlatformAccountError
-    with pytest.raises(PlatformAccountError):
-        manager.require_authenticated_cookies('douyin')
+    assert manager.require_authenticated_cookies('douyin') == [cookie]

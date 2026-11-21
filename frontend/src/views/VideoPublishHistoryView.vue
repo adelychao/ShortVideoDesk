@@ -6,7 +6,7 @@ import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import { ApiError, api } from '../api/client'
 import type { VideoPublishBatch, VideoPublishDraft, VideoPublishTarget } from '../api/types'
-import { videoPublishUserMessage } from '../utils/videoPublishMessages'
+import { isBatchScheduled, isDouyinScheduled, videoPublishUserMessage } from '../utils/videoPublishMessages'
 
 const router = useRouter()
 const route = useRoute()
@@ -78,6 +78,7 @@ function statusLabel(value: string): string {
 }
 
 function targetStatusLabel(target: VideoPublishTarget): string {
+  if (isDouyinScheduled(target)) return '定时发布中'
   if (!target.options.save_as_draft) return statusLabel(target.status)
   return ({
     pending_review: '草稿待确认', unknown: '草稿结果未知', draft_saved: '草稿已保存',
@@ -104,7 +105,7 @@ function platformName(platformId: string): string {
 }
 
 function platformStatusLabel(value: string | null): string {
-  return ({ private: '作品存在 · 私密', present: '作品存在 · 状态待确认', reviewing: '审核中', published: '已发布', rejected: '审核未通过', restricted: '作品受限' } as Record<string, string>)[value || ''] || '尚未确认'
+  return ({ private: '作品存在 · 私密', present: '作品存在 · 状态待确认', reviewing: '审核中', scheduled: '定时发布中', published: '已发布', rejected: '审核未通过', restricted: '作品受限' } as Record<string, string>)[value || ''] || '尚未确认'
 }
 
 function batchPortraitCoverUrl(batch: VideoPublishBatch): string | undefined {
@@ -540,7 +541,7 @@ onBeforeUnmount(stopRefresh)
                 <span>{{ item.targets[0] ? `${platformName(item.targets[0].platform_id)} · ${item.targets[0].account_name || item.targets[0].account_alias}` : '未指定账号' }}</span>
                 <small>{{ item.targets.length }} 个发布目标<span v-if="item.targets.length > 1">，另有 {{ item.targets.length - 1 }} 个账号</span></small>
               </div>
-              <span class="video-state" :class="statusClass(item.status)">{{ statusLabel(item.status) }}</span>
+              <span class="video-state" :class="statusClass(item.status)">{{ isBatchScheduled(item) ? '定时发布中' : statusLabel(item.status) }}</span>
               <div class="video-batch-progress">
                 <strong>{{ item.summary.published + item.summary.draft_saved }} / {{ item.summary.total }}</strong>
                 <small>{{ batchProgressLabel(item) }}</small>

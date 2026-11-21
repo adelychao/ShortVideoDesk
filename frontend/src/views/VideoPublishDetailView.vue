@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ApiError, api } from '../api/client'
 import PlatformLogo from '../components/PlatformLogo.vue'
 import type { VideoPublishBatch, VideoPublishTarget, VideoPublishTargetStatus } from '../api/types'
-import { videoPublishUserMessage } from '../utils/videoPublishMessages'
+import { isBatchScheduled, isDouyinScheduled, videoPublishUserMessage } from '../utils/videoPublishMessages'
 
 const route = useRoute()
 const router = useRouter()
@@ -181,6 +181,10 @@ function statusLabel(status: string, target?: VideoPublishTarget): string {
   } as Record<string, string>)[status] || status
 }
 
+function targetStatusLabel(target: VideoPublishTarget): string {
+  return isDouyinScheduled(target) ? '定时发布中' : statusLabel(target.status, target)
+}
+
 function statusTone(status: string): string {
   if (status === 'published' || status === 'draft_saved') return 'is-success'
   if (status === 'running') return 'is-running'
@@ -209,7 +213,7 @@ function displayProgress(target: VideoPublishTarget): number | null {
 
 function platformStatusLabel(value: string | null): string {
   return ({
-    private: '作品存在 · 私密', present: '作品存在 · 状态待确认', reviewing: '审核中', published: '已发布',
+    private: '作品存在 · 私密', present: '作品存在 · 状态待确认', reviewing: '审核中', scheduled: '定时发布中', published: '已发布',
     rejected: '审核未通过', restricted: '作品受限',
   } as Record<string, string>)[value || ''] || '尚未确认'
 }
@@ -466,7 +470,7 @@ onBeforeUnmount(stopRefresh)
         </div>
         <div class="detail-batch-state">
           <span>当前任务状态</span>
-          <strong><i class="detail-state-dot" :class="statusTone(batch.status)"></i>{{ statusLabel(batch.status) }}</strong>
+          <strong><i class="detail-state-dot" :class="statusTone(batch.status)"></i>{{ isBatchScheduled(batch) ? '定时发布中' : statusLabel(batch.status) }}</strong>
           <small>每个账号独立执行与记录；待确认结果请查看对应平台回执。</small>
         </div>
       </section>
@@ -524,7 +528,7 @@ onBeforeUnmount(stopRefresh)
               <PlatformLogo class="detail-platform-mark" :platform-id="target.platform_id" :name="platformName(target.platform_id)" />
               <span><strong>{{ platformName(target.platform_id) }}</strong><small>{{ target.account_name || target.account_alias }}</small></span>
             </span>
-            <span class="detail-target-status" :class="statusTone(target.status)"><i class="detail-state-dot"></i>{{ statusLabel(target.status, target) }}</span>
+            <span class="detail-target-status" :class="statusTone(target.status)"><i class="detail-state-dot"></i>{{ targetStatusLabel(target) }}</span>
             <span class="detail-target-info">
               <template v-if="displayProgress(target) !== null">
                 <span>视频上传中 · {{ displayProgress(target) }}%</span>
@@ -546,7 +550,7 @@ onBeforeUnmount(stopRefresh)
           <div class="detail-inspector-body">
             <div class="detail-account-title">
               <div><strong>{{ platformName(selectedTarget.platform_id) }}</strong><small>{{ selectedTarget.account_name || selectedTarget.account_alias }}</small></div>
-              <span class="detail-state-pill" :class="statusTone(selectedTarget.status)"><i class="detail-state-dot"></i>{{ statusLabel(selectedTarget.status, selectedTarget) }}</span>
+              <span class="detail-state-pill" :class="statusTone(selectedTarget.status)"><i class="detail-state-dot"></i>{{ targetStatusLabel(selectedTarget) }}</span>
             </div>
 
             <div v-if="selectedTarget.status === 'unknown' || selectedTarget.status === 'failed' || selectedTarget.status === 'cancelled'" class="detail-primary-action">

@@ -5,10 +5,13 @@ from app.workbench.video_publishing import SocialAutoUploadAdapter, VideoPublish
 from app.workbench.database import Database
 
 
-def test_windows_automation_fails_closed_before_browser_start(monkeypatch):
+def test_supported_browser_operations_ignore_windows_state(monkeypatch):
     monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
-    with pytest.raises(browser_safety.BrowserSafetyError, match="暂停"):
-        browser_safety.require_safe_browser("test")
+    monkeypatch.setattr(browser_safety, "_session_unlocked", lambda: pytest.fail("unexpected session query"))
+    monkeypatch.setattr(browser_safety, "_account_safe", lambda: pytest.fail("unexpected account query"))
+    browser_safety.require_safe_browser("video publishing")
+    with pytest.raises(browser_safety.BrowserSafetyError):
+        browser_safety.require_safe_browser("unknown operation")
 
 
 def test_non_windows_does_not_inherit_windows_lockout_restriction(monkeypatch):
@@ -16,19 +19,25 @@ def test_non_windows_does_not_inherit_windows_lockout_restriction(monkeypatch):
     browser_safety.require_safe_browser("test")
 
 
-def test_sau_is_blocked_before_external_process(monkeypatch, tmp_path):
+def test_sau_check_can_start_without_windows_account_gate(monkeypatch, tmp_path):
+    from app.workbench.video_publishing import SauCommand
     monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
+    monkeypatch.setattr(browser_safety, "_account_safe", lambda: pytest.fail("unexpected account query"))
     adapter = SocialAutoUploadAdapter(Database(tmp_path / "test.sqlite3"))
-    result = adapter.run(["douyin", "check"], lambda process: pytest.fail("started"), 1)
-    assert result.launch_error and "暂停" in result.launch_error
+    monkeypatch.setattr(adapter, "resolve_command", lambda: (SauCommand(("sau",), tmp_path, str(tmp_path)), ""))
+    class Process:
+        returncode = 0
+        def communicate(self, timeout): return ("valid", None)
+    monkeypatch.setattr("app.workbench.video_publishing.subprocess.Popen", lambda *args, **kwargs: Process())
+    assert adapter.check("douyin", "account", lambda process: None).returncode == 0
 
 
-def test_video_manager_does_not_start_status_scheduler(tmp_path):
+def test_video_manager_starts_status_scheduler(tmp_path):
     database = Database(tmp_path / "test.sqlite3")
     manager = VideoPublishManager(database)
     manager.start()
     try:
-        assert manager._sync_thread is None
+        assert manager._sync_thread is not None and manager._sync_thread.is_alive()
     finally:
         manager.stop()
 
@@ -52,27 +61,20 @@ def test_blocked_publish_stays_queued_without_attempt(monkeypatch, tmp_path):
         assert c.execute("SELECT COUNT(*) FROM video_publish_attempts").fetchone()[0] == 0
 
 
-def test_platform_login_is_blocked_before_worker_or_browser(monkeypatch, tmp_path):
-    from app.workbench.platform_accounts import PlatformAccountError, PlatformAccountManager
+def test_login_component_still_rejects_unverified_browser(monkeypatch, tmp_path):
     monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
-    manager = PlatformAccountManager(tmp_path)
-    with pytest.raises(PlatformAccountError, match="暂停"):
-        manager.start_login("douyin")
-    assert not manager._windows
+    monkeypatch.setattr(browser_safety, "_verified_xhs_browser", lambda project: False)
+    with pytest.raises(browser_safety.BrowserSafetyError, match="登录组件"):
+        browser_safety.reserve_xiaohongshu_login(None, tmp_path)
 
 
-def test_open_chrome_is_blocked_before_process_start(monkeypatch):
-    from app.browser import open_chrome
-    monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
-    monkeypatch.setattr("app.browser.subprocess.Popen", lambda *args, **kwargs: pytest.fail("browser started"))
-    with pytest.raises(browser_safety.BrowserSafetyError, match="暂停"):
-        open_chrome("https://example.com")
+def test_compatibility_hooks_do_not_check_windows_account():
+    assert browser_safety._session_unlocked() is True
+    assert browser_safety._account_safe() is True
 
 
-def test_health_reports_browser_safety_pause(monkeypatch):
+def test_health_does_not_report_windows_account_pause(monkeypatch):
     import anonymous_poc
     monkeypatch.setattr(browser_safety, "_is_windows", lambda: True)
-    monkeypatch.setattr(browser_safety, "_windows_browser_state_safe", lambda: False)
-    assert anonymous_poc.health()["browser_automation_paused"] is True
-    monkeypatch.setattr(browser_safety, "_is_windows", lambda: False)
+    monkeypatch.setattr(browser_safety, "_windows_browser_state_safe", lambda: pytest.fail("unexpected state query"))
     assert anonymous_poc.health()["browser_automation_paused"] is False

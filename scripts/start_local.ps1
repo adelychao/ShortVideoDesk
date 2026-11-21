@@ -67,12 +67,58 @@ function Test-NodeVersion {
 }
 
 function Get-PythonLauncher {
+    $projectPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
+    if ((Get-ToolOutput $projectPython @('--version')) -match '^Python 3\.11\.') {
+        return [PSCustomObject]@{ Source = $projectPython; Arguments = @() }
+    }
+
     foreach ($candidate in Get-Command -Name 'py' -CommandType Application -All -ErrorAction SilentlyContinue) {
         $version = Get-ToolOutput $candidate.Source @('-3.11', '--version')
         if ($version -match '^Python 3\.11\.') {
-            return $candidate
+            return [PSCustomObject]@{ Source = $candidate.Source; Arguments = @('-3.11') }
         }
     }
+
+    foreach ($candidate in Get-Command -Name 'python.exe' -CommandType Application -All -ErrorAction SilentlyContinue) {
+        if ((Get-ToolOutput $candidate.Source @('--version')) -match '^Python 3\.11\.') {
+            return [PSCustomObject]@{ Source = $candidate.Source; Arguments = @() }
+        }
+    }
+
+    $uvPython = Get-ToolOutput 'uv' @('python', 'find', '3.11', '--no-project', '--system', '--no-python-downloads')
+    if ($uvPython -and (Get-ToolOutput $uvPython.Trim() @('--version')) -match '^Python 3\.11\.') {
+        return [PSCustomObject]@{ Source = $uvPython.Trim(); Arguments = @() }
+    }
+}
+
+function Test-ExistingPythonRequirements {
+    param([string] $Python, [string] $Requirements)
+
+    $command = Get-Command -Name 'uv' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command) { return $false }
+    $ErrorActionPreference = 'Continue'
+    $output = & $command.Source pip install --dry-run --offline --python $Python -r $Requirements 2>&1
+    return ($LASTEXITCODE -eq 0 -and (($output | Out-String) -match 'Would make no changes'))
+}
+
+function Test-ExistingFrontendDependencies {
+    if (-not (Test-Path -LiteralPath 'frontend\node_modules\.package-lock.json' -PathType Leaf)) { return $false }
+    $installed = Get-ToolOutput 'npm.cmd' @('--prefix', 'frontend', 'ls', '--all', '--parseable')
+    if (-not $installed) { return $false }
+    $check = @'
+const fs = require('fs');
+try {
+  const expected = JSON.parse(fs.readFileSync('frontend/package-lock.json', 'utf8')).packages;
+  const actual = JSON.parse(fs.readFileSync('frontend/node_modules/.package-lock.json', 'utf8')).packages;
+  if (!expected || !actual) process.exit(1);
+  for (const [name, entry] of Object.entries(actual)) {
+    const wanted = expected[name];
+    if (!wanted || ['version', 'resolved', 'integrity'].some(key => entry[key] !== wanted[key])) process.exit(1);
+  }
+  console.log('ready');
+} catch { process.exit(1); }
+'@
+    return [bool] (Get-ToolOutput 'node' @('-e', $check))
 }
 
 function Select-CompatibleNode {
@@ -118,7 +164,7 @@ function Enter-BootstrapLock {
 function Enter-ProjectRuntimeLock {
     $pythonLauncher = Get-PythonLauncher
     if ($null -eq $pythonLauncher) {
-        throw '找不到可运行 Python 3.11 的启动器 py，不能安全检查项目运行状态。请检查 Python 3.11 安装后重新启动。'
+        throw '找不到可运行的 Python 3.11，不能安全检查项目运行状态。请检查 Python 3.11 安装后重新启动。'
     }
 
     $guardPath = Join-Path $PSScriptRoot 'project_lock_guard.py'
@@ -128,7 +174,7 @@ function Enter-ProjectRuntimeLock {
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $pythonLauncher.Source
-    $startInfo.Arguments = '-3.11 -u "' + $guardPath + '"'
+    $startInfo.Arguments = (($pythonLauncher.Arguments + @('-u', ('"' + $guardPath + '"'))) -join ' ')
     $startInfo.WorkingDirectory = $projectRoot
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardInput = $true
@@ -343,7 +389,9 @@ try {
             Write-Host "已将原虚拟环境备份到 $backup。"
         }
         if (-not (Test-Path -LiteralPath '.venv')) {
-            Invoke-CheckedProcess '创建 Python 3.11 虚拟环境' 'uv' @('venv', '--seed', '--python', '3.11', '.venv') '请检查 Python 3.11 和网络连接后重试。'
+            $pythonLauncher = Get-PythonLauncher
+            $pythonForVenv = if ($pythonLauncher.Arguments.Count -gt 0) { '3.11' } else { $pythonLauncher.Source }
+            Invoke-CheckedProcess '创建 Python 3.11 虚拟环境' 'uv' @('venv', '--seed', '--python', $pythonForVenv, '.venv') '请检查 Python 3.11 和网络连接后重试。'
         }
 
         if ((Get-ToolOutput $venvPython @('--version')) -notmatch '^Python 3\.11\.') {
@@ -365,6 +413,11 @@ try {
         $requirementsRecorded = $requirementsRecorded.Trim()
         $importCheck = 'import fastapi, keyring, multipart, uvicorn, yt_dlp, playwright, pydantic, litellm, rapidocr, onnxruntime, PIL, requests, segno, mediacloud_uploader'
         $importsReady = Get-ToolOutput $venvPython @('-c', "$importCheck; print(1)")
+        if ($requirementsHash -ne $requirementsRecorded -and $importsReady -and (Test-ExistingPythonRequirements $venvPython $requirements)) {
+            Write-Host '已有 Python 依赖符合要求，跳过安装。'
+            Set-Content -LiteralPath $requirementsMarker -Value $requirementsHash -Encoding Ascii
+            $requirementsRecorded = $requirementsHash
+        }
         if ($requirementsHash -ne $requirementsRecorded -or -not $importsReady) {
             Write-Host '正在安装 Python 工作台依赖…'
             if (Test-Path -LiteralPath $requirementsMarker) {
@@ -406,6 +459,11 @@ try {
             $lockRecorded = [string] (Get-Content -LiteralPath $lockMarker -Raw)
         }
         $lockRecorded = $lockRecorded.Trim()
+        if ($lockHash -ne $lockRecorded -and (Test-ExistingFrontendDependencies)) {
+            Write-Host '已有前端依赖符合要求，跳过安装。'
+            Set-Content -LiteralPath $lockMarker -Value $lockHash -Encoding Ascii
+            $lockRecorded = $lockHash
+        }
         if ($lockHash -ne $lockRecorded -or
             -not (Test-Path -LiteralPath 'frontend\node_modules\vite\bin\vite.js' -PathType Leaf)) {
             Write-Host '正在安装前端依赖…'

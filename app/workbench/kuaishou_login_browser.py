@@ -83,8 +83,6 @@ async def login(project: Path, pending: Path, qr: Path, *, check: bool = False) 
                 except Exception:
                     pass
             for _ in range(25 if check else 150):
-                if sys.platform == 'win32' and not safety._session_unlocked():
-                    raise RuntimeError('电脑已锁屏，请解锁后重新登录。')
                 parsed = urlsplit(page.url)
                 if parsed.scheme == 'https' and parsed.hostname == 'cp.kuaishou.com':
                     payload = await page.evaluate('''async () => {

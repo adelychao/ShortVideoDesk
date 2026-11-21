@@ -1,4 +1,4 @@
-"""Gate Windows browser automation on an unlocked session and account safety margin."""
+"""Browser component verification and coordination for platform automation."""
 
 import logging
 import ctypes
@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,9 +36,7 @@ def is_windows_platform() -> bool:
 
 
 def browser_automation_paused() -> bool:
-    if not _is_windows():
-        return False
-    return not _windows_browser_state_safe()
+    return False
 
 
 def require_safe_browser(operation: str) -> None:
@@ -48,59 +45,20 @@ def require_safe_browser(operation: str) -> None:
     if operation not in _SAFE_BROWSER_OPERATIONS:
         _LOGGER.warning("Browser launch blocked for unsupported operation: %s", operation)
         raise BrowserSafetyError(SAFETY_MESSAGE)
-    if not _session_unlocked():
-        _LOGGER.warning("Browser launch blocked because the Windows session is locked: %s", operation)
-        raise BrowserSafetyError(SAFETY_MESSAGE)
-    if not _account_safe():
-        _LOGGER.warning("Browser launch blocked because the Windows account state is unsafe: %s", operation)
-        raise BrowserSafetyError(SAFETY_MESSAGE)
 
 
 def _windows_browser_state_safe() -> bool:
-    return _session_unlocked() and _account_safe()
+    return True
 
 
 def _session_unlocked() -> bool:
-    try:
-        class SessionInfo(ctypes.Structure):
-            _fields_ = [('level', wintypes.DWORD), ('padding', wintypes.DWORD),
-                        ('session_id', wintypes.DWORD), ('state', wintypes.DWORD),
-                        ('flags', wintypes.LONG)]
-        api = ctypes.WinDLL('wtsapi32', use_last_error=True)
-        query = api.WTSQuerySessionInformationW
-        query.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
-                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
-        query.restype = wintypes.BOOL
-        api.WTSFreeMemory.argtypes = [ctypes.c_void_p]
-        pointer, size = ctypes.c_void_p(), wintypes.DWORD()
-        if not query(None, 0xFFFFFFFF, 25, ctypes.byref(pointer), ctypes.byref(size)):
-            return False
-        try:
-            if size.value < ctypes.sizeof(SessionInfo):
-                return False
-            info = ctypes.cast(pointer, ctypes.POINTER(SessionInfo)).contents
-            return info.level == 1 and info.state == 0 and info.flags == 1
-        finally:
-            api.WTSFreeMemory(pointer)
-    except (AttributeError, OSError, ValueError):
-        return False
+    # zhw 2026-11-16 23:20:15：兼容已固定哈希的小红书登录组件，不再按 Windows 会话状态拦截。
+    return True
 
 
 def _account_safe() -> bool:
-    command = ("if ($env:USERDOMAIN -ine $env:COMPUTERNAME) { exit 2 }; "
-               "$a=[ADSI]('WinNT://./'+$env:USERNAME+',user'); "
-               "$locked=[bool]$a.InvokeGet('IsAccountLocked'); "
-               "$bad=[int]$a.InvokeGet('BadPasswordAttempts'); "
-               "$max=[int]$a.InvokeGet('MaxBadPasswordsAllowed'); "
-               "if ($locked) { exit 3 }; "
-               "if ($max -gt 0 -and ($max - $bad) -lt 3) { exit 4 }")
-    try:
-        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
-                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), check=False)
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    # zhw 2026-11-16 23:20:15：兼容已固定哈希的小红书登录组件，不查询 Windows 密码错误次数。
+    return True
 
 
 def _verified_xhs_browser(project: Path) -> bool:
@@ -132,12 +90,6 @@ def _verified_xhs_browser(project: Path) -> bool:
 def reserve_xiaohongshu_login(database, project: Path) -> None:
     if not _is_windows():
         return
-    if not _session_unlocked():
-        _LOGGER.warning('Xiaohongshu login blocked: session not unlocked')
-        raise BrowserSafetyError('请先解锁电脑，再试一次。')
-    if not _account_safe():
-        _LOGGER.warning('Xiaohongshu login blocked: Windows account check failed')
-        raise BrowserSafetyError('暂时无法打开登录窗口，请稍后再试。')
     if not _verified_xhs_browser(project):
         _LOGGER.warning('Xiaohongshu login blocked: browser or application files changed')
         raise BrowserSafetyError('登录组件暂不可用，请检查运行环境后重试。')
@@ -146,10 +98,6 @@ def reserve_xiaohongshu_login(database, project: Path) -> None:
 def require_controlled_video_browser(project: Path) -> Path | None:
     if not _is_windows():
         return None
-    if not _session_unlocked():
-        raise BrowserSafetyError('电脑已锁屏或会话状态不可确认，请解锁后继续发布。')
-    if not _account_safe():
-        raise BrowserSafetyError('Windows 账户安全状态异常，发布已暂停，请检查账户后继续。')
     if not _verified_xhs_browser(project):
         raise BrowserSafetyError('受控浏览器或登录组件校验未通过，发布已暂停。')
     return Path(os.environ['LOCALAPPDATA']) / 'ms-playwright/chromium-1208/chrome-win64/chrome.exe'

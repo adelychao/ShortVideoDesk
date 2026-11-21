@@ -29,11 +29,11 @@ def test_xhs_login_uses_only_reserved_browser_path(monkeypatch, tmp_path):
     assert captured['env']['SAU_XHS_SAFE_LOGIN'] == '1'
 
 
-def test_locked_or_unknown_session_is_blocked(monkeypatch, tmp_path):
+def test_login_does_not_query_windows_session(monkeypatch, tmp_path):
     monkeypatch.setattr(browser_safety, '_is_windows', lambda: True)
-    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: False)
-    with pytest.raises(browser_safety.BrowserSafetyError, match='解锁'):
-        browser_safety.reserve_xiaohongshu_login(Database(tmp_path / 'db'), tmp_path)
+    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: pytest.fail('unexpected session query'))
+    monkeypatch.setattr(browser_safety, '_verified_xhs_browser', lambda path: True)
+    browser_safety.reserve_xiaohongshu_login(Database(tmp_path / 'db'), tmp_path)
 
 
 def test_successful_login_does_not_launch_second_check(tmp_path):
@@ -66,12 +66,11 @@ def test_completed_login_can_be_retried_without_waiting(monkeypatch, tmp_path):
     browser_safety.reserve_xiaohongshu_login(database, tmp_path)
 
 
-def test_account_failures_block_login_before_reservation(monkeypatch, tmp_path):
+def test_login_does_not_query_windows_account(monkeypatch, tmp_path):
     monkeypatch.setattr(browser_safety, '_is_windows', lambda: True)
-    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: True)
-    monkeypatch.setattr(browser_safety, '_account_safe', lambda: False)
-    with pytest.raises(browser_safety.BrowserSafetyError, match='暂时无法'):
-        browser_safety.reserve_xiaohongshu_login(Database(tmp_path / 'db'), tmp_path)
+    monkeypatch.setattr(browser_safety, '_account_safe', lambda: pytest.fail('unexpected account query'))
+    monkeypatch.setattr(browser_safety, '_verified_xhs_browser', lambda path: True)
+    browser_safety.reserve_xiaohongshu_login(Database(tmp_path / 'db'), tmp_path)
 
 
 def test_login_slot_blocks_parallel_start_and_releases_after_completion():

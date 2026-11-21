@@ -29,6 +29,16 @@ def test_platform_observation_is_separate_from_local_submission(setup_target):
     assert target["platform_observed_at"] is not None
 
 
+def test_scheduled_observation_is_not_published(setup_target):
+    database, manager = setup_target
+    manager.adapter.douyin_status = lambda target, on_start: {"status": "scheduled", "remote_id": "123456789", "message": "定时发布中"}
+    manager._run_status_sync("t")
+    target = get_video_publish_target(database, "t")
+    assert target["status"] == "pending_review"
+    assert target["platform_status"] == "scheduled"
+    assert target["platform_observed_at"] is not None
+
+
 def test_failed_refresh_preserves_last_observation(setup_target):
     database, manager = setup_target
     manager.adapter.douyin_status = lambda target, on_start: {"status": "private", "remote_id": "123456789", "message": "私密作品"}
@@ -104,7 +114,8 @@ def test_auto_sync_schedules_only_due_safe_targets(setup_target, monkeypatch):
     with database.transaction(write=True) as c:
         c.execute("UPDATE video_publish_batches SET schedule_at=? WHERE id='b'", ((now + timedelta(hours=1)).isoformat(),))
     manager._schedule_status_sync_once(now=now)
-    assert manager._queue.empty()
+    assert manager._queue.get_nowait() == ("sync", "t")
+    manager._sync_pending.clear()
     with database.transaction(write=True) as c:
         c.execute("UPDATE video_publish_batches SET schedule_at=NULL WHERE id='b'")
         c.execute("UPDATE video_publish_targets SET platform_checked_at=? WHERE id='t'", (now.isoformat(),))
@@ -122,6 +133,17 @@ def test_auto_sync_does_not_guess_identity_for_unknown_submission(setup_target, 
     with database.transaction(write=True) as c:
         c.execute("UPDATE video_publish_targets SET status='unknown' WHERE id='t'")
     manager._schedule_status_sync_once(now=datetime.now(timezone.utc))
+    assert manager._queue.empty()
+
+
+def test_future_non_douyin_target_still_waits_for_scheduled_time(setup_target, monkeypatch):
+    database, manager = setup_target
+    monkeypatch.setattr("app.workbench.video_publishing.browser_automation_paused", lambda: False)
+    now = datetime.now(timezone.utc)
+    with database.transaction(write=True) as c:
+        c.execute("UPDATE video_publish_targets SET platform_id='bilibili' WHERE id='t'")
+        c.execute("UPDATE video_publish_batches SET schedule_at=? WHERE id='b'", ((now + timedelta(hours=1)).isoformat(),))
+    manager._schedule_status_sync_once(now=now)
     assert manager._queue.empty()
 
 

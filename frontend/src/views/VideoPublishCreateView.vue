@@ -28,7 +28,8 @@ import LoginProgress from '../components/LoginProgress.vue'
 import { videoAccountName } from '../videoAccountName'
 import LocalMediaUpload from '../components/LocalMediaUpload.vue'
 import VideoCoverCropEditor from '../components/VideoCoverCropEditor.vue'
-import type { UploadReceipt, VideoPublishAccount, VideoPublishBatch, VideoPublishCoverUpload, VideoPublishDraftForm, VideoPublishMedia, VideoPublishPlatform, VideoPublishPoi, VideoPublishSauStatus, VideoPublishTarget, VideoPublishXhsPoi } from '../api/types'
+import DouyinPublishMetadataFields from '../components/DouyinPublishMetadataFields.vue'
+import type { DouyinCreatorTag, DouyinCreatorTagCategory, DouyinMetadataDraft, UploadReceipt, VideoPublishAccount, VideoPublishBatch, VideoPublishCoverUpload, VideoPublishDraftForm, VideoPublishMedia, VideoPublishPlatform, VideoPublishPoi, VideoPublishSauStatus, VideoPublishTarget, VideoPublishXhsPoi } from '../api/types'
 
 type PlatformOverride = {
   enabled: boolean
@@ -100,6 +101,11 @@ const overrides = reactive<Record<string, PlatformOverride>>({})
 const repostHistories = reactive<Record<string, { id: string; title: string }[]>>({})
 const repostSelectedIds = reactive<Record<string, string>>({})
 const repostHistoryBusy = ref('')
+const douyinCollections = reactive<Record<string, string[]>>({})
+const douyinCollectionSelections = reactive<Record<string, string>>({})
+const douyinCollectionBusy = reactive<Record<string, boolean>>({})
+const douyinCollectionErrors = reactive<Record<string, string>>({})
+const douyinCollectionLoaded = reactive<Record<string, boolean>>({})
 const poiQueries = reactive<Record<string, string>>({})
 const poiResults = reactive<Record<string, VideoPublishPoi[]>>({})
 const poiSelections = reactive<Record<string, VideoPublishPoi | null>>({})
@@ -110,6 +116,7 @@ const poiErrors = reactive<Record<string, string>>({})
 const poiSearched = reactive<Record<string, boolean>>({})
 const poiVersions: Record<string, number> = {}
 const poiTimers = new Map<string, number>()
+const douyinMetadata = reactive<Record<string, DouyinMetadataDraft>>({})
 const douyinTopicKeyword = ref('')
 const douyinTopicResults = ref<import('../api/types').VideoPublishDouyinTopic[]>([])
 const douyinTopicBusy = ref(false)
@@ -249,6 +256,11 @@ watch(() => selectedAccounts.value.find(account => account.platform_id === 'bili
 watch(() => selectedAccounts.value.some(account => account.platform_id === 'douyin'), enabled => {
   if (enabled) queueDouyinTopicSearch()
   else clearDouyinTopicSearch()
+})
+watch(() => selectedAccounts.value.filter(account => account.platform_id === 'douyin').map(account => account.id), accountIds => {
+  for (const accountId of accountIds) {
+    if (!douyinCollectionLoaded[accountId] && !douyinCollectionBusy[accountId]) void loadDouyinCollections(accountId)
+  }
 })
 watch(() => overrideFor('bilibili').tid, value => {
   const account = selectedAccounts.value.find(item => item.platform_id === 'bilibili')
@@ -1065,10 +1077,14 @@ function clearDraftFormState(): void {
   for (const key of Object.keys(poiSelections)) delete poiSelections[key]
   for (const key of Object.keys(poiQueries)) delete poiQueries[key]
   for (const key of Object.keys(poiCityCodes)) delete poiCityCodes[key]
+  for (const key of Object.keys(douyinMetadata)) delete douyinMetadata[key]
   for (const key of Object.keys(xhsPoiSelections)) delete xhsPoiSelections[key]
   for (const key of Object.keys(xhsPoiQueries)) delete xhsPoiQueries[key]
   for (const key of Object.keys(repostHistories)) delete repostHistories[key]
   for (const key of Object.keys(repostSelectedIds)) delete repostSelectedIds[key]
+  for (const record of [douyinCollections, douyinCollectionSelections, douyinCollectionBusy, douyinCollectionErrors, douyinCollectionLoaded]) {
+    for (const key of Object.keys(record)) delete record[key]
+  }
   kuaishouCoverRatio.value = 'original'
   xiaohongshuCoverRatio.value = 'portrait'
   selectedMedia.value = null
@@ -1107,14 +1123,23 @@ async function initializeDraftForm(draftId: string): Promise<void> {
     if (!platforms.value.some((platform) => platform.id === platformId) || !savedOverride || typeof savedOverride !== 'object') continue
     Object.assign(overrideFor(platformId), savedOverride)
   }
-  for (const record of [poiSelections, poiQueries, poiCityCodes, xhsPoiSelections, xhsPoiQueries, repostHistories, repostSelectedIds]) {
+  for (const record of [poiSelections, poiQueries, poiCityCodes, douyinMetadata, xhsPoiSelections, xhsPoiQueries, repostHistories, repostSelectedIds, douyinCollections, douyinCollectionSelections, douyinCollectionBusy, douyinCollectionErrors, douyinCollectionLoaded]) {
     for (const key of Object.keys(record)) delete record[key]
   }
   Object.assign(poiSelections, form.poi_selections || {})
   Object.assign(poiQueries, form.poi_queries || {})
   Object.assign(poiCityCodes, form.poi_city_codes || {})
+  for (const [accountId, poi] of Object.entries(poiSelections)) {
+    if (poi && !poi.search_tab_code) poiSelections[accountId] = { ...poi, search_tab_code: 'local' }
+    if (poiCityCodes[accountId] && !['local', 'domestic', 'overseas'].includes(poiCityCodes[accountId])) poiCityCodes[accountId] = 'local'
+  }
+  Object.assign(douyinMetadata, form.douyin_metadata || {})
+  for (const account of accounts.value.filter(item => item.platform_id === 'douyin' && selectedAccountIds.value.includes(item.id))) {
+    metadataForAccount(account.id)
+  }
   Object.assign(xhsPoiSelections, form.xhs_poi_selections || {})
   Object.assign(xhsPoiQueries, form.xhs_poi_queries || {})
+  Object.assign(douyinCollectionSelections, form.collection_selections || {})
   for (const [accountId, work] of Object.entries(form.repost_selections || {})) {
     if (!work?.id || !work.title) continue
     repostHistories[accountId] = [{ id: work.id, title: work.title }]
@@ -1259,23 +1284,34 @@ function initializeEditForm(batch: VideoPublishBatch, target: VideoPublishTarget
   override.description = ''
   override.tags = ''
   if (platformId === 'douyin') {
+    douyinCollectionSelections[accountId] = options.collection_name || ''
     override.declaration = options.declaration || '无需添加自主声明'
     override.repostSource = options.repost_source || ''
     override.visibility = options.visibility || ''
     override.allowDownload = typeof options.allow_download === 'boolean' ? options.allow_download : null
-    if (options.location && options.location_id && options.location_address && options.location_city_code) {
+    const restoredTags = (options.douyin_creator_tags || []).map((tag) => ({ ...tag })) as DouyinCreatorTag[]
+    if (options.location && options.location_id && options.location_address && (options.location_city_code || options.location_search_tab_code)) {
       poiSelections[accountId] = {
         id: options.location_id,
         name: options.location,
         address: options.location_address,
-        city_code: options.location_city_code,
+        city_code: options.location_city_code || '',
         city_name: options.location_city_name || '',
+        search_tab_code: options.location_search_tab_code || 'local',
       }
       poiQueries[accountId] = options.location
-      poiCityCodes[accountId] = options.location_city_code
+      poiCityCodes[accountId] = options.location_search_tab_code || 'local'
+      restoredTags.push({ id: options.location_id, category: 'location', name: options.location, address: options.location_address, city_code: options.location_city_code || '', city_name: options.location_city_name || '', search_tab_code: options.location_search_tab_code || 'local' })
     } else {
       poiSelections[accountId] = null
       poiQueries[accountId] = ''
+    }
+    douyinMetadata[accountId] = {
+      category: 'location',
+      queries: poiQueries[accountId] ? { location: poiQueries[accountId] } : {},
+      creator_tags: restoredTags,
+      hot_topic_query: '',
+      hot_topic: options.douyin_hot_topic ? { ...options.douyin_hot_topic } : null,
     }
     if (options.repost_id && options.repost_title) {
       repostHistories[accountId] = [{ id: options.repost_id, title: options.repost_title }]
@@ -1517,6 +1553,11 @@ async function toggleAccount(account: VideoPublishAccount, checked: boolean): Pr
 
   if (hasRecentSuccessfulAccountCheck(account)) {
     selectedAccountIds.value = [...selectedAccountIds.value, account.id]
+    if (account.platform_id === 'douyin') {
+      void api.prewarmDouyinPoi(account.id).catch((cause) => {
+        console.debug('抖音地点预热未启动：', safeError(cause))
+      })
+    }
     showStatusMessage(`${videoAccountName(account)}的登录状态最近已确认正常，已直接选中。`)
     error.value = ''
     return
@@ -1601,6 +1642,8 @@ function validateDraft(): string | null {
   if (description.value.length > 1000) return '视频简介不能超过 1000 个字符。'
   if (selectedAccounts.value.length === 0) return '请至少选择一个已经连接的平台账号。'
   if (selectedAccounts.value.length > 20) return '一次最多选择 20 个发布账号。'
+  const unverifiedDouyinCollection = selectedAccounts.value.find(account => account.platform_id === 'douyin' && douyinCollectionSelections[account.id] && (!douyinCollectionLoaded[account.id] || !douyinCollections[account.id]?.includes(douyinCollectionSelections[account.id])))
+  if (unverifiedDouyinCollection) return `请重新读取抖音账号「${videoAccountName(unverifiedDouyinCollection)}」的合集列表，并选择当前仍有效的合集。`
   if (selectedPlatforms.value.includes('baijiahao') && !baijiahaoDeclarations.includes(overrideFor('baijiahao').declaration)) return '请为百家号选择符合实际的创作声明。'
   if (scheduleMode.value === 'scheduled' && !scheduleAt.value) return '请选择通用计划发布时间。'
   const locationMissing = selectedAccounts.value.find(account => account.platform_id === 'douyin' && (poiQueries[account.id] || '').trim() && !poiSelections[account.id])
@@ -1688,6 +1731,56 @@ async function loadRepostHistory(account: VideoPublishAccount): Promise<void> {
     error.value = safeError(cause)
   } finally {
     repostHistoryBusy.value = ''
+  }
+}
+
+function makeDefaultDouyinMetadata(): DouyinMetadataDraft {
+  return { category: 'location', queries: {}, creator_tags: [], hot_topic_query: '', hot_topic: null }
+}
+
+function metadataForAccount(accountId: string): DouyinMetadataDraft {
+  if (!douyinMetadata[accountId]) {
+    const metadata = makeDefaultDouyinMetadata()
+    const poi = poiSelections[accountId]
+    if (poi) {
+      metadata.creator_tags.push({ ...poi, category: 'location' })
+      metadata.queries.location = poiQueries[accountId] || poi.name
+    } else if (poiQueries[accountId]) {
+      metadata.queries.location = poiQueries[accountId]
+    }
+    douyinMetadata[accountId] = metadata
+  }
+  return douyinMetadata[accountId]
+}
+
+function updateDouyinMetadata(accountId: string, value: DouyinMetadataDraft): void {
+  douyinMetadata[accountId] = value
+  const poi = value.creator_tags.find(tag => tag.category === 'location')
+  if (poi && poi.address && poi.search_tab_code && poi.city_name !== undefined) {
+    poiSelections[accountId] = { id: poi.id, name: poi.name, address: poi.address, city_code: poi.city_code || '', city_name: poi.city_name, search_tab_code: poi.search_tab_code }
+    poiQueries[accountId] = value.queries.location || poi.name
+    poiCityCodes[accountId] = poi.search_tab_code
+  } else {
+    poiSelections[accountId] = null
+    poiQueries[accountId] = value.queries.location || ''
+  }
+}
+
+async function loadDouyinCollections(accountId: string): Promise<void> {
+  if (douyinCollectionBusy[accountId]) return
+  douyinCollectionBusy[accountId] = true
+  douyinCollectionErrors[accountId] = ''
+  try {
+    const result = await api.getDouyinCollections(accountId)
+    douyinCollections[accountId] = result.items
+    douyinCollectionLoaded[accountId] = true
+    if (douyinCollectionSelections[accountId] && !result.items.includes(douyinCollectionSelections[accountId])) {
+      douyinCollectionSelections[accountId] = ''
+    }
+  } catch (cause) {
+    douyinCollectionErrors[accountId] = safeError(cause)
+  } finally {
+    douyinCollectionBusy[accountId] = false
   }
 }
 
@@ -1816,6 +1909,9 @@ function optionsFor(platformId: string, accountId: string): {
   location_address?: string
   location_city_code?: string
   location_city_name?: string
+  location_search_tab_code?: 'local' | 'domestic' | 'overseas'
+  douyin_creator_tags?: Array<Pick<DouyinCreatorTag, 'id' | 'category' | 'name' | 'share_url' | 'mount_option_id'>>
+  douyin_hot_topic?: { id: string; title: string }
   visibility?: 'public' | 'friends' | 'private'
   xhs_original?: boolean
   xhs_declaration?: 'fiction' | 'ai' | 'advertising' | 'self_shot' | 'repost'
@@ -1861,6 +1957,9 @@ function optionsFor(platformId: string, accountId: string): {
     location_address?: string
     location_city_code?: string
     location_city_name?: string
+    location_search_tab_code?: 'local' | 'domestic' | 'overseas'
+    douyin_creator_tags?: Array<Pick<DouyinCreatorTag, 'id' | 'category' | 'name' | 'share_url' | 'mount_option_id'>>
+    douyin_hot_topic?: { id: string; title: string }
     visibility?: 'public' | 'friends' | 'private'
     xhs_original?: boolean
     xhs_declaration?: 'fiction' | 'ai' | 'advertising' | 'self_shot' | 'repost'
@@ -1906,6 +2005,9 @@ function optionsFor(platformId: string, accountId: string): {
   }
   if (platformId === 'kuaishou' || platformId === 'wechat_channels') {
     if (override.collectionName.trim()) options.collection_name = override.collectionName.trim()
+  }
+  if (platformId === 'douyin' && douyinCollectionSelections[accountId]) {
+    options.collection_name = douyinCollectionSelections[accountId]
   }
   if (platformId === 'wechat_channels' && override.shortTitle.trim()) options.short_title = override.shortTitle.trim()
   if (platformId === 'wechat_channels' && override.saveAsDraft) options.save_as_draft = true
@@ -1958,9 +2060,22 @@ function optionsFor(platformId: string, accountId: string): {
       options.location = poi.name
       options.location_id = poi.id
       options.location_address = poi.address
-      options.location_city_code = poi.city_code
+      if (poi.city_code) options.location_city_code = poi.city_code
       if (poi.city_name) options.location_city_name = poi.city_name
+      options.location_search_tab_code = poi.search_tab_code || 'local'
     }
+    const metadata = douyinMetadata[accountId]
+    const creatorTags = metadata?.creator_tags.filter(tag => tag.category !== 'location') || []
+    if (creatorTags.length) {
+      options.douyin_creator_tags = creatorTags.map(tag => ({
+        id: tag.id,
+        category: tag.category,
+        name: tag.name,
+        ...(tag.category === 'mini_program' && tag.share_url ? { share_url: tag.share_url } : {}),
+        ...(tag.category === 'game_handle' && tag.mount_option_id ? { mount_option_id: tag.mount_option_id } : {}),
+      }))
+    }
+    if (metadata?.hot_topic) options.douyin_hot_topic = { ...metadata.hot_topic }
     if (override.visibility) options.visibility = override.visibility
     if (override.allowDownload !== null) options.allow_download = override.allowDownload
   }
@@ -1972,6 +2087,16 @@ function buildVideoPublishDraftForm(): VideoPublishDraftForm {
     const work = repostHistories[accountId]?.find((item) => item.id === workId)
     return work ? [[accountId, { id: work.id, title: work.title }]] : []
   }))
+  const safeMetadata = Object.fromEntries(Object.entries(douyinMetadata).map(([accountId, metadata]) => [accountId, {
+    category: metadata.category,
+    queries: { ...metadata.queries },
+    creator_tags: metadata.creator_tags.map(tag => {
+      const { thumbnail_url: _thumbnail, mount_options: _mountOptions, detail: _detail, ...selected } = tag
+      return selected
+    }),
+    hot_topic_query: metadata.hot_topic_query,
+    hot_topic: metadata.hot_topic ? { ...metadata.hot_topic } : null,
+  }]))
   return JSON.parse(JSON.stringify({
     title: title.value,
     description: description.value,
@@ -1986,9 +2111,11 @@ function buildVideoPublishDraftForm(): VideoPublishDraftForm {
     poi_selections: poiSelections,
     poi_queries: poiQueries,
     poi_city_codes: poiCityCodes,
+    douyin_metadata: safeMetadata,
     xhs_poi_selections: xhsPoiSelections,
     xhs_poi_queries: xhsPoiQueries,
     repost_selections: repostSelections,
+    collection_selections: { ...douyinCollectionSelections },
     cover_preferences: {
       kuaishou: kuaishouCoverRatio.value,
       xiaohongshu: xiaohongshuCoverRatio.value,
@@ -2035,18 +2162,9 @@ async function submitBatch(): Promise<void> {
   }
   const destinationText = selectedAccounts.value.map((account) => `${platformName(account.platform_id)} · ${videoAccountName(account)}`).join('、')
   const when = scheduleMode.value === 'scheduled' ? `\n计划发布时间：\n${selectedPlatforms.value.map(id => `${platformName(id)}：${platformSchedule(id).replace('T', ' ')}`).join('\n')}` : '\n发布时间：立即发布'
-  const commonRatios = commonCoverSlots.value.filter((slot) => Boolean(coverUploads[commonCoverKey(slot)])).map(slot => slotRatioLabel(slot)).join('、')
-  const coverNote = commonRatios
-    ? `\n左侧通用封面已设置：${commonRatios}；相同比例的平台封面位会自动继承。`
-    : selectedPlatforms.value.includes('douyin')
-      ? '\n抖音未上传自定义封面，将自动生成视频首帧封面。'
-      : ''
-  const draftNote = overrideFor('wechat_channels').saveAsDraft && selectedPlatforms.value.includes('wechat_channels')
-    ? '\n微信视频号将保存到草稿箱，不会立即发布。'
-    : ''
   const confirmText = isEditMode.value
     ? `确认修改并重新发送到「${destinationText}」？\n原任务：${editBatch.value?.title || ''}\n视频：${activeMediaName.value}${when}\n原处理记录会保留，只重新排队这个账号。`
-    : `确认创建任务「${title.value.trim()}」？\n视频：${activeMediaName.value}\n目标：${destinationText}${when}${coverNote}${draftNote}\n\n部分平台执行完后需要你在后台人工核实状态。`
+    : '确认创建发布任务？'
   if (!await confirmWithElementPlus(confirmText, isEditMode.value ? '确认修改并重新发送' : '确认创建视频发布任务')) return
   submitting.value = true
   error.value = ''
@@ -2470,6 +2588,22 @@ onBeforeUnmount(() => {
               </section>
             </template>
             <template v-if="activePlatform.id === 'douyin'">
+              <div class="douyin-form-row">
+                <span>添加合集</span>
+                <div class="douyin-row-content">
+                  <div v-for="account in selectedAccounts.filter(item => item.platform_id === 'douyin')" :key="account.id" class="video-poi-account">
+                    <small v-if="selectedAccounts.filter(item => item.platform_id === 'douyin').length > 1" class="douyin-account-name">{{ videoAccountName(account) }}</small>
+                    <ElSelect v-model="douyinCollectionSelections[account.id]" class="input douyin-input" :aria-label="`${videoAccountName(account)} 的抖音合集`" :disabled="douyinCollectionBusy[account.id] || !douyinCollectionLoaded[account.id] || !!douyinCollectionErrors[account.id]" :placeholder="douyinCollectionBusy[account.id] ? '正在读取抖音后台合集…' : '请选择合集'">
+                      <ElOption value="" label="不添加合集" />
+                      <ElOption v-for="collection in douyinCollections[account.id] || []" :key="collection" :value="collection" :label="collection" />
+                    </ElSelect>
+                    <small v-if="douyinCollectionBusy[account.id]" class="douyin-hint" role="status">正在从抖音创作者中心读取该账号的合集…</small>
+                    <small v-else-if="douyinCollectionErrors[account.id]" class="video-poi-error" role="alert">{{ douyinCollectionErrors[account.id] }} <ElButton text class="text-button" native-type="button" @click="loadDouyinCollections(account.id)">重试</ElButton></small>
+                    <small v-else-if="douyinCollectionLoaded[account.id] && !douyinCollections[account.id]?.length" class="douyin-hint">该账号暂无可选合集。</small>
+                  </div>
+                  <small class="douyin-hint">合集选项从每个抖音账号的创作者中心读取。</small>
+                </div>
+              </div>
               <label class="douyin-form-row">
                 <span>自主声明</span>
                 <ElSelect v-model="overrideFor(activePlatform.id).declaration" class="input douyin-input">
@@ -2501,31 +2635,11 @@ onBeforeUnmount(() => {
                 <div class="douyin-form-row">
                   <span>添加标签</span>
                   <div class="douyin-row-content">
-                    <small v-if="!selectedAccounts.some(account => account.platform_id === 'douyin')" class="douyin-hint">请先选择抖音发布账号，再搜索位置。</small>
+                    <small v-if="!selectedAccounts.some(account => account.platform_id === 'douyin')" class="douyin-hint">请先选择抖音发布账号，再设置官方标签或关联热点。</small>
                     <div v-for="account in selectedAccounts.filter(item => item.platform_id === 'douyin')" :key="account.id" class="video-poi-account">
-                      <small v-if="selectedAccounts.filter(item => item.platform_id === 'douyin').length > 1" class="douyin-account-name">{{ videoAccountName(account) }}</small>
-                      <div class="video-poi-search-row">
-                        <span class="douyin-location-type">位置</span>
-                        <ElInput v-model="poiQueries[account.id]" class="input douyin-input" type="search" maxlength="100" :aria-label="`${videoAccountName(account)} 的地点关键词`" placeholder="输入地点名称，选择搜索结果" @input="queuePoiSearch(account)" />
-                        <ElButton class="douyin-search-button" native-type="button" :disabled="!!poiBusy[account.id] || !(poiQueries[account.id] || '').trim() || !!poiSelections[account.id]" @click="runPoiSearch(account)">搜索</ElButton>
-                      </div>
-                      <div v-if="!poiSelections[account.id] && (poiCities[account.id]?.length || poiResults[account.id]?.length || poiBusy[account.id] || poiErrors[account.id] || poiSearched[account.id])" class="douyin-poi-popover">
-                        <div v-if="poiCities[account.id]?.length" class="douyin-city-tabs" aria-label="搜索城市">
-                          <ElButton v-for="city in poiCities[account.id]" :key="city.code" native-type="button" :class="{ 'is-active': poiCityCodes[account.id] === city.code }" :aria-pressed="poiCityCodes[account.id] === city.code" @click="poiCityCodes[account.id] = city.code; queuePoiSearch(account)">{{ city.name }}</ElButton>
-                        </div>
-                        <small v-if="poiBusy[account.id]" class="douyin-poi-message" role="status">正在查询抖音地点，请稍候…</small>
-                        <small v-if="poiErrors[account.id]" class="douyin-poi-message video-poi-error" role="alert">{{ poiErrors[account.id] }}</small>
-                        <div v-if="poiResults[account.id]?.length" class="video-poi-results" aria-label="地点搜索结果">
-                          <ElButton v-for="poi in poiResults[account.id]" :key="poi.id" native-type="button" class="video-poi-option" @click="choosePoi(account, poi)"><strong>{{ poi.name }}</strong><small>{{ poi.address }}</small></ElButton>
-                        </div>
-                        <small v-else-if="poiSearched[account.id] && !poiBusy[account.id] && !poiErrors[account.id]" class="douyin-poi-message">未找到可确认的地点，请换关键词或城市。</small>
-                      </div>
-                      <div v-if="poiSelections[account.id]" class="video-poi-selected">
-                        <span><small>已选择：{{ poiSelections[account.id]?.address || poiSelections[account.id]?.name }}</small></span>
-                        <ElButton text class="text-button" native-type="button" @click="clearPoi(account)">清除</ElButton>
-                      </div>
+                      <small class="douyin-account-name">{{ videoAccountName(account) }}</small>
+                      <DouyinPublishMetadataFields :account-id="account.id" :account-name="videoAccountName(account)" :model-value="metadataForAccount(account.id)" :disabled="savingDraft" @update:model-value="updateDouyinMetadata(account.id, $event)" />
                     </div>
-                    <small class="douyin-hint">地点来自抖音创作者中心，请从搜索结果中选择。</small>
                   </div>
                 </div>
               </section>
@@ -2538,7 +2652,6 @@ onBeforeUnmount(() => {
                   <ElRadio :value="true">允许</ElRadio><ElRadio :value="false">不允许</ElRadio><ElRadio value="default">平台默认</ElRadio>
                 </ElRadioGroup></div>
               </section>
-              <p class="video-platform-inherit-note">关联热点目前没有稳定的 SAU 接口，暂不提供自动设置；话题标签仍可在左侧单独填写。</p>
             </template>
             <section v-if="scheduleMode === 'scheduled' && !isEditMode" class="douyin-section platform-schedule-section" aria-label="平台发布时间">
               <h4>平台发布时间</h4>

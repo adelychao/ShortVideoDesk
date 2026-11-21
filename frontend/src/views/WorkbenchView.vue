@@ -71,7 +71,7 @@ function loadTranscriptionModePreference(): 'cloud' | 'local' {
 }
 const transcriptionMode = ref<'cloud' | 'local'>(loadTranscriptionModePreference())
 const ocrMode = ref<'cloud' | 'local'>('local')
-const ocrInterval = ref(2)
+const ocrInterval = ref(1)
 const ocrScanProfile = ref<'full' | 'subtitles'>('full')
 const localOcrStatus = ref<{ installed: boolean; ready: boolean; model: string; device: string; workers?: number } | null>(null)
 const localOcrError = ref('')
@@ -749,7 +749,7 @@ onActivated(() => {
       <template v-else>
         <label class="form-label">识别方式<el-select :model-value="ocrMode" class="select-field" @update:model-value="setOcrMode"><el-option value="local" label="本地离线 OCR · RapidOCR" /><el-option value="cloud" :label="`云端图像模型 · ${providerName}`" /></el-select></label>
         <label v-if="ocrMode === 'local'" class="form-label">识别范围<el-select :model-value="ocrScanProfile" class="select-field" @update:model-value="setOcrScanProfile"><el-option value="full" label="全画面文字（范围更全，速度较慢）" /><el-option value="subtitles" label="下方字幕区域（更快，适合口播字幕）" /></el-select></label>
-        <label v-if="ocrMode === 'local'" class="form-label">抽帧间隔<el-select :model-value="ocrInterval" class="select-field" @update:model-value="setOcrInterval"><el-option :value="0.5" label="每 0.5 秒（快字幕，识别量较多）" /><el-option :value="1" label="每 1 秒（更细致）" /><el-option :value="2" label="每 2 秒（推荐）" /><el-option :value="5" label="每 5 秒（较快）" /></el-select></label>
+        <label v-if="ocrMode === 'local'" class="form-label">抽帧间隔<el-select :model-value="ocrInterval" class="select-field" @update:model-value="setOcrInterval"><el-option :value="0.5" label="每 0.5 秒（快字幕，识别量较多）" /><el-option :value="1" label="每 1 秒（推荐）" /><el-option :value="2" label="每 2 秒（较快）" /><el-option :value="5" label="每 5 秒（更快）" /></el-select></label>
         <p v-if="ocrMode === 'local'">使用单个 FFmpeg 进程连续解码并按间隔抽帧；最多 2 路 OCR 并行。字幕区域模式只识别画面下方约 42%，画面中部或顶部的文字不会纳入结果。</p>
         <p v-if="ocrMode === 'local'" role="status">{{ localOcrError || (localOcrStatus?.ready ? `本地 OCR 已准备：${localOcrStatus.model}，${localOcrStatus.device === 'cuda' ? 'NVIDIA GPU' : 'CPU'}；最多 ${localOcrStatus.workers || 2} 路并行。` : '本地 OCR 依赖或模型未准备，请检查项目依赖和模型文件。') }}</p>
         <p v-else>图片自动发送给 {{ providerName }} 识别，可能产生云端费用。目前最多抽取 8 张，可能遗漏画面文字。</p>

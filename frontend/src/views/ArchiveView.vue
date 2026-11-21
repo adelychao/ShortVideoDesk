@@ -454,7 +454,7 @@ onBeforeUnmount(() => {
           <el-table :data="items" row-key="task.id" class="archive-table" aria-label="素材档案列表">
             <el-table-column label="素材" min-width="340">
               <template #default="{ row }">
-                <RouterLink class="archive-title" :to="{ name: 'task-detail', params: { taskId: row.task.id } }"><img v-if="row.cover && !coverFailedFor(row.task.id)" class="archive-cover" :src="`${row.cover.file_url}?inline=1`" alt="" loading="lazy" @error="markCoverFailed(row.task.id)" /><span v-else class="archive-art" aria-hidden="true"></span><span><strong @mouseenter="checkTitleOverflow(row as TaskSummary, $event)"><el-tooltip :content="titleOf(row as TaskSummary)" placement="top" :show-after="400" :disabled="!titleOverflow.has(row.task.id)" popper-class="archive-theme-popper"><span>{{ titleOf(row as TaskSummary) }}</span></el-tooltip></strong><span>作者：{{ row.asset.author || '未获取' }}</span><span>作品 ID：{{ row.asset.source_id || '未获取' }}</span></span></RouterLink>
+                <RouterLink class="archive-title" :to="{ name: 'task-detail', params: { taskId: row.task.id } }"><img v-if="row.cover && !coverFailedFor(row.task.id)" class="archive-cover" :src="`${row.cover.file_url}?inline=1`" alt="" loading="lazy" @error="markCoverFailed(row.task.id)" /><span v-else class="archive-art" aria-hidden="true"></span><span><strong @mouseenter="checkTitleOverflow(row as TaskSummary, $event)"><el-tooltip :content="titleOf(row as TaskSummary)" placement="top" :show-after="400" :disabled="!titleOverflow.has(row.task.id)" popper-class="archive-theme-popper"><span>{{ titleOf(row as TaskSummary) }}</span></el-tooltip></strong><span>作者：{{ row.asset.author || '未获取' }}</span></span></RouterLink>
               </template>
             </el-table-column>
             <el-table-column label="平台" min-width="85"><template #default="{ row }">{{ platformLabel(row.asset.platform, row.asset.source_kind) }}</template></el-table-column>
@@ -483,7 +483,6 @@ onBeforeUnmount(() => {
                 <span>
                   <strong @mouseenter="checkTitleOverflow(item, $event)"><el-tooltip :content="titleOf(item)" placement="top" :show-after="400" :disabled="!titleOverflow.has(item.task.id)" popper-class="archive-theme-popper"><span>{{ titleOf(item) }}</span></el-tooltip></strong>
                   <span>作者：{{ item.asset.author || '未获取' }}</span>
-                  <span>作品 ID：{{ item.asset.source_id || '未获取' }}</span>
                 </span>
               </RouterLink>
               <el-tag :type="statusType(item.task.status)" effect="light">{{ statusLabel(item.task.status) }}</el-tag>

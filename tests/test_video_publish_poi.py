@@ -38,16 +38,28 @@ def test_selected_location_fields_are_forwarded_to_sau(tmp_path):
     assert args[args.index("--location-city-code") + 1] == options["location_city_code"]
 
 
-def test_poi_search_does_not_wait_behind_an_active_account_task(tmp_path):
+@pytest.fixture
+def connected_douyin_manager(tmp_path):
     db = Database(tmp_path / "test.sqlite")
     db.migrate()
     with db.transaction(write=True) as c:
         c.execute("INSERT INTO video_publish_accounts(id,platform_id,account_alias,status,created_at,updated_at) VALUES('a','douyin','user','connected','2026-11-02','2026-11-02')")
-    manager = VideoPublishManager(db)
-    lock = manager._account_lock("a")
-    lock.acquire()
-    try:
+    return VideoPublishManager(db)
+
+
+def test_poi_prewarm_does_not_wait_behind_an_active_account_task(connected_douyin_manager):
+    manager = connected_douyin_manager
+    with manager._account_lock("a"):
         with pytest.raises(VideoPublishError, match="正在执行其他操作"):
-            manager.search_douyin_poi("a", "北京路")
-    finally:
-        lock.release()
+            manager.search_douyin_poi("a", "", "local", wait_for_warmup=False)
+
+
+def test_hot_recommendations_load_while_location_holds_account_lock(connected_douyin_manager, monkeypatch):
+    manager = connected_douyin_manager
+    monkeypatch.setattr(
+        manager._douyin_hot_recommendations, "read",
+        lambda: [{"id": "2754647", "title": "测试热点", "view_count": 12000, "view_count_text": "1.2万在看"}],
+    )
+    with manager._account_lock("a"):
+        result = manager.search_douyin_hot_topics("a")
+    assert result["items"][0]["id"] == "2754647"

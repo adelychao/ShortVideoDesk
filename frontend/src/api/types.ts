@@ -606,9 +606,11 @@ export interface VideoPublishDraftForm {
   poi_selections: Record<string, VideoPublishPoi | null>
   poi_queries: Record<string, string>
   poi_city_codes: Record<string, string>
+  douyin_metadata?: Record<string, DouyinMetadataDraft>
   xhs_poi_selections: Record<string, VideoPublishXhsPoi | null>
   xhs_poi_queries: Record<string, string>
   repost_selections: Record<string, { id: string; title: string } | null>
+  collection_selections?: Record<string, string>
   cover_preferences: { kuaishou: string; xiaohongshu: string }
 }
 
@@ -651,10 +653,48 @@ export interface VideoPublishPoi {
   address: string
   city_code: string
   city_name: string
+  search_tab_code?: 'local' | 'domestic' | 'overseas'
+  distance?: string
+}
+
+export type DouyinCreatorTagCategory = 'location' | 'media_entertainment' | 'mini_program' | 'game_handle' | 'mark_anything'
+export type DouyinCreatorTagSearchCategory = Exclude<DouyinCreatorTagCategory, 'location'>
+
+export interface DouyinCreatorTag {
+  id: string
+  category: DouyinCreatorTagCategory
+  name: string
+  detail?: string
+  address?: string
+  city_code?: string
+  city_name?: string
+  search_tab_code?: 'local' | 'domestic' | 'overseas'
+  share_url?: string
+  mount_options?: Array<{ id: string; description: string }>
+  mount_option_id?: string
+  mount_option_description?: string
+  thumbnail_url?: string
+}
+
+export interface DouyinHotTopic {
+  id: string
+  title: string
+  view_count: number
+  view_count_text: string
+  thumbnail_url?: string
+}
+
+export interface DouyinMetadataDraft {
+  category: DouyinCreatorTagCategory
+  queries: Partial<Record<DouyinCreatorTagCategory, string>>
+  creator_tags: DouyinCreatorTag[]
+  hot_topic_query: string
+  hot_topic: Pick<DouyinHotTopic, 'id' | 'title'> | null
 }
 
 export interface VideoPublishPoiSearchResult {
   items: VideoPublishPoi[]
+  tabs: { code: string; name: string }[]
   cities: { code: string; name: string }[]
   selected_city_code: string
 }
@@ -704,6 +744,9 @@ export interface VideoPublishTarget {
     location_address?: string
     location_city_code?: string
     location_city_name?: string
+    location_search_tab_code?: 'local' | 'domestic' | 'overseas'
+    douyin_creator_tags?: Array<Pick<DouyinCreatorTag, 'id' | 'category' | 'name' | 'share_url' | 'mount_option_id'>>
+    douyin_hot_topic?: Pick<DouyinHotTopic, 'id' | 'title'>
     visibility?: 'public' | 'friends' | 'private'
     xhs_original?: boolean
     xhs_declaration?: 'fiction' | 'ai' | 'advertising' | 'self_shot' | 'repost'
@@ -813,6 +856,9 @@ export interface CreateVideoPublishBatchRequest {
       location_address?: string
       location_city_code?: string
       location_city_name?: string
+      location_search_tab_code?: 'local' | 'domestic' | 'overseas'
+      douyin_creator_tags?: Array<Pick<DouyinCreatorTag, 'id' | 'category' | 'name' | 'share_url' | 'mount_option_id'>>
+      douyin_hot_topic?: Pick<DouyinHotTopic, 'id' | 'title'>
       visibility?: 'public' | 'friends' | 'private'
       xhs_original?: boolean
       xhs_declaration?: 'fiction' | 'ai' | 'advertising' | 'self_shot' | 'repost'

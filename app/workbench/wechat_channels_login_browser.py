@@ -10,7 +10,6 @@ import importlib.util
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -701,8 +700,6 @@ async def _run_login(project: Path, session_file: Path, qr_file: Path, *, check:
             if not check:
                 await _capture_qr(page, qr_file)
             for attempt in range(attempts):
-                if sys.platform == "win32" and not safety._session_unlocked():
-                    raise WechatChannelsLoginError("请先解锁电脑，再试一次。")
                 profile = state.get("profile")
                 if profile is None and isinstance(state.get("profile_candidate"), dict):
                     try:

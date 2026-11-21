@@ -99,21 +99,17 @@ def test_self_shot_is_reported_before_upload(tmp_path, monkeypatch):
     assert '拍摄地点' in row['message'] and '拍摄日期' in row['message'] and '未提交' in row['message']
 
 
-def test_video_guard_rejects_locked_session_before_other_checks(monkeypatch, tmp_path):
+def test_video_guard_does_not_query_windows_session_or_account(monkeypatch, tmp_path):
     monkeypatch.setattr(browser_safety, '_is_windows', lambda: True)
-    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: False)
-    monkeypatch.setattr(browser_safety, '_account_safe', lambda: pytest.fail('account checked after locked session'))
-    with pytest.raises(browser_safety.BrowserSafetyError, match='解锁'):
-        browser_safety.require_controlled_video_browser(tmp_path)
+    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: pytest.fail('unexpected session query'))
+    monkeypatch.setattr(browser_safety, '_account_safe', lambda: pytest.fail('unexpected account query'))
+    monkeypatch.setattr(browser_safety, '_verified_xhs_browser', lambda path: True)
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    assert browser_safety.require_controlled_video_browser(tmp_path).name == 'chrome.exe'
 
 
-def test_video_guard_rejects_account_and_unverified_browser(monkeypatch, tmp_path):
+def test_video_guard_rejects_unverified_browser(monkeypatch, tmp_path):
     monkeypatch.setattr(browser_safety, '_is_windows', lambda: True)
-    monkeypatch.setattr(browser_safety, '_session_unlocked', lambda: True)
-    monkeypatch.setattr(browser_safety, '_account_safe', lambda: False)
-    with pytest.raises(browser_safety.BrowserSafetyError, match='账户'):
-        browser_safety.require_controlled_video_browser(tmp_path)
-    monkeypatch.setattr(browser_safety, '_account_safe', lambda: True)
     monkeypatch.setattr(browser_safety, '_verified_xhs_browser', lambda path: False)
     with pytest.raises(browser_safety.BrowserSafetyError, match='浏览器'):
         browser_safety.require_controlled_video_browser(tmp_path)

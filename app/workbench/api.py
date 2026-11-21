@@ -230,7 +230,7 @@ class CreateTaskRequest(BaseModel):
     comment_analysis_options: CommentAnalysisOptionsRequest | None = None
     transcription_mode: str = Field(default="cloud", pattern="^(cloud|local)$")
     ocr_mode: str = Field(default="cloud", pattern="^(cloud|local)$")
-    ocr_interval_seconds: float = Field(default=2.0, ge=0.5, le=60)
+    ocr_interval_seconds: float = Field(default=1.0, ge=0.5, le=60)
     ocr_scan_profile: str = Field(default="full", pattern="^(full|subtitles)$")
     local_model: str = Field(default="small", pattern="^(tiny|base|small|medium|large-v3)$")
     local_language: str = Field(default="auto", pattern="^(auto|zh|en)$")
@@ -550,6 +550,23 @@ class VideoPublishAccountCreateRequest(BaseModel):
     display_name: str = Field(default="", max_length=80)
 
 
+class DouyinCreatorTagOptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    category: Literal["media_entertainment", "mini_program", "game_handle", "mark_anything"]
+    name: str = Field(min_length=1, max_length=160)
+    share_url: str | None = Field(default=None, min_length=9, max_length=2048)
+    mount_option_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class DouyinHotTopicOptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    title: str = Field(min_length=1, max_length=120)
+
+
 class VideoPublishOptionsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -584,6 +601,9 @@ class VideoPublishOptionsRequest(BaseModel):
     location_address: str | None = Field(default=None, max_length=300)
     location_city_code: str | None = Field(default=None, pattern=r"^\d{6}$")
     location_city_name: str | None = Field(default=None, max_length=100)
+    location_search_tab_code: Literal["local", "domestic", "overseas"] | None = None
+    douyin_creator_tags: list[DouyinCreatorTagOptionRequest] | None = Field(default=None, max_length=4)
+    douyin_hot_topic: DouyinHotTopicOptionRequest | None = None
     visibility: Literal["public", "friends", "private"] | None = None
     xhs_original: bool | None = None
     xhs_declaration: Literal["fiction", "ai", "advertising", "self_shot", "repost"] | None = None
@@ -614,8 +634,21 @@ class VideoPublishTargetRequest(BaseModel):
 
 class VideoPublishPoiSearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    keyword: str = Field(min_length=1, max_length=100)
-    city_code: str | None = Field(default=None, pattern=r"^\d{6}$")
+    keyword: str = Field(min_length=0, max_length=100)
+    city_code: str | None = Field(default=None, pattern=r"^(?:\d{6}|local|domestic|overseas)$")
+
+
+class DouyinCreatorTagSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    category: Literal["media_entertainment", "mini_program", "game_handle", "mark_anything"]
+    keyword: str = Field(min_length=1, max_length=2048)
+
+
+class DouyinHotTopicSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    keyword: str | None = Field(default=None, max_length=100)
 
 
 class VideoPublishTopicSearchRequest(BaseModel):
@@ -5618,10 +5651,51 @@ def get_douyin_repost_history(account_id: str, request: Request) -> dict[str, ob
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
 
 
+@_router.post("/video-publish/accounts/{account_id}/collections", dependencies=[Depends(_same_origin)])
+def get_douyin_collections(account_id: str, request: Request) -> dict[str, object]:
+    try:
+        return {"items": _video_publish_manager(request).get_douyin_collections(account_id)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
 @_router.post("/video-publish/accounts/{account_id}/poi-search", dependencies=[Depends(_same_origin)])
 def search_douyin_poi(account_id: str, body: VideoPublishPoiSearchRequest, request: Request) -> dict[str, object]:
     try:
         return _video_publish_manager(request).search_douyin_poi(account_id, body.keyword, body.city_code)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
+@_router.post("/video-publish/accounts/{account_id}/poi-prewarm", dependencies=[Depends(_same_origin)])
+def prewarm_douyin_poi(account_id: str, request: Request) -> dict[str, bool]:
+    try:
+        scheduled = _video_publish_manager(request).prewarm_douyin_poi(account_id)
+        return {"scheduled": scheduled}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
+@_router.post("/video-publish/accounts/{account_id}/creator-tag-search", dependencies=[Depends(_same_origin)])
+def search_douyin_creator_tags(account_id: str, body: DouyinCreatorTagSearchRequest, request: Request) -> dict[str, object]:
+    try:
+        return _video_publish_manager(request).search_douyin_creator_tags(account_id, body.category, body.keyword)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
+@_router.post("/video-publish/accounts/{account_id}/hot-topic-search", dependencies=[Depends(_same_origin)])
+def search_douyin_hot_topics(account_id: str, body: DouyinHotTopicSearchRequest, request: Request) -> dict[str, object]:
+    try:
+        return _video_publish_manager(request).search_douyin_hot_topics(account_id, body.keyword)
     except KeyError:
         raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
     except VideoPublishError as exc:
