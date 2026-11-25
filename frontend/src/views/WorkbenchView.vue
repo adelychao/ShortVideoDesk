@@ -21,6 +21,8 @@ const taskStore = useTasksStore()
 const router = useRouter()
 const configState = configStore.state
 const taskState = taskStore.state
+const COMMENT_SUPPORTED_PLATFORMS = new Set(['douyin', 'bilibili'])
+const ACCOUNT_DOWNLOAD_SUPPORTED_PLATFORMS = new Set(['douyin', 'bilibili'])
 
 const sourceText = ref('')
 const sourceMode = ref<'url' | 'file'>('url')
@@ -189,7 +191,10 @@ const platformAccountsForSource = computed(() => platformAccounts.value.filter((
 )))
 const connectedPlatformAccounts = computed(() => platformAccountsForSource.value.filter((item) => item.status === 'connected'))
 const selectedPlatformAccount = computed(() => platformAccountsForSource.value.find((item) => item.id === selectedPlatformAccountId.value) ?? null)
-const accountAccessAvailable = computed(() => Boolean(sourcePreview.value && connectedPlatformAccounts.value.length))
+const accountPlatformSupported = computed(() => Boolean(
+  sourcePreview.value && ACCOUNT_DOWNLOAD_SUPPORTED_PLATFORMS.has(sourcePreview.value.platform)
+))
+const accountAccessAvailable = computed(() => Boolean(accountPlatformSupported.value && connectedPlatformAccounts.value.length))
 const accountSelectionValid = computed(() => Boolean(selectedPlatformAccount.value?.status === 'connected'))
 const cloudModelName = computed(() => {
   const models = selectedCloudSteps.value.map((step) => step === 'transcribe'
@@ -306,6 +311,14 @@ function clearSourceResult(): void {
 
 async function refreshPlatformAccounts(): Promise<void> {
   const request = ++platformAccountsRequest
+  if (!accountPlatformSupported.value) {
+    platformAccounts.value = []
+    selectedPlatformAccountId.value = ''
+    platformAccessMode.value = 'anonymous'
+    platformAccountsError.value = ''
+    platformAccountsLoading.value = false
+    return
+  }
   platformAccountsLoading.value = true
   platformAccountsError.value = ''
   try {
@@ -332,7 +345,7 @@ async function runPreview(): Promise<boolean> {
   taskSuccess.value = null
   sourcePreview.value = null
   if (!sourceText.value.trim()) {
-    previewError.value = '请先粘贴抖音或 B 站的公开作品链接或分享文案。'
+    previewError.value = '请先粘贴支持平台的公开单条视频链接或分享文案。'
     return false
   }
 
@@ -350,8 +363,12 @@ async function runPreview(): Promise<boolean> {
 
 watch(sourcePreview, (preview) => {
   selectedPlatformAccountId.value = ''
+  if (preview && !COMMENT_SUPPORTED_PLATFORMS.has(preview.platform)) {
+    selectedSteps.value = selectedSteps.value.filter((step) => step !== 'comments' && step !== 'analyze_comments')
+  }
   if (preview) void refreshPlatformAccounts()
-})
+  else platformAccessMode.value = 'anonymous'
+}, { flush: 'sync' })
 
 function videoAccountName(account: VideoPublishAccount): string {
   return account.profile_name || account.display_name || account.account_alias || '未命名账号'
@@ -443,7 +460,7 @@ async function submitTask(): Promise<void> {
   }
 
   if (!sourceText.value.trim()) {
-    previewError.value = '请先填写视频链接或分享文案。'
+    previewError.value = '请先填写支持平台的公开视频链接或分享文案。'
     submitReminder.value = previewError.value
     document.getElementById('source-text')?.focus()
     return
@@ -486,6 +503,8 @@ async function submitTask(): Promise<void> {
       platformAccountId: platformAccessMode.value === 'account' ? selectedPlatformAccountId.value : undefined,
       modelProfileId: requiresCloudModel.value ? selectedModelProfileId.value : undefined,
     })
+    sourceText.value = ''
+    clearSourceResult()
     taskSuccess.value = createdTask
     void router.push({ name: 'task-detail', params: { taskId: createdTask.task.id } })
   } catch (error) {
@@ -555,7 +574,7 @@ onActivated(() => {
             <span class="step-number" aria-hidden="true">01</span>
             <div>
               <h2 id="workbench-source-title">{{ sourceMode === 'url' ? '添加一个公开视频' : '导入已有本地媒体' }}</h2>
-              <p>{{ sourceMode === 'url' ? '抖音：打开作品页，点击右侧“分享”→面板底部“复制链接”；B 站：在视频页点击“分享”→“复制链接”。复制后粘贴到下方，也可直接粘贴包含链接的分享文案。' : '直接使用所选的原文件，不会复制或移动；创建任务时校验后的副本写入归档目录。' }}</p>
+              <p>{{ sourceMode === 'url' ? '支持抖音、B 站、YouTube、TikTok、Instagram、Facebook、X 和 Reddit 的公开单条视频链接，也可粘贴包含链接的分享文案。YouTube 长视频可用；频道、合集、直播和登录后内容暂不支持。' : '直接使用所选的原文件，不会复制或移动；创建任务时校验后的副本写入归档目录。' }}</p>
             </div>
           </div>
           <span class="quiet-pill">单条任务</span>
@@ -575,7 +594,7 @@ onActivated(() => {
               aria-required="true"
               :aria-describedby="previewError ? 'source-error' : undefined"
               :aria-invalid="Boolean(previewError)"
-              placeholder="粘贴抖音作品页“分享→复制链接”或 B 站视频页“分享→复制链接”得到的内容，也可粘贴分享文案…"
+              placeholder="粘贴抖音、B 站、YouTube、TikTok、Instagram、Facebook、X 或 Reddit 的公开单条视频链接…"
               @input="clearSourceResult"
             ></textarea>
             <button class="button" type="button" :disabled="previewing" @click="runPreview">
@@ -608,10 +627,11 @@ onActivated(() => {
             <div class="panel-title-wrap"><span class="step-number" aria-hidden="true">＋</span><h2>访问方式</h2></div>
             <div class="access-options" role="group" aria-label="访问方式">
               <label class="access-choice" :class="{ 'is-selected': platformAccessMode === 'anonymous' }"><input v-model="platformAccessMode" type="radio" name="access-mode" value="anonymous" /> 匿名访问</label>
-              <label class="access-choice" :class="{ 'is-selected': platformAccessMode === 'account', 'is-disabled': !accountAccessAvailable }"><input v-model="platformAccessMode" type="radio" name="access-mode" value="account" :disabled="!accountAccessAvailable" /> 使用已登录账号 <small>{{ platformAccountsLoading ? '读取状态…' : accountAccessAvailable ? `${connectedPlatformAccounts.length} 个可用账号` : '未登录' }}</small></label>
+              <label v-if="accountPlatformSupported" class="access-choice" :class="{ 'is-selected': platformAccessMode === 'account', 'is-disabled': !accountAccessAvailable }"><input v-model="platformAccessMode" type="radio" name="access-mode" value="account" :disabled="!accountAccessAvailable" /> 使用已登录账号 <small>{{ platformAccountsLoading ? '读取状态…' : accountAccessAvailable ? `${connectedPlatformAccounts.length} 个可用账号` : '未登录' }}</small></label>
             </div>
             <p v-if="platformAccountsError" class="helper form-error-text" role="alert">{{ platformAccountsError }}</p>
             <p v-else-if="!sourcePreview" class="helper">先识别作品链接，再检查对应平台的登录状态。</p>
+            <p v-else-if="!accountPlatformSupported" class="helper">该平台本期仅支持匿名下载公开单条视频，不支持登录后内容。</p>
             <p v-else-if="!platformAccountsForSource.length" class="helper">该平台尚未添加账号。<RouterLink class="text-button" :to="{ name: 'accounts', query: { tab: 'video', platform: sourcePreview.platform } }">前往视频发布账号管理 →</RouterLink></p>
             <p v-else-if="!accountAccessAvailable" class="helper">该平台账号当前未连接，请先在视频发布账号管理中完成登录。<RouterLink class="text-button" :to="{ name: 'accounts', query: { tab: 'video', platform: sourcePreview.platform } }">前往账号管理 →</RouterLink></p>
             <template v-else-if="platformAccessMode === 'account'">
@@ -652,6 +672,7 @@ onActivated(() => {
             v-model="selectedSteps"
             v-model:script-style-ids="scriptStyleIds"
             :source-kind="sourceMode"
+            :platform="sourcePreview?.platform"
             :model-configured="cloudModelConfigured"
             :text-model-configured="textModelConfigured"
             :asr-model-configured="transcriptionConfigured"

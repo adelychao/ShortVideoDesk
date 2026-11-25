@@ -2,12 +2,46 @@ import pytest
 
 from app.workbench.api import VideoPublishOptionsRequest
 from app.workbench.database import Database
-from app.workbench.video_publishing import SauResult, SocialAutoUploadAdapter, VideoPublishError, VideoPublishManager, validate_douyin_location_options
+from app.workbench.video_publishing import (
+    SauResult, SocialAutoUploadAdapter, VideoPublishError, VideoPublishManager,
+    _normalize_video_publish_draft_form, validate_douyin_location_options,
+)
 
 
 def test_api_preserves_selected_location_identity():
     options = VideoPublishOptionsRequest(location="北京路", location_id="6601231759000471556", location_address="烟台市北京路", location_city_code="370600")
     assert options.model_dump(exclude_none=True)["location_id"] == "6601231759000471556"
+
+
+@pytest.mark.parametrize("scope", ["370600", "domestic"])
+def test_location_scope_survives_search_and_draft(scope):
+    places = [{"id": "6601231759000471556", "name": "岱王山", "address": "烟台市岱王山", "city_code": "370600"}]
+    cities = [{"code": "370600", "name": "烟台市"}] if scope == "370600" else []
+    tabs = [{"code": "domestic", "name": "国内"}] if scope == "domestic" else []
+    payload = {"items": places, "cities": cities, "tabs": tabs, "selected_city_code": scope}
+    result = VideoPublishManager._normalize_douyin_poi_result(payload, None)
+    assert result["tabs"] == tabs
+    assert result["cities"] == cities
+    assert len(result["items"]) == 1
+    place = result["items"][0]
+    expected_tab = "domestic" if scope == "domestic" else None
+    assert place.get("search_tab_code") == expected_tab
+    form, _ = _normalize_video_publish_draft_form({
+        "douyin_metadata": {"a": {"creator_tags": [{**place, "category": "location"}]}},
+    })
+    restored = form["douyin_metadata"]["a"]["creator_tags"][0]
+    assert restored["city_code"] == "370600"
+    assert restored.get("search_tab_code") == expected_tab
+    options = {
+        "location": restored["name"],
+        "location_id": restored["id"],
+        "location_address": restored["address"],
+        "location_city_code": restored["city_code"],
+    }
+    if expected_tab:
+        options["location_search_tab_code"] = expected_tab
+    validate_douyin_location_options(options)
+    assert options.get("location_search_tab_code") == expected_tab
 
 
 @pytest.mark.parametrize("options", [

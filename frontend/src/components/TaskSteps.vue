@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onUnmounted, ref, watch } from 'vue'
 import type { CommentCollectionState, TaskArtifact, TaskConsentRecord, TaskDetail, TaskRecord, TaskStep, TaskTranscriptionConfig } from '../api/types'
 import TranscriptionRetrySettings from './TranscriptionRetrySettings.vue'
 
@@ -14,12 +14,24 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (event: 'retry', stepId: string, ocrAction?: 'continue' | 'restart', transcriptionAuthorized?: boolean): void
+  (event: 'retry', stepId: string, ocrAction?: 'continue' | 'restart', transcriptionAuthorized?: boolean, downloadQuality?: '720p'): void
   (event: 'skip', stepId: string): void
   (event: 'reauthorize-comments', stepId: string, artifactId: string): void
 }>()
 const authorizeUpdatedComments = ref(false)
 const retryApprovedStepId = ref('')
+const currentTime = ref(Date.now())
+let downloadClock: ReturnType<typeof setInterval> | undefined
+watch(
+  () => props.task.steps.some((step) => step.kind === 'download' && step.status === 'running'),
+  (running) => {
+    if (downloadClock) clearInterval(downloadClock)
+    downloadClock = undefined
+    if (running) downloadClock = setInterval(() => { currentTime.value = Date.now() }, 5000)
+  },
+  { immediate: true },
+)
+onUnmounted(() => { if (downloadClock) clearInterval(downloadClock) })
 watch(() => props.task.id, () => {
   retryApprovedStepId.value = ''
   authorizeUpdatedComments.value = false
@@ -136,10 +148,40 @@ function elapsedLabel(startedAt: string | null): string {
   if (!startedAt) return '未知'
   const timestamp = Date.parse(startedAt)
   if (Number.isNaN(timestamp)) return '未知'
-  const elapsed = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+  const elapsed = Math.max(0, Math.floor((currentTime.value - timestamp) / 1000))
   const minutes = Math.floor(elapsed / 60)
   const seconds = elapsed % 60
   return minutes ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`
+}
+
+function formatBytes(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '未知'
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let amount = value / 1024
+  let unit = 0
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit++ }
+  return `${amount.toFixed(amount >= 100 ? 0 : 1)} ${units[unit]}`
+}
+
+function durationLabel(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '未知'
+  const seconds = Math.max(0, Math.floor(value))
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainingSeconds = seconds % 60
+  return hours ? `${hours} 小时 ${minutes} 分` : minutes ? `${minutes} 分 ${remainingSeconds} 秒` : `${remainingSeconds} 秒`
+}
+
+function downloadQuietSeconds(step: TaskStep): number | null {
+  if (step.kind !== 'download' || step.status !== 'running') return null
+  const timestamp = Date.parse(step.last_progress_at ?? step.started_at ?? '')
+  if (Number.isNaN(timestamp)) return null
+  return Math.max(0, Math.floor((currentTime.value - timestamp) / 1000))
+}
+
+function isDownloadStalled(step: TaskStep): boolean {
+  return (downloadQuietSeconds(step) ?? 0) >= 180
 }
 
 function canContinueFirstAnalysis(step: TaskStep): boolean {
@@ -204,7 +246,26 @@ function authorizeComments(stepId: string, artifactId: string): void {
             <span>处理中</span>
           </div>
 
+          <div v-if="step.kind === 'download' && step.status === 'running'" class="download-transfer-status">
+            <p v-if="step.downloaded_bytes != null" class="helper">
+              已下载 {{ formatBytes(step.downloaded_bytes) }}<template v-if="step.total_bytes != null"> / {{ formatBytes(step.total_bytes) }}</template>
+              · {{ step.speed_bytes_per_second == null ? '速度计算中' : `${formatBytes(step.speed_bytes_per_second)}/秒` }}
+              · 预计剩余 {{ durationLabel(step.eta_seconds) }}
+            </p>
+            <p v-else class="helper">正在获取视频流，尚未收到媒体数据。</p>
+            <p class="helper">最近收到数据：{{ step.last_progress_at ? `${elapsedLabel(step.last_progress_at)}前` : '尚无数据' }}；自动重试 {{ step.automatic_retry_count ?? 0 }}/2。</p>
+            <p v-if="isDownloadStalled(step)" class="task-step-message task-step-error">
+              <template v-if="step.automatic_retry_count">已连续 3 分钟没有新增媒体数据；系统已开始第 {{ step.automatic_retry_count }} 次自动恢复，正在重新解析并尝试续传。若仍未恢复，可用页面顶部“取消任务”停止，再选择普通重试或 720p 重试。</template>
+              <template v-else>已连续 3 分钟没有新增媒体数据。系统会在当前连接超时后刷新视频地址并自动重试，最多 2 次；如仍未恢复，可用页面顶部“取消任务”停止，再选择普通重试或 720p 重试。</template>
+              已下载的临时分片会保留。
+            </p>
+            <p v-else class="helper">若连续 3 分钟没有新增数据，系统会在连接超时后尝试自动恢复；也可用页面顶部“取消任务”安全停止。</p>
+          </div>
+
           <p v-if="stepMessage(step)" class="task-step-message" :class="{ 'task-step-error': Boolean(step.error_code) }">{{ stepMessage(step) }}</p>
+          <p v-if="step.kind === 'download' && step.status !== 'running' && step.downloaded_bytes != null" class="helper">
+            上次传输到 {{ formatBytes(step.downloaded_bytes) }}<template v-if="step.total_bytes != null"> / {{ formatBytes(step.total_bytes) }}</template> 时停止；自动重试 {{ step.automatic_retry_count ?? 0 }} 次，临时分片已保留。
+          </p>
           <p v-if="step.kind === 'analyze_comments' && step.status === 'running'" class="helper">取消不能立即中断当前云端请求；单次连接或读取等待上限为 10 分钟，并非整个步骤的总耗时上限。</p>
           <p v-if="step.kind === 'comments' && commentState?.stop_reason && (step.status === 'partial' || commentState.stop_reason.includes('楼中楼'))" class="task-step-message">已保存 {{ commentState.collected_count }} 条，{{ commentState.page_count }} 页。{{ step.status === 'partial' ? '停止原因' : '采集提示' }}：{{ commentState.stop_reason }}</p>
           <dl class="task-step-artifacts">
@@ -246,6 +307,17 @@ function authorizeComments(stepId: string, artifactId: string): void {
               :busy="busy"
               @retry="(stepId, transcriptionAuthorized) => emit('retry', stepId, undefined, transcriptionAuthorized)"
             />
+          </div>
+          <div v-else-if="canRetry(step, task.status) && step.kind === 'download' && task.source.platform === 'youtube'" class="task-step-actions">
+            <p>普通重试会尝试续传已有临时文件；若原画质持续失败，可改用最高 720p 下载，原画质的临时文件会保留。</p>
+            <div class="button-row">
+              <button class="button button-secondary button-small" type="button" :disabled="busy" @click="emit('retry', step.id)">
+                {{ busy ? '正在提交…' : '普通重试' }}
+              </button>
+              <button class="button button-small" type="button" :disabled="busy" @click="emit('retry', step.id, undefined, false, '720p')">
+                {{ busy ? '正在提交…' : '改用 720p 重试' }}
+              </button>
+            </div>
           </div>
           <div v-else-if="canRetry(step, task.status) && !isLocalOcr(step)" class="task-step-actions">
             <button class="button button-secondary button-small" type="button" :disabled="busy" @click="emit('retry', step.id)">

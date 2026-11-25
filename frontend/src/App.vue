@@ -3,9 +3,11 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import WorkspaceTabs from './components/WorkspaceTabs.vue'
 import brandLogo from './assets/digua-logo.svg'
+import { api } from './api/client'
+import type { ArticleGenerationJob } from './api/types'
 
 const route = useRoute()
-const pageTitle = computed(() => String(route.meta.title ?? '工作区'))
+const pageTitle = computed(() => route.name === 'article-from-text' && route.query.job ? '文章生成任务' : String(route.meta.title ?? '工作区'))
 const isNewArticleNavActive = computed(() => ['article-new', 'article-from-text', 'article-manual'].includes(String(route.name))
   || (route.name === 'article-edit' && route.query.source === 'new-article'))
 const isArticleManagerNavActive = computed(() => route.name === 'articles'
@@ -14,6 +16,12 @@ const isArticleManagerNavActive = computed(() => route.name === 'articles'
   || (route.name === 'article-edit' && route.query.source !== 'new-article'))
 const restartRequired = ref(false)
 let healthTimer: ReturnType<typeof setInterval> | undefined
+let articleJobTimer: ReturnType<typeof setInterval> | undefined
+const latestArticleJob = ref<Pick<ArticleGenerationJob, 'id' | 'status'> | null>(null)
+
+async function refreshArticleJob(): Promise<void> {
+  try { latestArticleJob.value = await api.latestArticleGenerationJob() } catch { /* Retain the last known state until the next refresh. */ }
+}
 
 async function checkRuntimeVersion(): Promise<void> {
   try {
@@ -30,8 +38,15 @@ async function checkRuntimeVersion(): Promise<void> {
 onMounted(() => {
   void checkRuntimeVersion()
   healthTimer = setInterval(() => { void checkRuntimeVersion() }, 30_000)
+  void refreshArticleJob()
+  articleJobTimer = setInterval(() => { void refreshArticleJob() }, 5000)
+  window.addEventListener('article-generation-updated', refreshArticleJob)
 })
-onUnmounted(() => { if (healthTimer) clearInterval(healthTimer) })
+onUnmounted(() => {
+  if (healthTimer) clearInterval(healthTimer)
+  if (articleJobTimer) clearInterval(articleJobTimer)
+  window.removeEventListener('article-generation-updated', refreshArticleJob)
+})
 </script>
 
 <template>
@@ -116,6 +131,7 @@ onUnmounted(() => { if (healthTimer) clearInterval(healthTimer) })
           <strong aria-current="page">{{ pageTitle }}</strong>
         </nav>
         <div class="topbar-actions">
+          <RouterLink v-if="latestArticleJob" class="top-link" :to="{ name: 'article-from-text', query: { job: latestArticleJob.id } }">{{ latestArticleJob.status === 'running' ? '文章生成中 · 查看任务' : '文章生成任务' }}</RouterLink>
           <RouterLink v-if="route.name !== 'settings'" class="top-link" to="/settings">知识库与设置</RouterLink>
           <RouterLink v-else class="top-link" to="/">返回素材采集</RouterLink>
         </div>

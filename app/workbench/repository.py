@@ -100,6 +100,12 @@ class TaskRepository:
             "retry_count",
             "started_at",
             "finished_at",
+            "downloaded_bytes",
+            "total_bytes",
+            "speed_bytes_per_second",
+            "eta_seconds",
+            "last_progress_at",
+            "automatic_retry_count",
         ):
             value = getattr(update, field_name)
             if value is not None:
@@ -378,6 +384,12 @@ def _step_from_row(row: sqlite3.Row) -> StepRecord:
         retry_count=int(row["retry_count"]),
         started_at=_optional_datetime(row["started_at"]),
         finished_at=_optional_datetime(row["finished_at"]),
+        downloaded_bytes=int(row["downloaded_bytes"]) if row["downloaded_bytes"] is not None else None,
+        total_bytes=int(row["total_bytes"]) if row["total_bytes"] is not None else None,
+        speed_bytes_per_second=(float(row["speed_bytes_per_second"]) if row["speed_bytes_per_second"] is not None else None),
+        eta_seconds=int(row["eta_seconds"]) if row["eta_seconds"] is not None else None,
+        last_progress_at=_optional_datetime(row["last_progress_at"]),
+        automatic_retry_count=int(row["automatic_retry_count"]),
     )
 
 

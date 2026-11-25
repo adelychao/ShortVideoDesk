@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import time
 from urllib.parse import parse_qs, urlsplit
 
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.xiaohongshu import XiaoHongShuIE
+from yt_dlp.utils import DownloadError as YtDlpDownloadError, ExtractorError
 
 from app.xiaohongshu import parse_note
 from multi_sources import (
@@ -30,10 +32,37 @@ def archive_directory(output_root, platform, media_id, *, archive_id=None):
 
 
 class QuietLogger:
+    def __init__(self):
+        self.last_warning = None
+        self.last_error = None
+
     def debug(self, message): pass
     def info(self, message): pass
-    def warning(self, message): pass
-    def error(self, message): pass
+    def warning(self, message): self.last_warning = str(message)
+    def error(self, message): self.last_error = str(message)
+
+
+def _safe_download_diagnostic(value):
+    text = re.sub(r"https?://\S+", "<链接已隐藏>", str(value), flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?i)(xsec_token|share_token|token|sig|lsig|signature|sign|auth|authorization|api[_-]?key)=([^&\s]+)",
+        r"\1=<已隐藏>", text,
+    )
+    text = re.sub(r"(?i)(cookie|authorization|proxy-authorization):\s*[^\s,;]+", r"\1: <已隐藏>", text)
+    text = re.sub(r"[\r\n\t]+", " ", text).strip()
+    text = re.sub(r"^(?:ERROR|WARNING):\s*", "", text, flags=re.IGNORECASE)
+    return text[:240]
+
+
+def _ydl_download_issue(exc, logger):
+    diagnostic = logger.last_error or logger.last_warning or str(exc)
+    combined = f"{type(exc).__name__}: {exc}; {diagnostic}"
+    code, message = classify_failure(RuntimeError(combined))
+    if code in {"network_error", "extraction_failed", "access_rejected", "rate_limited"}:
+        detail = _safe_download_diagnostic(diagnostic)
+        if detail:
+            message = f"{message}（{detail}）"
+    return DownloadIssue(message, code)
 
 
 def asset_formats(assets):
@@ -161,7 +190,8 @@ def cover_artifact(folder: Path, video: Path, *, allow_first_frame=True):
 
 
 def download_multiplatform(value, update, *, output_root, douyin_download, verifier, archive_id=None,
-                           allow_first_frame=True, cookie_file=None, browser_cookies=None):
+                           allow_first_frame=True, cookie_file=None, browser_cookies=None,
+                           download_quality=None):
     initial = parse_source(value)
     update(platform=initial.platform, phase="解析", message=f"正在解析{initial.name}公开视频")
     if initial.platform == "douyin":
@@ -186,35 +216,89 @@ def download_multiplatform(value, update, *, output_root, douyin_download, verif
 
     def progress(event):
         if event.get("status") == "downloading":
-            total = event.get("total_bytes") or event.get("total_bytes_estimate") or 0
+            downloaded = event.get("downloaded_bytes")
+            total = event.get("total_bytes") or event.get("total_bytes_estimate")
+            speed = event.get("speed")
+            eta = event.get("eta")
+            downloaded = int(downloaded) if isinstance(downloaded, (int, float)) else None
+            total = int(total) if isinstance(total, (int, float)) else None
+            speed = float(speed) if isinstance(speed, (int, float)) else None
+            eta = int(eta) if isinstance(eta, (int, float)) else None
             update(phase="下载", message=f"正在下载{source.name}媒体", percent=(
-                min(100, round(event.get("downloaded_bytes", 0) / total * 100, 1)) if total else None))
+                min(100, round(downloaded / total * 100, 1)) if downloaded is not None and total else None),
+                downloaded_bytes=downloaded, total_bytes=total,
+                speed_bytes_per_second=speed, eta_seconds=eta)
         elif event.get("status") == "finished":
             update(phase="合并", message="媒体已传输，正在处理本地文件")
 
-    options = {
-        "quiet": True, "no_warnings": True, "noprogress": True, "logger": QuietLogger(),
-        "outtmpl": {"default": str(folder / "video.%(ext)s"), "thumbnail": str(folder / "cover.%(ext)s")},
-        "format": "bv*[vcodec~='^(avc|h264)']+ba/b[vcodec~='^(avc|h264)']/bv*+ba/b",
-        "merge_output_format": "mp4", "writethumbnail": True,
-        "socket_timeout": 12, "retries": 1, "fragment_retries": 1,
-        "extractor_retries": 0, "noplaylist": True, "overwrites": True,
-        "concurrent_fragment_downloads": 4, "progress_hooks": [progress],
-    }
-    if cookie_file is not None:
-        options["cookiefile"] = str(cookie_file)
-    with YoutubeDL(options) as ydl:
-        if source.platform == "xiaohongshu":
-            info = extract_xhs(source, ydl, update)
-        else:
-            info = ydl.extract_info(source.url, download=False)
-        if not isinstance(info, dict):
-            raise DownloadIssue("解析器未返回视频信息", "extraction_failed")
-        info, selection_note = select_post_video(source, info)
-        update(parsed=True, page_accessible=True, title=info.get("title"), phase="下载",
-               message="作品身份已核对，正在保存视频与封面")
-        folder.mkdir(parents=True, exist_ok=True)
-        info = ydl.process_ie_result(info, download=True)
+    if download_quality not in {None, "720p"}:
+        raise DownloadIssue("下载画质选项无效", "invalid_download_quality")
+    if download_quality == "720p" and source.platform != "youtube":
+        raise DownloadIssue("720p 降画质重试仅适用于 YouTube", "invalid_download_quality")
+
+    format_selector = "bv*[vcodec~='^(avc|h264)']+ba/b[vcodec~='^(avc|h264)']/bv*+ba/b"
+    if download_quality == "720p":
+        format_selector = (
+            "bv*[height<=720][vcodec~='^(avc|h264)']+ba/"
+            "b[height<=720][vcodec~='^(avc|h264)']/bv*[height<=720]+ba/b[height<=720]"
+        )
+
+    max_automatic_retries = 2
+    automatic_retry_count = 0
+    info = None
+    selection_note = None
+    for attempt in range(max_automatic_retries + 1):
+        logger = QuietLogger()
+        options = {
+            "quiet": True, "no_warnings": True, "noprogress": True, "logger": logger,
+            "outtmpl": {"default": str(folder / "video.%(ext)s"), "thumbnail": str(folder / "cover.%(ext)s")},
+            "format": format_selector,
+            "merge_output_format": "mp4", "writethumbnail": True,
+            # Keep one yt-dlp retry per socket/fragment. The workbench owns the
+            # wider two-attempt recovery loop and refreshes extracted URLs there.
+            "socket_timeout": 30, "retries": 1, "fragment_retries": 1,
+            "extractor_retries": 0, "file_access_retries": 2,
+            "continuedl": True, "noplaylist": True, "overwrites": True,
+            "concurrent_fragment_downloads": 4, "progress_hooks": [progress],
+        }
+        if cookie_file is not None:
+            options["cookiefile"] = str(cookie_file)
+        try:
+            with YoutubeDL(options) as ydl:
+                if source.platform == "xiaohongshu":
+                    info = extract_xhs(source, ydl, update)
+                else:
+                    # Re-extract on each bounded application retry so expiring
+                    # media URLs are refreshed before yt-dlp resumes the .part.
+                    info = ydl.extract_info(source.url, download=False)
+                if not isinstance(info, dict):
+                    raise DownloadIssue("解析器未返回视频信息", "extraction_failed")
+                info, selection_note = select_post_video(source, info)
+                update(parsed=True, page_accessible=True, title=info.get("title"), phase="下载",
+                       message="作品身份已核对，正在保存视频与封面",
+                       automatic_retry_count=automatic_retry_count)
+                folder.mkdir(parents=True, exist_ok=True)
+                info = ydl.process_ie_result(info, download=True)
+            break
+        except DownloadIssue as exc:
+            issue = exc
+        except (YtDlpDownloadError, ExtractorError) as exc:
+            issue = _ydl_download_issue(exc, logger)
+        retryable = issue.code in {"network_error", "access_rejected", "rate_limited"}
+        if not retryable or attempt >= max_automatic_retries:
+            raise issue
+        automatic_retry_count += 1
+        backoff_seconds = 5 if automatic_retry_count == 1 else 15
+        for remaining in range(backoff_seconds, 0, -2):
+            update(
+                phase="下载",
+                message=(
+                    f"下载连接中断（{issue.code}），正在刷新视频地址并续传；"
+                    f"自动重试 {automatic_retry_count}/{max_automatic_retries}，约 {remaining} 秒后开始"
+                ),
+                automatic_retry_count=automatic_retry_count,
+            )
+            time.sleep(min(2, remaining))
     candidates = [p for p in folder.glob("video.*") if p.suffix in {".mp4", ".mkv", ".webm", ".mov", ".flv"}]
     if not candidates:
         raise DownloadIssue("传输结束后未找到视频文件", "download_failed")

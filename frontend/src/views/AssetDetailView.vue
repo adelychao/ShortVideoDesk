@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
+import { ElDialog } from 'element-plus'
+import 'element-plus/es/components/dialog/style/css'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ApiError, api } from '../api/client'
 import type { CommentAnalysisOptions, CommentCollectionState, ObsidianOutputDirectory, TaskArtifact, TaskDetail, TaskStep, TranscriptComparisonData, VaultPreview } from '../api/types'
@@ -12,6 +14,7 @@ import KnowledgeCardReview from '../components/KnowledgeCardReview.vue'
 import StructureAnalysis from '../components/StructureAnalysis.vue'
 import MarkdownTextEditor from '../components/MarkdownTextEditor.vue'
 import MarkdownPreview from '../components/MarkdownPreview.vue'
+import VaultLibraryDialog from '../components/VaultLibraryDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -44,6 +47,16 @@ const commentSourceUrl = computed(() => {
   if (asset?.platform === 'douyin' && /^\d{1,30}$/.test(asset.source_id ?? '')) return 'https://www.douyin.com/video/' + asset.source_id
   if (asset?.platform === 'bilibili' && /^BV[0-9A-Za-z]{10}$/.test(asset.source_id ?? '')) return 'https://www.bilibili.com/video/' + asset.source_id
   return ''
+})
+const originalVideoUrl = computed(() => {
+  const source = detail.value?.task.source
+  if (source?.kind !== 'url') return ''
+  try {
+    const url = new URL(source.value)
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : ''
+  } catch {
+    return ''
+  }
 })
 const loading = ref(false)
 const actionBusy = ref(false)
@@ -84,6 +97,12 @@ const vaultBusy = ref(false)
 const vaultMessage = ref('')
 const vaultLibraries = ref<ObsidianOutputDirectory[]>([])
 const vaultLibraryName = ref('')
+const proofViewMode = ref<'preview' | 'edit'>('preview')
+const vaultImportBusy = ref(false)
+const vaultImportMessage = ref('')
+const vaultImportDialogOpen = ref(false)
+const vaultImportLibraries = ref<ObsidianOutputDirectory[]>([])
+let vaultImportLibraryResolve: ((name: string | null) => void) | null = null
 const scriptEditor = ref<InstanceType<typeof ScriptEditor> | null>(null)
 const scriptRegenerationTarget = ref<HTMLElement | null>(null)
 const knowledgeEditor = ref<InstanceType<typeof KnowledgeCardReview> | null>(null)
@@ -164,7 +183,8 @@ const taskProgressHelp = computed(() => {
   return '页面每 2 秒同步一次状态；素材大小和平台响应会影响处理时长。'
 })
 const failedStep = computed(() => detail.value?.task.steps.find((step) => ['failed', 'blocked'].includes(step.status)) ?? null)
-const completedStepCount = computed(() => detail.value?.task.steps.filter((step) => ['completed', 'partial'].includes(step.status)).length ?? 0)
+const completedStepCount = computed(() => detail.value?.task.steps.filter((step) => step.status === 'completed').length ?? 0)
+const partialStepCount = computed(() => detail.value?.task.steps.filter((step) => step.status === 'partial').length ?? 0)
 const skippedStepCount = computed(() => detail.value?.task.steps.filter((step) => step.status === 'skipped').length ?? 0)
 const taskProgressPercent = computed(() => {
   const steps = detail.value?.task.steps ?? []
@@ -183,6 +203,7 @@ function progressSegmentClass(step: TaskStep): Record<string, boolean> {
     'is-running': step.status === 'running',
     'is-indeterminate': step.status === 'running' && step.progress == null,
     'is-attention': ['failed', 'blocked'].includes(step.status),
+    'is-partial': step.status === 'partial',
     'is-skipped': step.status === 'skipped',
   }
 }
@@ -294,6 +315,20 @@ const reviewedTranscriptArtifacts = computed(() => editableTextArtifacts.value
 const selectedEditableTextArtifact = computed(() => editableTextArtifacts.value.find((artifact) => artifact.id === editableArtifactId.value) ?? null)
 const reviewCopyEditorActive = computed(() => selectedEditableTextArtifact.value?.kind === 'transcript_draft'
   || selectedEditableTextArtifact.value?.metadata.review_copy === true)
+const selectedVaultNotePath = computed(() => {
+  const value = selectedEditableTextArtifact.value?.metadata.vault_note_path
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+})
+const selectedVaultLibraryName = computed(() => {
+  const value = selectedEditableTextArtifact.value?.metadata.vault_library_name
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+})
+const proofPreviewStats = computed(() => {
+  const artifact = selectedEditableTextArtifact.value
+  if (!artifact) return `${textEditSnapshot.value.length.toLocaleString()} 字符`
+  const label = artifact.kind === 'ocr_result' || artifact.kind === 'ocr_revision' ? 'OCR 文本' : '校对版本'
+  return `${textEditSnapshot.value.length.toLocaleString()} 字符 · ${label} v${artifact.version} · ${formatDate(artifact.created_at)}`
+})
 const mergedCommentFeedback = computed(() => {
   const heading = '## 评论反馈参考'
   const start = reviewCopySuffix.value.indexOf(heading)
@@ -304,29 +339,6 @@ const transcriptComparisonChanges = computed(() => buildTranscriptChanges(
   transcriptComparison.value?.source_segments ?? [],
   editedText.value,
 ))
-const selectedTranscriptionArtifact = computed(() => {
-  const selected = selectedEditableTextArtifact.value
-  if (!selected) return null
-  const allArtifacts = detail.value?.artifacts ?? []
-  const visited = new Set<string>()
-  function findTranscript(artifact: TaskDetail['artifacts'][number]): TaskDetail['artifacts'][number] | null {
-    if (visited.has(artifact.id)) return null
-    visited.add(artifact.id)
-    if (artifact.kind === 'transcript') return artifact
-    const ids = [artifact.metadata.source_artifact_id, ...(Array.isArray(artifact.metadata.source_artifact_ids) ? artifact.metadata.source_artifact_ids : [])]
-    for (const id of ids) {
-      if (typeof id !== 'string') continue
-      const source = allArtifacts.find((item) => item.id === id)
-      if (source) {
-        const found = findTranscript(source)
-        if (found) return found
-      }
-    }
-    return null
-  }
-  return findTranscript(selected) ?? selected
-})
-
 interface TranscriptDiffUnit {
   text: string
   startSeconds: number | null
@@ -484,21 +496,6 @@ function buildTranscriptChanges(
   return changes
 }
 
-function ocrCorrectionsForChange(change: TranscriptDiffChange): TranscriptComparisonData['ocr_corrections'] {
-  return (transcriptComparison.value?.ocr_corrections ?? []).filter((correction) => {
-    const correctionStart = correction.start_seconds
-    const correctionEnd = correction.end_seconds
-    if (typeof correctionStart === 'number' && typeof correctionEnd === 'number'
-      && change.startSeconds !== null && change.endSeconds !== null
-      && (correctionEnd < change.startSeconds || correctionStart > change.endSeconds)) return false
-    const asr = correction.asr_text?.trim()
-    const corrected = correction.corrected_text?.trim()
-    if (!asr && !corrected) return false
-    return Boolean((asr && (change.originalText.includes(asr) || asr.includes(change.originalText)))
-      || (corrected && (change.currentText.includes(corrected) || corrected.includes(change.currentText))))
-  })
-}
-
 async function restoreTranscriptChange(change: TranscriptDiffChange): Promise<void> {
   const start = change.currentStartOffset
   const end = change.currentEndOffset
@@ -627,16 +624,6 @@ function platformLabel(value: string | null): string {
 function archivePathLabel(value: string | null): string {
   if (value) return value
   return detail.value?.asset.archived_at ? '旧归档路径位于当前目录之外，未在页面展示。' : '尚未生成归档文件。'
-}
-
-function artifactMetadataText(artifact: TaskDetail['artifacts'][number], key: string, fallback = '未记录'): string {
-  const value = artifact.metadata[key]
-  return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback
-}
-
-function transcriptionMethod(artifact: TaskDetail['artifacts'][number]): string {
-  const provider = artifactMetadataText(artifact, 'provider_id', '')
-  return provider === 'local-faster-whisper' ? '本机离线转写' : provider || '未记录'
 }
 
 function textArtifactLabel(artifact: TaskDetail['artifacts'][number]): string {
@@ -779,6 +766,7 @@ async function retryStep(
   stepId: string,
   ocrAction?: 'continue' | 'restart',
   transcriptionAuthorized = false,
+  downloadQuality?: '720p',
 ): Promise<void> {
   if (!detail.value || actionBusy.value) return
   const id = detail.value.task.id
@@ -787,7 +775,7 @@ async function retryStep(
   actionBusy.value = true
   actionError.value = ''
   try {
-    const result = await api.retryStep(id, stepId, ocrAction, transcriptionAuthorized)
+    const result = await api.retryStep(id, stepId, ocrAction, transcriptionAuthorized, downloadQuality)
     if (sequence !== requestSequence || id !== taskId.value) return
     detail.value = result
     schedulePoll()
@@ -930,12 +918,8 @@ async function loadTranscriptComparison(artifactId: string): Promise<void> {
   }
 }
 
-async function toggleTranscriptComparison(): Promise<void> {
+async function openTranscriptComparison(): Promise<void> {
   if (!reviewCopyEditorActive.value || !editableArtifactId.value || transcriptComparisonBusy.value) return
-  if (transcriptComparisonOpen.value) {
-    transcriptComparisonOpen.value = false
-    return
-  }
   transcriptComparisonOpen.value = true
   if (transcriptComparison.value?.artifact_id !== editableArtifactId.value) {
     await loadTranscriptComparison(editableArtifactId.value)
@@ -982,6 +966,7 @@ async function loadTextPreview(artifactId: string): Promise<void> {
     editExpectedSha256.value = result.sha256
     textEditSnapshot.value = editorContent
     loadedTextArtifactId.value = artifactId
+    proofViewMode.value = 'preview'
   } catch (cause) {
     if (sequence === textPreviewSequence) {
       editableArtifactId.value = loadedTextArtifactId.value
@@ -1030,9 +1015,95 @@ async function copySelectedText(): Promise<void> {
   }
 }
 
-function discardTextChanges(): void {
+function beginTextEdit(): void {
+  proofViewMode.value = 'edit'
+}
+
+function cancelTextEdit(): void {
+  if (textHasUnsavedChanges.value && !window.confirm('当前有未保存的修改，取消编辑将放弃这些修改。继续吗？')) return
   editedText.value = textEditSnapshot.value
-  textSaveMessage.value = '未保存修改已撤销。'
+  textSaveMessage.value = ''
+  proofViewMode.value = 'preview'
+}
+
+function chooseImportLibrary(libraries: ObsidianOutputDirectory[]): Promise<string | null> {
+  vaultImportLibraries.value = libraries
+  vaultImportDialogOpen.value = true
+  return new Promise((resolve) => {
+    vaultImportLibraryResolve = resolve
+  })
+}
+
+function confirmImportLibrary(libraryName: string): void {
+  const resolve = vaultImportLibraryResolve
+  vaultImportLibraryResolve = null
+  vaultImportDialogOpen.value = false
+  resolve?.(libraryName)
+}
+
+function cancelImportLibrary(): void {
+  const resolve = vaultImportLibraryResolve
+  vaultImportLibraryResolve = null
+  vaultImportDialogOpen.value = false
+  resolve?.(null)
+}
+
+async function importToVault(): Promise<void> {
+  const artifact = selectedEditableTextArtifact.value
+  if (!artifact || textPreviewBusy.value || textSaveBusy.value || vaultImportBusy.value) return
+  if (proofViewMode.value !== 'preview') return
+  vaultImportMessage.value = ''
+  const managedPath = selectedVaultNotePath.value
+  let libraryName: string | null = null
+  if (!managedPath) {
+    try {
+      const configured = await api.getConfig()
+      const libraries = configured.settings.obsidian_output_directories ?? []
+      if (libraries.length > 1) {
+        libraryName = await chooseImportLibrary(libraries)
+        if (!libraryName) return
+      } else {
+        libraryName = libraries[0]?.name ?? null
+      }
+    } catch {
+      // 读取设置失败时仍尝试导入；后端会返回明确的失败原因。
+      libraryName = null
+    }
+  }
+  vaultImportBusy.value = true
+  try {
+    const result = await api.importArtifactToVault(artifact.id, artifact.sha256, {
+      libraryName,
+      relativePath: managedPath || null,
+    })
+    if (result.written) {
+      const updated = await api.getTask(taskId.value)
+      if (taskId.value && updated.task.id === taskId.value) detail.value = updated
+      vaultImportMessage.value = result.library_name
+        ? `已导入「${result.library_name}」：${result.path}`
+        : `已导入：${result.path}`
+    } else {
+      vaultImportMessage.value = result.reason ?? '未能写入知识库。'
+    }
+  } catch (cause) {
+    vaultImportMessage.value = safeError(cause)
+  } finally {
+    vaultImportBusy.value = false
+  }
+}
+
+async function openVaultNote(reveal: boolean): Promise<void> {
+  const artifact = selectedEditableTextArtifact.value
+  if (!artifact || !selectedVaultNotePath.value || vaultImportBusy.value) return
+  vaultImportBusy.value = true
+  try {
+    await api.openVaultNote(artifact.id, reveal)
+    vaultImportMessage.value = reveal ? '已在文件管理器中定位知识库笔记。' : '已用系统默认程序打开知识库笔记。'
+  } catch (cause) {
+    vaultImportMessage.value = safeError(cause)
+  } finally {
+    vaultImportBusy.value = false
+  }
 }
 
 function handleTextArtifactChange(event: Event): void {
@@ -1063,6 +1134,7 @@ async function saveTextRevision(): Promise<void> {
     loadedTextArtifactId.value = revision.id
     editExpectedSha256.value = revision.sha256
     textEditSnapshot.value = editedText.value
+    proofViewMode.value = 'preview'
     textSaveMessage.value = revision.metadata.conflict_copy === true
       ? '检测到原文件被外部修改；你的内容已单独另存为冲突版本，没有覆盖原文件。'
       : '人工校对版本已另存；原始 ASR/OCR 产物保持不变。'
@@ -1172,6 +1244,11 @@ watch(taskId, () => {
   editedText.value = ''
   reviewCopySuffix.value = ''
   textEditSnapshot.value = ''
+  proofViewMode.value = 'preview'
+  vaultImportBusy.value = false
+  vaultImportMessage.value = ''
+  vaultImportDialogOpen.value = false
+  vaultImportLibraryResolve = null
   actionBusy.value = false
   actionError.value = ''
   activeDetailTab.value = 'files'
@@ -1259,7 +1336,6 @@ onBeforeUnmount(pauseTab)
         <p v-if="detail" class="lead">
           <span class="status-badge" :class="statusClass(detail.task.status)">{{ statusLabel(detail.task.status) }}</span>
           <span>{{ detail.asset.source_kind === 'file' ? '本地媒体' : platformLabel(detail.asset.platform) }}</span>
-          <span v-if="detail.asset.source_id">作品 ID：{{ detail.asset.source_id }}</span>
           <span v-if="detail.asset.source_kind === 'url' && detail.task.platform_access?.mode === 'account'">使用账号：{{ detail.task.platform_access.account_name || '历史采集登录态' }}</span>
           <span v-else-if="detail.asset.source_kind === 'url' && detail.task.platform_access">访问方式：匿名</span>
           <span>创建于 {{ formatDate(detail.task.created_at) }}</span>
@@ -1289,7 +1365,7 @@ onBeforeUnmount(pauseTab)
         </div>
         <div class="task-progress-main">
           <div class="task-progress-topline">
-            <strong class="task-progress-step-count">{{ completedStepCount }} / {{ detail.task.steps.length }} 步完成<span v-if="skippedStepCount"> · {{ skippedStepCount }} 步跳过</span></strong>
+            <strong class="task-progress-step-count">{{ completedStepCount }} / {{ detail.task.steps.length }} 步完成<span v-if="partialStepCount"> · {{ partialStepCount }} 步部分完成</span><span v-if="skippedStepCount"> · {{ skippedStepCount }} 步跳过</span></strong>
             <div class="task-progress-state" :class="{ 'is-attention': taskNeedsAttention }">
               <span class="task-progress-state-mark" aria-hidden="true">{{ taskNeedsAttention ? '!' : detail.task.status === 'completed' ? '✓' : '·' }}</span>
               <span class="task-progress-state-copy">
@@ -1312,7 +1388,7 @@ onBeforeUnmount(pauseTab)
               </button>
             </div>
           </div>
-          <div class="task-progress-segments" :class="{ 'is-indeterminate': progressIndeterminate }" role="progressbar" :aria-valuenow="progressIndeterminate ? undefined : taskProgressPercent" aria-valuemin="0" aria-valuemax="100" :aria-label="`任务进度 ${taskProgressPercent}%`" :aria-valuetext="`${completedStepCount} / ${detail.task.steps.length} 步完成，${taskProgressPercent}%`">
+          <div class="task-progress-segments" :class="{ 'is-indeterminate': progressIndeterminate }" role="progressbar" :aria-valuenow="progressIndeterminate ? undefined : taskProgressPercent" aria-valuemin="0" aria-valuemax="100" :aria-label="`任务进度 ${taskProgressPercent}%`" :aria-valuetext="`${completedStepCount} / ${detail.task.steps.length} 步完成，${taskProgressPercent}%${partialStepCount ? `，${partialStepCount} 步部分完成` : ''}`">
             <span v-for="step in detail.task.steps" :key="step.id" class="task-progress-segment" :class="progressSegmentClass(step)" aria-hidden="true">
               <span :style="{ width: `${progressSegmentPercent(step)}%` }"></span>
             </span>
@@ -1373,7 +1449,7 @@ onBeforeUnmount(pauseTab)
           <div id="detail-panel-proof" v-show="activeDetailTab === 'proof'" class="detail-tab-stack" role="tabpanel" aria-labelledby="detail-tab-proof" tabindex="0">
             <section class="panel panel-pad" aria-labelledby="transcript-edit-title">
               <div class="panel-head">
-                <div><h2 id="transcript-edit-title">转写与画面校对</h2><p>原稿与校对稿分开保存。</p></div>
+                <div><h2 id="transcript-edit-title">转写与画面校对</h2></div>
                 <button class="button button-secondary button-small" type="button"
                   :disabled="!canReconcileTranscript || transcriptReconcileBusy || textPreviewBusy || textSaveBusy"
                   :title="transcriptReconcileUnavailableReason || '使用本任务已有的 ASR 与 OCR 结果生成新的校对草稿，不会重新识别。'"
@@ -1384,9 +1460,6 @@ onBeforeUnmount(pauseTab)
               <p v-if="transcriptReconcileUnavailableReason" class="helper" role="status">{{ transcriptReconcileUnavailableReason }}</p>
               <p v-if="transcriptReconcileMessage" class="helper" role="status">{{ transcriptReconcileMessage }}</p>
               <template v-if="editableTextArtifacts.length">
-                <div v-if="selectedEditableTextArtifact && selectedEditableTextArtifact.kind.includes('transcript') && selectedTranscriptionArtifact" class="detail-meta-inline transcript-method-summary">
-                  <span>{{ transcriptionMethod(selectedTranscriptionArtifact) }} · {{ artifactMetadataText(selectedTranscriptionArtifact, 'model_id') }} · {{ artifactMetadataText(selectedTranscriptionArtifact, 'language', '语言未记录') }}<template v-if="artifactMetadataText(selectedTranscriptionArtifact, 'device', '')"> · {{ artifactMetadataText(selectedTranscriptionArtifact, 'device') }}</template></span>
-                </div>
                 <label class="form-label" for="editable-text-artifact">选择稿件</label>
                 <select id="editable-text-artifact" v-model="editableArtifactId" class="select-control" :disabled="textPreviewBusy || textSaveBusy" @change="handleTextArtifactChange">
                   <option v-for="artifact in proofingTextOptions" :key="artifact.id" :value="artifact.id">
@@ -1398,57 +1471,129 @@ onBeforeUnmount(pauseTab)
                   <button class="button button-secondary button-small" type="button" :disabled="textPreviewBusy || !editedText.trim()" @click="copySelectedText">{{ textPreviewBusy ? '正在载入…' : '复制文本' }}</button>
                   <button v-if="reviewCopyEditorActive" class="button button-secondary button-small" type="button"
                     :disabled="transcriptComparisonBusy || textPreviewBusy"
-                    :aria-expanded="transcriptComparisonOpen"
-                    @click="toggleTranscriptComparison">
-                    {{ transcriptComparisonBusy ? '正在比对…' : `${transcriptComparisonOpen ? '收起差异' : '查看差异'}${transcriptComparisonOpen && transcriptComparison ? ` · ${transcriptComparisonChanges.length} 处` : ''}` }}
+                    aria-haspopup="dialog"
+                    @click="openTranscriptComparison">
+                    {{ transcriptComparisonBusy ? '正在比对…' : `查看差异${transcriptComparison ? ` · ${transcriptComparisonChanges.length} 处` : ''}` }}
                   </button>
                   <p v-if="textCopyMessage" class="helper" role="status">{{ textCopyMessage }}</p>
                 </div>
-                <div v-if="transcriptComparisonMessage" class="info-box form-error" role="alert">{{ transcriptComparisonMessage }}</div>
-                <section v-if="reviewCopyEditorActive && transcriptComparisonOpen" class="transcript-comparison-panel" aria-label="ASR 原稿与校对稿差异">
-                  <div v-if="transcriptComparisonBusy" class="helper" role="status">正在载入 ASR 原稿和 OCR 依据…</div>
-                  <template v-else-if="transcriptComparison">
-                    <div v-if="!transcriptComparisonChanges.length" class="transcript-comparison-empty">ASR 原稿与当前校对稿正文一致，没有发现文字变化。</div>
-                    <article v-for="change in transcriptComparisonChanges" :key="change.id" class="transcript-change-item">
-                      <div class="transcript-change-time">{{ transcriptTimeLabel(change.startSeconds, change.endSeconds) }}</div>
-                      <div class="transcript-diff-columns">
-                        <div class="transcript-diff-side transcript-diff-original">
-                          <span class="transcript-diff-label">原始 ASR</span>
-                          <p><span>{{ change.commonPrefix }}</span><del v-if="change.removedText">{{ change.removedText }}</del><span v-else class="transcript-diff-empty">（无）</span><span>{{ change.commonSuffix }}</span></p>
-                        </div>
-                        <div class="transcript-diff-side transcript-diff-current">
-                          <span class="transcript-diff-label">当前校对稿</span>
-                          <p><span>{{ change.commonPrefix }}</span><ins v-if="change.insertedText">{{ change.insertedText }}</ins><span v-else class="transcript-diff-empty">（删除）</span><span>{{ change.commonSuffix }}</span></p>
-                        </div>
+                <el-dialog
+                  v-model="transcriptComparisonOpen"
+                  class="transcript-comparison-dialog"
+                  title="ASR 原稿与校对稿差异"
+                  width="min(1080px, calc(100vw - 32px))"
+                  :teleported="false"
+                  aria-label="ASR 原稿与校对稿差异"
+                >
+                  <div class="transcript-comparison-panel">
+                    <div v-if="transcriptComparisonBusy" class="helper" role="status">正在载入 ASR 原稿和差异内容…</div>
+                    <div v-else-if="transcriptComparisonMessage" class="info-box form-error" role="alert">{{ transcriptComparisonMessage }}</div>
+                    <template v-else-if="transcriptComparison">
+                      <p class="transcript-comparison-summary">共 {{ transcriptComparisonChanges.length }} 处文字差异</p>
+                      <div v-if="!transcriptComparisonChanges.length" class="transcript-comparison-empty">ASR 原稿与当前校对稿正文一致，没有发现文字变化。</div>
+                      <div v-else class="transcript-diff-table-wrap">
+                        <table class="transcript-diff-table" aria-label="ASR 原稿与当前校对稿差异清单">
+                          <colgroup>
+                            <col class="transcript-diff-col-time" />
+                            <col />
+                            <col />
+                            <col class="transcript-diff-col-action" />
+                          </colgroup>
+                          <thead>
+                            <tr>
+                              <th scope="col">时间</th>
+                              <th scope="col">原始 ASR</th>
+                              <th scope="col">当前校对稿</th>
+                              <th scope="col">操作</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="change in transcriptComparisonChanges" :key="change.id">
+                              <td class="transcript-diff-time">{{ transcriptTimeLabel(change.startSeconds, change.endSeconds) }}</td>
+                              <td class="transcript-diff-value transcript-diff-original">
+                                <span>{{ change.commonPrefix }}</span><del v-if="change.removedText">{{ change.removedText }}</del><span v-else class="transcript-diff-empty">（无）</span><span>{{ change.commonSuffix }}</span>
+                              </td>
+                              <td class="transcript-diff-value transcript-diff-current">
+                                <span>{{ change.commonPrefix }}</span><ins v-if="change.insertedText">{{ change.insertedText }}</ins><span v-else class="transcript-diff-empty">（删除）</span><span>{{ change.commonSuffix }}</span>
+                              </td>
+                              <td class="transcript-diff-action">
+                                <button class="button button-secondary button-small" type="button"
+                                  :disabled="textSaveBusy || change.currentStartOffset === null || change.currentEndOffset === null"
+                                  title="将这处校对恢复为原始 ASR 文本；不会自动保存"
+                                  aria-label="恢复为原始 ASR 文本"
+                                  @click="restoreTranscriptChange(change)">恢复</button>
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
                       </div>
-                      <details v-for="(correction, correctionIndex) in ocrCorrectionsForChange(change)" :key="`${change.id}-${correctionIndex}`" class="transcript-change-evidence">
-                        <summary>查看 OCR 依据<span v-if="correction.frame_ids?.length"> · {{ correction.frame_ids.length }} 帧</span></summary>
-                        <p v-if="correction.ocr_text">OCR 摘录：<b>{{ correction.ocr_text }}</b></p>
-                        <p v-if="correction.frame_ids?.length">画面帧：{{ correction.frame_ids.join('、') }}</p>
-                        <p v-if="correction.frame_times_seconds?.length">抽帧时间：{{ correction.frame_times_seconds.map((time) => `${time.toFixed(1)} 秒`).join('、') }}</p>
+                      <p v-if="transcriptUndoMessage" class="helper transcript-undo-message" role="status">{{ transcriptUndoMessage }}</p>
+                      <details v-if="transcriptComparison.ocr_result_artifact_id" class="transcript-full-ocr" @toggle="loadFullOcrEvidence">
+                        <summary>查看完整 OCR 结果</summary>
+                        <p v-if="fullOcrEvidenceBusy" class="helper" role="status">正在载入 OCR 结果…</p>
+                        <p v-if="fullOcrEvidenceMessage" class="helper" role="status">{{ fullOcrEvidenceMessage }}</p>
+                        <pre v-if="fullOcrEvidenceContent" class="transcript-full-ocr-content">{{ fullOcrEvidenceContent }}</pre>
                       </details>
-                      <div class="transcript-change-actions">
-                        <span>恢复为原始 ASR 文本，不会自动保存</span>
-                        <button class="button button-secondary button-small" type="button"
-                          :disabled="textSaveBusy || change.currentStartOffset === null || change.currentEndOffset === null"
-                          title="将这处校对恢复为原始 ASR 文本；不会自动保存"
-                          @click="restoreTranscriptChange(change)">撤回此处校对</button>
-                      </div>
-                    </article>
-                    <p v-if="transcriptUndoMessage" class="helper transcript-undo-message" role="status">{{ transcriptUndoMessage }}</p>
-                    <details v-if="transcriptComparison.ocr_result_artifact_id" class="transcript-full-ocr" @toggle="loadFullOcrEvidence">
-                      <summary>查看完整 OCR 结果</summary>
-                      <p v-if="fullOcrEvidenceBusy" class="helper" role="status">正在载入 OCR 结果…</p>
-                      <p v-if="fullOcrEvidenceMessage" class="helper" role="status">{{ fullOcrEvidenceMessage }}</p>
-                      <pre v-if="fullOcrEvidenceContent" class="transcript-full-ocr-content">{{ fullOcrEvidenceContent }}</pre>
-                    </details>
-                  </template>
-                </section>
+                    </template>
+                  </div>
+                </el-dialog>
                 <div v-if="selectedEditableTextArtifact && textPreviewBusy" class="info-box" role="status">正在读取所选版本…</div>
-                <div v-if="selectedEditableTextArtifact && !textPreviewBusy && reviewCopyEditorActive" class="review-copy-editor-heading">
-                  <h3>校对正文</h3>
-                </div>
-                <MarkdownTextEditor v-if="selectedEditableTextArtifact && !textPreviewBusy" v-model="editedText" :disabled="textSaveBusy" />
+                <template v-if="selectedEditableTextArtifact && !textPreviewBusy">
+                  <section class="proof-body" aria-label="校对正文">
+                    <div class="proof-body-head">
+                      <div class="left">
+                        <h3>校对正文</h3>
+                        <span v-if="proofViewMode === 'edit'" class="mode-chip edit">编辑中</span>
+                        <span v-else class="mode-chip preview">只读预览</span>
+                      </div>
+                      <div class="proof-body-actions">
+                        <button v-if="proofViewMode === 'preview' && !selectedVaultNotePath" class="button button-small" type="button"
+                          :disabled="vaultImportBusy"
+                          title="将当前校对稿一键写入知识库；文件名自动取素材标题，已有同名不同内容的文件不会被覆盖。"
+                          @click="importToVault">
+                          {{ vaultImportBusy ? '正在导入…' : '导入到知识库' }}
+                        </button>
+                        <button v-if="proofViewMode === 'preview'" class="button button-secondary button-small" type="button" :disabled="vaultImportBusy" @click="beginTextEdit">编辑</button>
+                        <button v-else class="button button-secondary button-small" type="button" :disabled="textSaveBusy" @click="cancelTextEdit">取消编辑</button>
+                      </div>
+                    </div>
+                    <template v-if="proofViewMode === 'preview'">
+                      <MarkdownPreview class="proof-preview" :content="textEditSnapshot || '当前版本没有正文。'" aria-label="校对正文预览" />
+                      <div class="proof-foot">
+                        <span>{{ proofPreviewStats }}</span>
+                        <span v-if="selectedVaultNotePath">已入库 · {{ selectedVaultNotePath }}</span>
+                        <span v-else>导入知识库会生成带 frontmatter 的 Markdown 文件</span>
+                      </div>
+                    </template>
+                    <MarkdownTextEditor v-else v-model="editedText" :disabled="textSaveBusy" />
+                    <div v-if="proofViewMode === 'edit'" class="text-editor-save-bar">
+                      <div class="text-editor-save-copy">
+                        <button class="button button-secondary button-small" type="button" :disabled="textSaveBusy || textPreviewBusy" @click="cancelTextEdit">取消编辑</button>
+                        <p class="helper">保存会生成新的校对版本，不会覆盖原始转写或 OCR 文件。</p>
+                        <p v-if="textSaveMessage" class="helper" role="status">{{ textSaveMessage }}</p>
+                      </div>
+                      <button class="button button-small" type="button" :disabled="!textHasUnsavedChanges || textSaveBusy || textPreviewBusy" @click="saveTextRevision">
+                        {{ textSaveBusy ? '正在保存…' : '保存' }}
+                      </button>
+                    </div>
+                  </section>
+                  <div v-if="proofViewMode === 'preview' && selectedVaultNotePath" class="vault-import-actions">
+                    <div class="button-row vault-import-row">
+                      <span v-if="selectedVaultLibraryName" class="status-badge">{{ selectedVaultLibraryName }}</span>
+                      <button class="button button-secondary button-small" type="button" :disabled="vaultImportBusy" @click="openVaultNote(false)">打开知识库文件</button>
+                      <button class="button button-secondary button-small" type="button" :disabled="vaultImportBusy" @click="openVaultNote(true)">打开所在目录</button>
+                    </div>
+                    <div class="button-row vault-import-row">
+                      <button class="button button-secondary button-small" type="button" :disabled="vaultImportBusy"
+                        title="用当前版本内容覆盖此前导入的知识库文件；若文件在校后被外部修改过，将不会覆盖。"
+                        @click="importToVault">
+                        {{ vaultImportBusy ? '正在更新…' : '更新知识库文件' }}
+                      </button>
+                      <p class="helper-inline">已入库后再次点击 = 用当前版本内容覆盖同一文件。</p>
+                    </div>
+                  </div>
+                  <p v-if="vaultImportMessage" class="helper" role="status">{{ vaultImportMessage }}</p>
+                </template>
                 <section v-if="mergedCommentFeedback && !textPreviewBusy" class="info-box merged-comment-feedback" aria-label="已合并的评论反馈">
                   <div class="merged-comment-feedback-heading">
                     <h3>已合并的评论反馈</h3>
@@ -1456,16 +1601,6 @@ onBeforeUnmount(pauseTab)
                   </div>
                   <MarkdownPreview class="merged-comment-feedback-preview" :content="mergedCommentFeedback" />
                 </section>
-                <div v-if="selectedEditableTextArtifact && !textPreviewBusy" class="text-editor-save-bar">
-                  <div class="text-editor-save-copy">
-                    <button class="button button-secondary button-small" type="button" :disabled="!textHasUnsavedChanges || textSaveBusy || textPreviewBusy" @click="discardTextChanges">撤销修改</button>
-                    <p class="helper">保存会生成新的校对版本，不会覆盖原始转写或 OCR 文件。</p>
-                    <p v-if="textSaveMessage" class="helper" role="status">{{ textSaveMessage }}</p>
-                  </div>
-                  <button class="button button-small" type="button" :disabled="!textHasUnsavedChanges || textSaveBusy || textPreviewBusy" @click="saveTextRevision">
-                    {{ textSaveBusy ? '正在保存…' : '保存' }}
-                  </button>
-                </div>
               </template>
               <div v-else class="empty-state empty-state-compact" role="status"><h3>暂无转写或 OCR 文本</h3><p>任务生成相关产物后，可在这里预览和校对。</p></div>
               <button class="text-button" type="button" @click="selectDetailTab('files')">按需分析内容结构 →</button>
@@ -1488,6 +1623,15 @@ onBeforeUnmount(pauseTab)
                 {{ actionBusy ? '正在提交…' : '继续识别' }}
               </button>
             </section>
+
+            <VaultLibraryDialog
+              :open="vaultImportDialogOpen"
+              :libraries="vaultImportLibraries"
+              hint="这份转写稿导入后将写入所选目录；文件名自动取素材标题，已有同名不同内容的文件不会被覆盖。"
+              confirm-label="导入"
+              @confirm="confirmImportLibrary"
+              @cancel="cancelImportLibrary"
+            />
           </div>
 
           <div id="detail-panel-comments" v-show="activeDetailTab === 'comments'" class="detail-tab-stack" role="tabpanel" aria-labelledby="detail-tab-comments" tabindex="0">
@@ -1551,18 +1695,18 @@ onBeforeUnmount(pauseTab)
             <div class="aside-head"><div><h2>作品信息与归档</h2><p>来源信息和本机保存位置。</p></div></div>
             <dl class="meta-list">
               <div class="meta-row"><dt>来源</dt><dd>{{ detail.asset.source_kind === 'file' ? '本地媒体' : platformLabel(detail.asset.platform) }}</dd></div>
+              <div v-if="originalVideoUrl" class="meta-row"><dt>原视频</dt><dd><a class="text-button" :href="originalVideoUrl" target="_blank" rel="noopener noreferrer">打开原视频 ↗</a></dd></div>
               <div class="meta-row"><dt>作者</dt><dd>{{ videoAuthor }}</dd></div>
               <div class="meta-row"><dt>发布时间</dt><dd>{{ videoPublishedAt }}</dd></div>
               <div class="meta-row"><dt>时长</dt><dd>{{ videoDuration }}</dd></div>
               <div class="meta-row"><dt>分辨率</dt><dd>{{ videoResolution }}</dd></div>
-              <div class="meta-row"><dt>作品 ID</dt><dd><code>{{ detail.asset.source_id || '—' }}</code></dd></div>
               <div class="meta-row"><dt>归档位置</dt><dd>{{ archivePathLabel(detail.asset.archive_relative_path) }}</dd></div>
               <div class="meta-row"><dt>归档时间</dt><dd>{{ formatDate(detail.asset.archived_at) }}</dd></div>
             </dl>
             <button class="button button-secondary button-small detail-folder-button" type="button" :disabled="!canOpenTaskFolder || taskFolderBusy" @click="openTaskFolder">{{ taskFolderBusy ? '正在打开…' : '打开任务目录' }}</button>
             <RouterLink class="text-button" :to="{ name: 'settings', query: { tab: 'folders' } }">查看目录设置 →</RouterLink>
-            <div class="detail-pending-group">
-              <div class="aside-head"><div><h2>待处理事项</h2><p>需要授权或检查时在这里提示。</p></div></div>
+            <div v-if="pendingOcrStep || failedStep" class="detail-pending-group">
+              <div class="aside-head"><div><h2>待处理事项</h2></div></div>
               <div v-if="pendingOcrStep" class="detail-pending-item">
                 <strong>OCR 等待继续</strong><span>继续后将使用当前云端图像模型识别已生成的关键帧。</span>
                 <button class="text-button" type="button" :disabled="actionBusy" @click="retryStep(pendingOcrStep.id)">继续识别 →</button>
@@ -1570,8 +1714,6 @@ onBeforeUnmount(pauseTab)
               <div v-else-if="failedStep" class="detail-pending-item">
                 <strong>{{ stepLabels[failedStep.kind] ?? failedStep.kind }}需要处理</strong><span>{{ failedStep.message || '查看步骤记录了解停止原因。' }}</span>
               </div>
-              <div v-else-if="taskActive" class="detail-empty">任务运行中，页面会自动同步步骤状态。</div>
-              <div v-else class="detail-empty">暂无待处理事项</div>
             </div>
           </section>
         </aside>
@@ -1592,12 +1734,27 @@ onBeforeUnmount(pauseTab)
 .detail-page-heading .detail-description { min-width: 0; flex: 1 1 auto; margin: 0; color: var(--text-tertiary); font-size: var(--fs-body-sm); line-height: var(--lh-base); overflow-wrap: anywhere; }
 .detail-page-heading .detail-description.is-collapsed { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .task-progress-state-heading { display: flex; min-width: 0; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; }
+.task-progress-segment.is-partial > span { background: var(--warning); }
 .task-progress-state-duration { color: var(--text-tertiary); font-size: var(--fs-body-sm); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .page-heading .lead { color: var(--text-tertiary); font-size: var(--fs-body); }
 .panel-head h2 { font-size: var(--fs-title-xl); font-weight: var(--fw-semibold); line-height: var(--lh-tight); }
 .panel-head p { margin: 4px 0 0; color: var(--text-tertiary); font-size: var(--fs-body-sm); }
 .aside-card h2 { font-size: var(--fs-title-lg); font-weight: var(--fw-semibold); }
-.review-copy-editor-heading h3 { margin: 0 0 3px; font-size: var(--fs-title-md); font-weight: var(--fw-semibold); }
+/* —— 校对正文 · 预览/编辑两态卡片（设计稿 19） —— */
+.proof-body { margin-top: 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); overflow: hidden; }
+.proof-body-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--paper-2); }
+.proof-body-head .left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.proof-body-head h3 { margin: 0; color: var(--text-primary); font-size: var(--fs-title-md); font-weight: var(--fw-semibold); }
+.proof-body-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.mode-chip { flex: 0 0 auto; padding: 2px 9px; border-radius: 999px; color: var(--text-tertiary); background: #eef0f3; font-size: var(--fs-caption); font-weight: var(--fw-medium); }
+.mode-chip.edit { color: var(--pine-2); background: var(--pine-soft); }
+.proof-preview { min-width: 0; max-height: 430px; overflow: auto; padding: 16px 18px 18px; }
+.proof-preview :deep(p) { margin: 0 0 10px; color: var(--text-primary); font-size: var(--fs-body); line-height: 1.85; }
+.proof-preview :deep(p:last-child) { margin-bottom: 0; }
+.proof-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 14px; border-top: 1px solid var(--line); background: var(--paper-2); color: var(--text-tertiary); font-size: var(--fs-caption); overflow-wrap: anywhere; }
+.vault-import-actions { display: grid; gap: 8px; margin-top: 12px; }
+.vault-import-row { margin-top: 0; }
+.vault-import-row .helper-inline { margin: 0; }
 .merged-comment-feedback { display: grid; min-width: 0; gap: .75rem; margin-top: 1rem; }
 .merged-comment-feedback-heading h3 { margin: 0; color: var(--text-primary); font-size: var(--fs-title-md); font-weight: var(--fw-semibold); }
 .merged-comment-feedback-heading p { margin: .25rem 0 0; color: var(--text-secondary); font-size: var(--fs-body-sm); }
@@ -1612,6 +1769,10 @@ onBeforeUnmount(pauseTab)
 .asset-detail-page :deep(.status-badge) { min-height: 24px; padding: 0 10px; font-size: var(--fs-caption); font-weight: var(--fw-medium); }
 .asset-detail-page :deep(.empty-state h3) { color: var(--text-primary); font-size: var(--fs-title-md); font-weight: var(--fw-semibold); }
 .asset-detail-page :deep(.empty-state p) { color: var(--text-tertiary); font-size: var(--fs-body-sm); }
+.asset-detail-page :deep(.transcript-comparison-dialog) { max-height: 90dvh; overflow: hidden; border-radius: 12px; }
+.asset-detail-page :deep(.transcript-comparison-dialog .el-dialog__header) { margin: 0; padding: 16px 20px 13px; border-bottom: 1px solid var(--line); }
+.asset-detail-page :deep(.transcript-comparison-dialog .el-dialog__title) { color: var(--text-primary); font-size: var(--fs-title-lg); font-weight: var(--fw-semibold); }
+.asset-detail-page :deep(.transcript-comparison-dialog .el-dialog__body) { max-height: calc(90dvh - 66px); overflow: auto; padding: 16px 20px 20px; color: var(--text-primary); }
 .scope-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--text-tertiary); font-size: var(--fs-caption); }
 .detail-empty { color: var(--text-tertiary); font-size: var(--fs-body-sm); }
 
@@ -1633,9 +1794,11 @@ onBeforeUnmount(pauseTab)
 .detail-pending-group { display: grid; gap: 9px; margin-top: 1px; padding-top: 12px; border-top: 1px solid var(--line); }
 .detail-pending-group .aside-head { margin: 0; }
 .detail-pending-group .aside-head h2 { font-size: var(--fs-title-md); }
-.detail-pending-group .aside-head p { margin-top: 3px; color: var(--text-tertiary); font-size: var(--fs-body-sm); }
 .detail-pending-group .detail-pending-item { border-radius: 6px; }
 @media (max-width: 600px) {
+  .asset-detail-page :deep(.transcript-comparison-dialog) { width: calc(100vw - 18px); max-height: 94dvh; }
+  .asset-detail-page :deep(.transcript-comparison-dialog .el-dialog__header) { padding: 14px 14px 11px; }
+  .asset-detail-page :deep(.transcript-comparison-dialog .el-dialog__body) { max-height: calc(94dvh - 60px); padding: 12px 14px 16px; }
   .article-generation-heading { flex-direction: column; }
   .article-generation-list li { align-items: flex-start; flex-direction: column; }
 }

@@ -20,6 +20,7 @@ _PROMPT = ('请对每条评论只返回分类，JSON格式为{"items":[{"n":1,"l
            'I普通互动，S垃圾信息，U无法判断；不要输出评论原文、理由或总结。')
 _LABELS = {'Q': '观众提问', 'T': '选题请求', 'V': '经验与观点', 'F': '纠错与具体反馈',
            'I': '普通互动', 'S': '垃圾信息', 'U': '待复核'}
+_MAX_REPAIR_ITEMS = 25
 
 
 def _spent(context, options):
@@ -48,7 +49,7 @@ def _cached(context, source_id, model_id, provider_id, option_hash):
     for row in rows:
         try:
             metadata = json.loads(row['metadata_json'])
-            if (metadata.get('prompt_version') != _VERSION or metadata.get('option_hash') != option_hash
+            if (not isinstance(metadata, dict) or metadata.get('prompt_version') != _VERSION or metadata.get('option_hash') != option_hash
                     or metadata.get('source_artifact_ids') != [source_id] or metadata.get('model_id') != model_id
                     or metadata.get('provider_id') != provider_id):
                 continue
@@ -62,27 +63,52 @@ def _cached(context, source_id, model_id, provider_id, option_hash):
             if hashlib.sha256(content).hexdigest() != row['sha256']:
                 continue
             value = json.loads(content.decode('utf-8'))
-            result.setdefault(int(value['batch_index']), (value, str(row['id'])))
+            if isinstance(value, dict) and isinstance(value.get('raw_response_text'), str):
+                key = (int(value['batch_index']), value.get('repair') is True)
+                result.setdefault(key, (value, str(row['id'])))
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             continue
     return result
 
 
-def _has_prior_attempt(context, batch_index):
+def _has_prior_attempt(context, batch_index, repair):
     with context.repository.database.transaction() as connection:
         rows = connection.execute('SELECT usage_json FROM model_runs WHERE task_id=? AND step_id=?', (context.task.id, context.step.id)).fetchall()
     for row in rows:
         try:
             detail = json.loads(row['usage_json'] or '{}').get('input_detail', {})
-            if detail.get('prompt_version') == _VERSION and detail.get('batch_index') == batch_index:
+            if (detail.get('prompt_version') == _VERSION and detail.get('batch_index') == batch_index
+                    and (detail.get('repair') is True) == repair):
                 return True
         except (TypeError, ValueError, AttributeError):
             continue
     return False
 
 
+def _read_labels(raw: str, batch_size: int) -> dict[int, list[str]]:
+    from .analyze_comments import _parse_object
+
+    try:
+        items = _parse_object(raw).get('items')
+    except RunnerError:
+        return {}
+    by_index = {}
+    if not isinstance(items, list):
+        return by_index
+    for item in items:
+        if not isinstance(item, dict) or type(item.get('n')) is not int or not isinstance(item.get('labels'), list):
+            continue
+        n = item['n']
+        if n < 1 or n > batch_size or n in by_index:
+            continue
+        labels = list(dict.fromkeys(_LABELS[label] for label in item['labels'] if isinstance(label, str) and label in _LABELS))[:3]
+        if labels:
+            by_index[n] = labels
+    return by_index
+
+
 def analyze_economically(context, comments, options):
-    from .analyze_comments import CommentAnalysis, ClassifiedComment, SelectedComment, _comment_note_artifact, _parse_object
+    from .analyze_comments import CommentAnalysis, ClassifiedComment, SelectedComment, _comment_note_artifact
 
     groups = group_comments(comments)
     candidates = choose_groups(groups, str(options['mode']), int(options['candidate_limit']))
@@ -99,7 +125,9 @@ def analyze_economically(context, comments, options):
     processed_ids = []
     attempted_ids = set()
     raw_batches = []
+    completed_batches = 0
     stop_reason = None
+
     def publish_partial():
         inp, out, spent, unknown = _spent(context, options)
         counts = {label: 0 for label in _LABELS.values()}
@@ -114,82 +142,89 @@ def analyze_economically(context, comments, options):
             'coverage': {'mode': options['mode'], 'original_count': len(comments), 'unique_text_count': len(groups),
                 'candidate_text_count': len(candidates), 'analyzed_original_count': len(processed_ids),
                 'attempted_original_count': len(attempted_ids), 'not_selected_original_count': len(comments) - sum(len(group.comments) for group in candidates),
-                'unanalysed_original_count': len(comments) - len(processed_ids), 'completed_batches': len(raw_batches),
+                'unanalysed_original_count': len(comments) - len(processed_ids), 'completed_batches': completed_batches,
                 'total_batches': len(batches), 'input_tokens': inp, 'output_tokens': out,
                 'estimated_cost_cny': str(spent), 'unknown_cost': unknown, 'budget_cny': options['budget_cny'], 'token_budget': options['token_budget'],
                 'stop_reason': None, 'running': True}}
         register_bytes(context, 'comment_analysis_json', '.json', json.dumps(payload, ensure_ascii=False).encode('utf-8'),
             {'media_type': 'application/json', 'partial': True, 'source_artifact_ids': [source_id]})
-    for index, batch in enumerate(batches, 1):
+
+    def request_batch(index, batch, *, repair=False):
+        nonlocal stop_reason
         if context.cancel_event.is_set():
             raise TaskCancelled
         fingerprints = [group.fingerprint for group in batch]
         text = batch_input(batch)
-        if len(text.encode('utf-8')) > 96 * 1024:
-            stop_reason = '存在超过单批输入上限的评论，请查看原文并单独处理。'
-            continue
-        context.progress(context.step.id, round((index - 1) / max(len(batches), 1) * 90),
-                         '已完成 ' + str(len(raw_batches)) + '/' + str(len(batches)) + ' 批，已分析 ' + str(len(processed_ids)) + ' 条原评论')
-        existing = cached.get(index)
+        existing = cached.get((index, repair))
         if existing and existing[0].get('fingerprints') == fingerprints:
             attempted_ids.update(item.platform_comment_id for group in batch for item in group.comments)
-            raw, artifact_id = existing[0]['raw_response_text'], existing[1]
-        else:
-            if _has_prior_attempt(context, index):
-                stop_reason = '该批次已有调用记录，但可复用结果缺失或不匹配；已停止，避免重复计费。'
-                break
-            inp, out, spent, unknown = _spent(context, options)
-            if unknown:
-                stop_reason = '调用用量未知，已停止发送新批次，请核对服务商记录。'
-                break
-            estimated_input = len((_PROMPT + text).encode('utf-8')) + 256
-            output_limit = int(options['max_output_tokens'])
-            if inp + out + estimated_input + output_limit > int(options['token_budget']):
-                stop_reason = '预计下一批可能超过 Token 预算，已停止发送新批次。'
-                break
-            reservation = (Decimal(estimated_input) * Decimal(str(options['input_price_per_million'])) + Decimal(output_limit) * Decimal(str(options['output_price_per_million']))) / Decimal(1_000_000)
-            if spent + reservation > Decimal(str(options['budget_cny'])):
-                stop_reason = '预计下一批可能超过本次预算，已停止发送新批次。'
-                break
-            try:
-                attempted_ids.update(item.platform_comment_id for group in batch for item in group.comments)
-                response = authorized_model_call(context, model_id=model_id, input_artifact_ids=[source_id], consent_artifact_ids=[source_id],
-                    input_detail={'batch_index': index, 'batch_count': len(batches), 'comment_count': len(batch), 'mode': options['mode'], 'prompt_version': _VERSION},
-                    operation=lambda provider, data=text: provider.analyze_text(_PROMPT, data, model_id, max_output_tokens=output_limit))
-            except RunnerError as exc:
-                if context.cancel_event.is_set():
-                    raise TaskCancelled from exc
-                stop_reason = '本批请求未完成，可能存在未知费用；请查看模型调用记录。'
-                break
-            raw = str(response.text)
-            artifact = register_bytes(context, 'comment_analysis_raw', '.json', json.dumps({'batch_index': index, 'fingerprints': fingerprints, 'raw_response_text': raw}, ensure_ascii=False).encode('utf-8'),
-                {'model_id': model_id, 'provider_id': provider_id, 'prompt_version': _VERSION, 'option_hash': option_hash, 'batch_index': index, 'source_artifact_ids': [source_id]})
-            artifact_id = artifact.id
+            return existing[0]['raw_response_text'], existing[1]
+        if _has_prior_attempt(context, index, repair):
+            stop_reason = '该批次已有调用记录，但可复用结果缺失或不匹配；已停止，避免重复计费。'
+            return None
+        inp, out, spent, unknown = _spent(context, options)
+        if unknown:
+            stop_reason = '调用用量未知，已停止发送新批次，请核对服务商记录。'
+            return None
+        estimated_input = len((_PROMPT + text).encode('utf-8')) + 256
+        output_limit = int(options['max_output_tokens'])
+        if inp + out + estimated_input + output_limit > int(options['token_budget']):
+            stop_reason = '预计下一次请求可能超过 Token 预算，已停止发送。'
+            return None
+        reservation = (Decimal(estimated_input) * Decimal(str(options['input_price_per_million'])) + Decimal(output_limit) * Decimal(str(options['output_price_per_million']))) / Decimal(1_000_000)
+        if spent + reservation > Decimal(str(options['budget_cny'])):
+            stop_reason = '预计下一次请求可能超过本次预算，已停止发送。'
+            return None
         try:
-            parsed = _parse_object(raw)
-            items = parsed.get('items')
-            if not isinstance(items, list):
-                raise ValueError('missing items')
-            by_index = {}
-            for item in items:
-                if not isinstance(item, dict) or type(item.get('n')) is not int or not isinstance(item.get('labels'), list):
-                    continue
-                n = item['n']
-                if n < 1 or n > len(batch) or n in by_index:
-                    continue
-                labels = list(dict.fromkeys(_LABELS[label] for label in item['labels'] if isinstance(label, str) and label in _LABELS))[:3]
-                if labels:
-                    by_index[n] = labels
-            if len(by_index) != len(batch):
-                raise ValueError('incomplete classification')
-        except (RunnerError, ValueError):
-            stop_reason = '本批模型结果不完整或格式无效，已保留响应并停止；未处理的评论可继续查看原文。'
+            attempted_ids.update(item.platform_comment_id for group in batch for item in group.comments)
+            response = authorized_model_call(context, model_id=model_id, input_artifact_ids=[source_id], consent_artifact_ids=[source_id],
+                input_detail={'batch_index': index, 'batch_count': len(batches), 'comment_count': len(batch),
+                    'mode': options['mode'], 'prompt_version': _VERSION, 'repair': repair},
+                operation=lambda provider: provider.analyze_text(_PROMPT, text, model_id, max_output_tokens=output_limit))
+        except RunnerError as exc:
+            if context.cancel_event.is_set():
+                raise TaskCancelled from exc
+            stop_reason = '本批请求未完成，可能存在未知费用；请查看模型调用记录。'
+            return None
+        raw = str(response.text)
+        artifact = register_bytes(context, 'comment_analysis_raw', '.json', json.dumps(
+            {'batch_index': index, 'fingerprints': fingerprints, 'raw_response_text': raw, 'repair': repair}, ensure_ascii=False).encode('utf-8'),
+            {'model_id': model_id, 'provider_id': provider_id, 'prompt_version': _VERSION, 'option_hash': option_hash,
+                'batch_index': index, 'repair': repair, 'source_artifact_ids': [source_id]})
+        return raw, artifact.id
+
+    oversized = False
+    for index, batch in enumerate(batches, 1):
+        if context.cancel_event.is_set():
+            raise TaskCancelled
+        if len(batch_input(batch).encode('utf-8')) > 96 * 1024:
+            oversized = True
+            continue
+        progress = round((index - 1) / max(len(batches), 1) * 90)
+        context.progress(context.step.id, progress,
+                         f'已完成 {completed_batches}/{len(batches)} 批，已分析 {len(processed_ids)} 条原评论')
+        response = request_batch(index, batch)
+        if response is None:
             break
+        raw, artifact_id = response
+        by_index = _read_labels(raw, len(batch))
+        missing = [n for n in range(1, len(batch) + 1) if n not in by_index]
+        repair_artifact_id = None
+        if by_index and 0 < len(missing) <= _MAX_REPAIR_ITEMS:
+            context.progress(context.step.id, progress, f'正在补查第 {index} 批缺失的 {len(missing)} 组评论')
+            repair = request_batch(index, [batch[n - 1] for n in missing], repair=True)
+            if repair is not None:
+                repair_raw, repair_artifact_id = repair
+                for n, labels in _read_labels(repair_raw, len(missing)).items():
+                    by_index[missing[n - 1]] = labels
+        batch_ids = []
         for n, group in enumerate(batch, 1):
-            labels = by_index[n]
+            labels = by_index.get(n)
+            if labels is None:
+                continue
             for comment in group.comments:
                 classified.append(ClassifiedComment(comment.platform_comment_id, labels))
-                processed_ids.append(comment.platform_comment_id)
+                batch_ids.append(comment.platform_comment_id)
             if len(selected) < 20 and any(label in labels for label in ('观众提问', '选题请求', '经验与观点', '纠错与具体反馈')):
                 representative = max(group.comments, key=lambda item: item.like_count or 0)
                 selected.append(SelectedComment(representative.platform_comment_id, '有用', '模型分类的候选评论，请人工复核。', representative.text, representative.like_count))
@@ -197,13 +232,23 @@ def analyze_economically(context, comments, options):
                 questions.append('评论原文：' + group.text[:500])
             if any(label in labels for label in ('选题请求', '经验与观点', '纠错与具体反馈')) and len(themes) < 20:
                 themes.append('评论原文：' + group.text[:500])
-        raw_batches.append({'batch_index': index, 'processed_comment_ids': [item.platform_comment_id for group in batch for item in group.comments], 'raw_artifact_id': artifact_id})
+        processed_ids.extend(batch_ids)
+        report = {'batch_index': index, 'processed_comment_ids': batch_ids, 'raw_artifact_id': artifact_id}
+        if repair_artifact_id is not None:
+            report['repair_raw_artifact_id'] = repair_artifact_id
+        raw_batches.append(report)
+        if len(by_index) < len(batch):
+            stop_reason = stop_reason or f'第 {index} 批只返回 {len(by_index)}/{len(batch)} 组有效分类，已保留有效结果。'
+            break
+        completed_batches += 1
         publish_partial()
+    if stop_reason is None and oversized:
+        stop_reason = '存在超过单批输入上限的评论，请查看原文并单独处理。'
     setattr(context, '_comment_analysis_raw', raw_batches)
     inp, out, spent, unknown = _spent(context, options)
     setattr(context, '_comment_analysis_coverage', {'mode': options['mode'], 'original_count': len(comments), 'unique_text_count': len(groups),
         'candidate_text_count': len(candidates), 'analyzed_original_count': len(processed_ids), 'unanalysed_original_count': len(comments) - len(processed_ids),
         'attempted_original_count': len(attempted_ids), 'not_selected_original_count': len(comments) - sum(len(group.comments) for group in candidates),
-        'completed_batches': len(raw_batches), 'total_batches': len(batches), 'input_tokens': inp, 'output_tokens': out,
+        'completed_batches': completed_batches, 'total_batches': len(batches), 'input_tokens': inp, 'output_tokens': out,
         'estimated_cost_cny': str(spent), 'unknown_cost': unknown, 'budget_cny': options['budget_cny'], 'token_budget': options['token_budget'], 'stop_reason': stop_reason})
     return CommentAnalysis(selected, classified, themes, questions, [], [], processed_ids)

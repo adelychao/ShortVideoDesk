@@ -102,7 +102,7 @@ export interface PlatformStatus {
 }
 
 export interface SourcePreview {
-  platform: 'douyin' | 'bilibili'
+  platform: 'douyin' | 'bilibili' | 'youtube' | 'tiktok' | 'instagram' | 'facebook' | 'twitter' | 'reddit'
   platform_name: string
   source_id: string | null
   is_short: boolean
@@ -308,6 +308,12 @@ export interface TaskStep {
   message: string | null
   error_code: string | null
   retry_count: number
+  downloaded_bytes?: number | null
+  total_bytes?: number | null
+  speed_bytes_per_second?: number | null
+  eta_seconds?: number | null
+  last_progress_at?: string | null
+  automatic_retry_count?: number
   started_at: string | null
   finished_at: string | null
 }
@@ -439,6 +445,16 @@ export interface ArticleSourceScript {
   source_title: string | null
   version: number
   created_at: string
+}
+
+export interface ArticleGenerationJob {
+  id: string
+  content: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  article_id: string | null
+  error_message: string | null
+  created_at: string
+  finished_at: string | null
 }
 
 export interface ArticleFromTextRequest {
@@ -778,6 +794,7 @@ export interface VideoPublishTarget {
   heartbeat_at?: string | null
   last_output_at?: string | null
   upload_retry_count?: number
+  diagnostic_code?: string | null
   diagnosis?: {
     code: string
     severity: 'warning' | 'danger'
@@ -1096,6 +1113,14 @@ export interface VaultWriteResult {
   conflict_path: string | null
   reason: string | null
   library_name?: string | null
+}
+
+export interface VaultImportResult {
+  written: boolean
+  path: string | null
+  conflict_path: string | null
+  reason: string | null
+  library_name: string | null
 }
 
 export interface SearchHit {

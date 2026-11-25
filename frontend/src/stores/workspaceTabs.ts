@@ -22,6 +22,8 @@ function tabFromPath(router: Router, path: string): WorkspaceTab | null {
   const batchId = typeof resolved.params.batchId === 'string' ? resolved.params.batchId : ''
   const title = resolved.name === 'task-detail' && taskId
     ? `任务 · ${taskId.slice(-6)}`
+    : resolved.name === 'article-from-text' && resolved.query.job
+      ? '文章生成任务'
     : resolved.name === 'video-publish-detail' && batchId
       ? `发布 · ${batchId.slice(-6)}`
     : String(resolved.meta.title ?? resolved.path)

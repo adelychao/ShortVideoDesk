@@ -54,7 +54,7 @@ from .script_styles import MAX_SELECTED_SCRIPT_STYLES
 from .uploads import UploadError, UploadReceipt, delete_upload, get_upload
 
 
-ProgressCallback = Callable[[str, float | None, str], None]
+ProgressCallback = Callable[..., None]
 EventCallback = Callable[[dict[str, object]], None]
 
 
@@ -114,6 +114,7 @@ class StepContext:
     media_artifact: ArtifactRecord | None = None
     skip_event: threading.Event | None = None
     ocr_resume_mode: str | None = None
+    download_quality: str | None = None
 
 
 class StepHandler(Protocol):
@@ -128,6 +129,7 @@ class _QueueItem:
     callback: EventCallback | None
     selected_step_id: str | None = None
     ocr_resume_mode: str | None = None
+    download_quality: str | None = None
 
 
 def _new_task_steps(selected: list[StepKind]) -> list[StepRecord]:
@@ -173,10 +175,12 @@ class _DownloadStepHandler:
             context.archive_root,
             context.progress,
             allow_first_frame=context.allow_first_frame,
+            progress_step_id=context.step.id,
             task_id=context.task.id,
             access_mode=get_task_access_mode(context.repository.database, context.task.id),
             account_id=account_id,
             database=context.repository.database,
+            download_quality=context.download_quality,
         )
         # Serialize the final cancellation check with publication/registration.
         # cancel() uses the same lock, so it either wins before publication or
@@ -925,6 +929,7 @@ class TaskRunner:
         callback: EventCallback | None = None,
         ocr_action: str | None = None,
         transcription_consent: tuple[str, str] | None = None,
+        download_quality: str | None = None,
     ) -> None:
         self.start()
         task = self.repository.get_task(task_id)
@@ -936,6 +941,12 @@ class TaskRunner:
             raise KeyError("step not found")
         if step.kind not in self._handlers:
             raise RunnerError("unsupported_step", "所选步骤尚未实现，未重试。", status_code=422)
+        if download_quality is not None and (
+            download_quality != "720p"
+            or step.kind is not StepKind.DOWNLOAD
+            or task.source.platform != "youtube"
+        ):
+            raise RunnerError("invalid_download_quality", "720p 降画质重试仅适用于 YouTube 下载步骤。", status_code=422)
         retryable = {
             StepStatus.FAILED.value,
             StepStatus.INTERRUPTED.value,
@@ -1000,7 +1011,9 @@ class TaskRunner:
                 connection.execute(
                     """UPDATE task_steps SET retry_count = retry_count + 1,
                            status = 'queued', progress = NULL, message = ?, error_code = NULL,
-                           started_at = NULL, finished_at = NULL
+                           started_at = NULL, finished_at = NULL, downloaded_bytes = NULL,
+                           total_bytes = NULL, speed_bytes_per_second = NULL, eta_seconds = NULL,
+                           last_progress_at = NULL, automatic_retry_count = 0
                        WHERE task_id = ? AND id = ?""",
                     ("等待重试", task_id, step_id),
                 )
@@ -1066,7 +1079,11 @@ class TaskRunner:
                 )
             self._queued_ids.add(task_id)
             self._cancel_events[task_id] = threading.Event()
-            self._queue.put(_QueueItem(task_id, source_text, False, callback, ocr_resume_mode=ocr_resume_mode))
+            self._queue.put(_QueueItem(
+                task_id, source_text, False, callback,
+                ocr_resume_mode=ocr_resume_mode,
+                download_quality=download_quality,
+            ))
         self._emit(callback, status="queued", message="等待重试")
 
     def _retry_active_comment_step(
@@ -1914,12 +1931,32 @@ class TaskRunner:
                 self._emit(item.callback, status="running", message=initial_message, progress=0)
                 task = current_task
 
-            def update(step_id: str, percent: float | None, message: str) -> None:
+            def update(
+                step_id: str,
+                percent: float | None,
+                message: str,
+                *,
+                downloaded_bytes: int | None = None,
+                total_bytes: int | None = None,
+                speed_bytes_per_second: float | None = None,
+                eta_seconds: int | None = None,
+                automatic_retry_count: int | None = None,
+            ) -> None:
                 if event.is_set():
                     raise TaskCancelled
                 if skip_event is not None and skip_event.is_set():
                     raise TaskStepSkipped
-                if not self._persist_progress(item.task_id, step_id, percent, message):
+                if not self._persist_progress(
+                    item.task_id,
+                    step_id,
+                    percent,
+                    message,
+                    downloaded_bytes=downloaded_bytes,
+                    total_bytes=total_bytes,
+                    speed_bytes_per_second=speed_bytes_per_second,
+                    eta_seconds=eta_seconds,
+                    automatic_retry_count=automatic_retry_count,
+                ):
                     return
                 self._emit(
                     item.callback,
@@ -1947,6 +1984,7 @@ class TaskRunner:
                 app_config=self.config,
                 skip_event=skip_event,
                 ocr_resume_mode=item.ocr_resume_mode,
+                download_quality=item.download_quality,
             )
             if pending.kind is StepKind.ANALYZE_COMMENTS and any(
                 step.kind is StepKind.COMMENTS and step.status == StepStatus.PARTIAL.value
@@ -1981,6 +2019,8 @@ class TaskRunner:
                 raise TaskCancelled
             if skip_event is not None and skip_event.is_set():
                 raise TaskStepSkipped
+            public_result = step_result.metadata.get("result")
+            stop_reason = public_result.get("stop_reason") if isinstance(public_result, dict) else None
             self._complete_task_step(
                 item.task_id,
                 pending.id,
@@ -1999,7 +2039,8 @@ class TaskRunner:
                     if pending.kind is StepKind.OCR
                     else "本地媒体导入完成"
                     if pending.kind is StepKind.IMPORT
-                    else "评论分析部分完成；请查看覆盖范围与停止原因"
+                    else (f"评论分析部分完成：{stop_reason}" if isinstance(stop_reason, str) and stop_reason
+                          else "评论分析部分完成；请查看覆盖范围与停止原因")
                     if pending.kind is StepKind.ANALYZE_COMMENTS and step_result.status == StepStatus.PARTIAL.value
                     else "评论分析完成；精选结果可逐条审核"
                     if pending.kind is StepKind.ANALYZE_COMMENTS
@@ -2015,7 +2056,6 @@ class TaskRunner:
                     else "下载与本地媒体校验完成"
                 ),
             )
-            public_result = step_result.metadata.get("result")
             self._emit(item.callback, status="running", message="步骤已完成", result=public_result if isinstance(public_result, dict) else None)
         except AwaitingAuthorization as exc:
             self._set_waiting_authorization(item.task_id, pending.id, str(exc))
@@ -2214,7 +2254,7 @@ class TaskRunner:
             self._set_task_asset(connection, task.id, asset_id)
 
             archive_time = datetime.now(timezone.utc)
-            folder = archive_path(root, archive_time, title, platform, source_id)
+            folder = archive_path(root, archive_time, title_value, platform, source_id)
             created_archive_directories.append(folder)
             _fsync_directory(folder.parent)
             _fsync_directory(root)
@@ -2551,6 +2591,11 @@ class TaskRunner:
             connection.execute(
                 """UPDATE task_steps SET status = ?, progress = ?, message = ?,
                        error_code = ?, started_at = COALESCE(?, started_at),
+                       downloaded_bytes = CASE WHEN ? = 'running' THEN NULL ELSE downloaded_bytes END,
+                       total_bytes = CASE WHEN ? = 'running' THEN NULL ELSE total_bytes END,
+                       speed_bytes_per_second = CASE WHEN ? = 'running' THEN NULL ELSE speed_bytes_per_second END,
+                       eta_seconds = CASE WHEN ? = 'running' THEN NULL ELSE eta_seconds END,
+                       last_progress_at = CASE WHEN ? = 'running' THEN NULL ELSE last_progress_at END,
                        finished_at = ?
                    WHERE task_id = ? AND id = ?""",
                 (
@@ -2559,6 +2604,11 @@ class TaskRunner:
                     _safe_message(message),
                     error_code,
                     started_at,
+                    step_status,
+                    step_status,
+                    step_status,
+                    step_status,
+                    step_status,
                     finished_at,
                     task_id,
                     step_id,
@@ -2570,16 +2620,60 @@ class TaskRunner:
             )
 
     def _persist_progress(
-        self, task_id: str, step_id: str, percent: float | None, message: str
+        self,
+        task_id: str,
+        step_id: str,
+        percent: float | None,
+        message: str,
+        *,
+        downloaded_bytes: int | None = None,
+        total_bytes: int | None = None,
+        speed_bytes_per_second: float | None = None,
+        eta_seconds: int | None = None,
+        automatic_retry_count: int | None = None,
     ) -> bool:
         if percent is not None:
             percent = max(0.0, min(100.0, float(percent)))
+        if downloaded_bytes is not None:
+            downloaded_bytes = max(0, int(downloaded_bytes))
+        if total_bytes is not None:
+            total_bytes = max(0, int(total_bytes))
+        if speed_bytes_per_second is not None:
+            speed_bytes_per_second = max(0.0, float(speed_bytes_per_second))
+        if eta_seconds is not None:
+            eta_seconds = max(0, int(eta_seconds))
+        if automatic_retry_count is not None:
+            automatic_retry_count = max(0, int(automatic_retry_count))
+        now = _utc_now_iso()
         with self.database.transaction(write=True) as connection:
             updated = connection.execute(
-                """UPDATE task_steps SET progress = COALESCE(?, progress), message = ?
+                """UPDATE task_steps SET progress = COALESCE(?, progress), message = ?,
+                       downloaded_bytes = COALESCE(?, downloaded_bytes),
+                       total_bytes = COALESCE(?, total_bytes),
+                       speed_bytes_per_second = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(?, speed_bytes_per_second) END,
+                       eta_seconds = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(?, eta_seconds) END,
+                       automatic_retry_count = COALESCE(?, automatic_retry_count),
+                       last_progress_at = CASE
+                           WHEN ? IS NOT NULL AND ? > COALESCE(downloaded_bytes, 0)
+                           THEN ? ELSE last_progress_at END
                    WHERE task_id = ? AND id = ? AND status = 'running'
                      AND error_code IS NOT 'step_skip_requested'""",
-                (percent, _safe_message(message), task_id, step_id),
+                (
+                    percent,
+                    _safe_message(message),
+                    downloaded_bytes,
+                    total_bytes,
+                    1 if automatic_retry_count is not None else 0,
+                    speed_bytes_per_second,
+                    1 if automatic_retry_count is not None else 0,
+                    eta_seconds,
+                    automatic_retry_count,
+                    downloaded_bytes,
+                    downloaded_bytes,
+                    now,
+                    task_id,
+                    step_id,
+                ),
             )
             connection.execute(
                 "UPDATE tasks SET updated_at = ? WHERE id = ?",

@@ -21,7 +21,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
 from ..errors import SiteIssueCode, classify_site_issue
@@ -203,8 +203,11 @@ def validate_douyin_location_options(options: dict[str, Any]) -> None:
             or (search_tab_code and search_tab_code not in {"local", "domestic", "overseas"})
             or (not city_code and not search_tab_code) or len(city_name) > 100):
         raise VideoPublishError("douyin_location_incomplete", "地点信息不完整，请重新搜索并选择具体地点。")
-    options.update(location=name, location_id=poi_id, location_address=address, location_city_code=city_code,
-                   location_search_tab_code=search_tab_code or "local")
+    options.update(location=name, location_id=poi_id, location_address=address, location_city_code=city_code)
+    if search_tab_code:
+        options["location_search_tab_code"] = search_tab_code
+    else:
+        options.pop("location_search_tab_code", None)
     if city_name:
         options["location_city_name"] = city_name
 
@@ -2067,15 +2070,16 @@ def _normalize_video_publish_draft_form(form: dict[str, object]) -> tuple[dict[s
             if tag_category == "location":
                 address, city_code = tag.get("address"), tag.get("city_code")
                 city_name = tag.get("city_name", "")
-                search_tab_code = tag.get("search_tab_code", "local")
+                search_tab_code = tag.get("search_tab_code")
                 if (not isinstance(address, str) or not address.strip() or len(address) > 300
                         or not isinstance(city_code, str) or (city_code and not re.fullmatch(r"\d{6}", city_code))
-                        or not isinstance(search_tab_code, str) or search_tab_code not in {"local", "domestic", "overseas"}
+                        or (search_tab_code is not None and search_tab_code not in ("local", "domestic", "overseas"))
                         or (not city_code and search_tab_code != "overseas")
                         or not isinstance(city_name, str) or len(city_name) > 100):
                     raise VideoPublishError("draft_form_invalid", "本地草稿中的抖音地点数据无效。")
-                clean_tag.update({"address": address.strip(), "city_code": city_code, "city_name": city_name,
-                                  "search_tab_code": search_tab_code})
+                clean_tag.update({"address": address.strip(), "city_code": city_code, "city_name": city_name})
+                if search_tab_code:
+                    clean_tag["search_tab_code"] = search_tab_code
             if tag_category == "mini_program":
                 share_url = tag.get("share_url")
                 try:
@@ -2900,6 +2904,89 @@ def edit_video_publish_target(database: Database, target_id: str, options: dict[
     return target_id
 
 
+def add_video_publish_target(
+    database: Database, batch_id: str, source_target_id: str, account_id: str,
+    options: dict[str, Any], *, confirmed: bool,
+) -> str:
+    """编辑页追加账号：在同一批次内为同平台的新账号克隆一个发布目标（沿用内容与封面）。"""
+    if not confirmed:
+        raise VideoPublishError("confirmation_required", "请确认追加发布账号。", 400)
+    with database.transaction() as connection:
+        batch = connection.execute("SELECT * FROM video_publish_batches WHERE id = ?", (batch_id,)).fetchone()
+        if batch is None:
+            raise KeyError("发布任务不存在。")
+        source = connection.execute(
+            "SELECT * FROM video_publish_targets WHERE id = ? AND batch_id = ?",
+            (source_target_id, batch_id),
+        ).fetchone()
+        if source is None:
+            raise KeyError("原发布目标不存在。")
+    platform_id = str(source["platform_id"])
+    media_path = Path(str(batch["media_path"]))
+    if batch["media_cleaned"] or media_path.is_symlink() or media_path.parent.is_symlink() or not media_path.is_file():
+        raise VideoPublishError("media_cleaned", "任务素材已清理或原视频不可用，请重新选择视频创建新任务。", 409)
+    if batch["local_source_id"]:
+        get_local_video_source(database, str(batch["local_source_id"]), verify_hash=True)
+    else:
+        try:
+            _assert_contained(media_path, _prepare_publish_media_root(), strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise VideoPublishError("media_unavailable", "原任务视频文件不可用，无法追加账号。", 409) from exc
+    account = _get_account(database, account_id)
+    if account is None or str(account["platform_id"]) != platform_id:
+        raise VideoPublishError("account_not_connected", "所选账号不存在、已停用或不属于该平台，请刷新账号后重试。", 409)
+    if account["status"] != "connected":
+        raise VideoPublishError("account_not_connected", "所选账号当前未连接，请先检查登录状态后再追加。", 409)
+    provided = dict(options)
+    # 追加账号沿用原目标已归档的封面，不接受新封面上传。
+    for key in ("cover_upload_id", "cover_portrait_upload_id", "cover_landscape_upload_id", "cover_4_3_upload_id", "cover_16_9_upload_id"):
+        provided.pop(key, None)
+    normalized_options = _normalize_video_publish_target_options(
+        platform_id=platform_id,
+        schedule_at=batch["schedule_at"],
+        options=provided,
+        common_title=str(batch["title"]),
+        common_description=str(batch["description"]),
+        common_tags=_decode_list(batch["tags_json"]),
+    )
+    previous_options = _decode_object(source["options_json"])
+    updated_options = {
+        key: previous_options[key]
+        for key in ("cover_filename", "cover_4_3_filename", "cover_16_9_filename", "cover_portrait_filename", "cover_landscape_filename")
+        if isinstance(previous_options.get(key), str) and previous_options[key]
+    }
+    updated_options.update(normalized_options)
+    if platform_id == "douyin":
+        try:
+            validate_douyin_repost_options(updated_options)
+            validate_douyin_location_options(updated_options)
+        except VideoPublishError as exc:
+            raise VideoPublishError(
+                "douyin_options_incomplete",
+                "该账号缺少完整的抖音发布信息（转载来源或地点），请在表单中为它补全后再追加。",
+                409,
+            ) from exc
+    now = _utc_now()
+    target_id = uuid.uuid4().hex
+    with database.transaction(write=True) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM video_publish_targets WHERE batch_id = ? AND account_id = ? LIMIT 1",
+            (batch_id, account_id),
+        ).fetchone()
+        if exists is not None:
+            raise VideoPublishError("target_exists", "该账号在此任务中已有发布目标，请在任务详情中直接操作。", 409)
+        connection.execute(
+            """INSERT INTO video_publish_targets
+               (id, batch_id, account_id, platform_id, account_alias, account_name,
+                options_json, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+            (target_id, batch_id, str(account["id"]), platform_id, str(account["account_alias"]),
+             _account_display_name(account), _json(updated_options), now, now),
+        )
+        _refresh_batch_status(connection, batch_id)
+    return target_id
+
+
 def request_video_publish_retry(
     database: Database, target_id: str, *, confirmed: bool,
     change_schedule: bool = False, schedule_at: str | None = None, xhs_manual_submit: bool = False,
@@ -3238,13 +3325,14 @@ class VideoPublishManager:
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._cancel_requests: set[str] = set()
         self._account_login_cancel_events: dict[str, threading.Event] = {}
+        self._account_check_cancel_events: dict[str, threading.Event] = {}
+        self._account_check_previous_status: dict[str, str] = {}
         self._account_locks: dict[str, threading.Lock] = {}
         self._douyin_poi_cache: OrderedDict[tuple[str, str, str], tuple[float, dict[str, object]]] = OrderedDict()
         self._douyin_poi_warmups: set[str] = set()
         self._douyin_poi_warmup_events: dict[str, threading.Event] = {}
         self._last_output_write: dict[str, float] = {}
         self._sync_pending: set[str] = set()
-        self._sync_thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
         self._deferred_thread: threading.Thread | None = None
         self._deferred_publish: set[str] = set()
@@ -3273,13 +3361,11 @@ class VideoPublishManager:
                 daemon=True,
             )
             self._deferred_thread = threading.Thread(target=self._resume_deferred_worker, name='video-publish-resume', daemon=True)
-            self._sync_thread = threading.Thread(target=self._status_sync_worker, name="video-publish-status-sync", daemon=True)
             self._started = True
             for thread in self._workers:
                 thread.start()
             self._cleanup_thread.start()
             self._deferred_thread.start()
-            self._sync_thread.start()
             for target_id in queued:
                 self._queue.put(("publish", target_id))
 
@@ -3289,19 +3375,16 @@ class VideoPublishManager:
                 self._stop.set()
                 processes = list(self._processes.values())
                 workers = list(self._workers)
-                scheduler = self._sync_thread
                 cleanup_thread = self._cleanup_thread
                 deferred_thread = self._deferred_thread
                 self._deferred_thread = None
                 self._deferred_publish.clear()
-                self._sync_thread = None
                 self._cleanup_thread = None
                 self._workers = []
                 self._started = False
             else:
                 processes = []
                 workers = []
-                scheduler = None
                 cleanup_thread = None
                 deferred_thread = None
         for process in processes:
@@ -3316,8 +3399,6 @@ class VideoPublishManager:
             thread.join(timeout=2)
         if deferred_thread:
             deferred_thread.join(timeout=2)
-        if scheduler:
-            scheduler.join(timeout=2)
         if cleanup_thread:
             cleanup_thread.join(timeout=2)
         self._douyin_lookup.close()
@@ -3557,12 +3638,26 @@ class VideoPublishManager:
         except (OSError, ValueError, RuntimeError):
             _LOGGER.warning('could not read saved xiaohongshu account profile for %s', account_id)
 
+    def request_account_action(self, account_id: str, action: str) -> dict[str, Any]:
+        previous_status = ""
+        if action == "check":
+            account = _get_account(self.database, account_id)
+            if account is not None and str(account["status"]) in {"connected", "error"}:
+                previous_status = str(account["status"])
+        payload = request_video_publish_account_action(self.database, account_id, action)
+        if previous_status:
+            with self._lock:
+                self._account_check_previous_status[account_id] = previous_status
+        return payload
+
     def enqueue_account_action(self, account_id: str, action: str) -> None:
         if action not in {"login", "check"}:
             raise ValueError("账号操作无效。")
-        if action == "login":
-            with self._lock:
+        with self._lock:
+            if action == "login":
                 self._account_login_cancel_events[account_id] = threading.Event()
+            elif action == "check":
+                self._account_check_cancel_events[account_id] = threading.Event()
         self._queue.put((action, account_id))
 
     def cancel_account_login(self, account_id: str) -> None:
@@ -3582,6 +3677,62 @@ class VideoPublishManager:
                 process.terminate()
             except OSError:
                 pass
+
+    def cancel_account_check(self, account_id: str) -> None:
+        account = _get_account(self.database, account_id)
+        if account is None:
+            raise KeyError(account_id)
+        if account["status"] != "checking":
+            raise VideoPublishError("account_check_not_running", "该账号当前没有正在进行的检查。", 409)
+        with self._lock:
+            cancel_event = self._account_check_cancel_events.get(account_id)
+            if cancel_event is None:
+                raise VideoPublishError("account_check_not_running", "检查已结束，请刷新账号状态。", 409)
+            cancel_event.set()
+            process = self._processes.get(f"account:{account_id}")
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def relogin_target_account(self, target_id: str) -> dict[str, Any]:
+        """为失败任务的一键重登重试打开账号登录；已退出/隐藏的账号先恢复启用。"""
+        status = self.adapter.status()
+        if not status["configured"]:
+            raise VideoPublishError("sau_not_configured", str(status["message"]), 409)
+        with self.database.transaction(write=True) as connection:
+            target = connection.execute(
+                """SELECT t.id, t.account_id, t.status AS target_status,
+                          a.enabled AS account_enabled, a.status AS account_status, a.message AS account_message
+                   FROM video_publish_targets t JOIN video_publish_accounts a ON a.id = t.account_id
+                   WHERE t.id = ?""",
+                (target_id,),
+            ).fetchone()
+            if target is None:
+                raise KeyError(target_id)
+            if target["target_status"] not in {"failed", "cancelled"}:
+                raise VideoPublishError("target_not_reloginable", "只有失败或已取消的账号任务可以重新登录账号。", 409)
+            if target["account_status"] in {"login_in_progress", "checking"}:
+                raise VideoPublishError("account_busy", "该账号正在登录或检查，请稍候。", 409)
+            active = connection.execute(
+                "SELECT 1 FROM video_publish_targets WHERE account_id = ? AND status IN ('queued', 'running') LIMIT 1",
+                (str(target["account_id"]),),
+            ).fetchone()
+            if active is not None:
+                raise VideoPublishError("account_busy", "该账号有发布任务正在排队或执行，请完成后再重新登录。", 409)
+            if not bool(target["account_enabled"]):
+                # 已退出/隐藏的账号：恢复启用后再走正常登录流程；重复占位账号不自动恢复。
+                if target["account_status"] == "error" and str(target["account_message"] or "") == _DUPLICATE_ACCOUNT_MESSAGE:
+                    raise VideoPublishError("account_duplicate_hidden", "该账号因重复添加被停用，请到「账号管理」处理后再试。", 409)
+                connection.execute(
+                    "UPDATE video_publish_accounts SET enabled = 1, message = '正在重新登录以恢复账号。', updated_at = ? WHERE id = ?",
+                    (_utc_now(), str(target["account_id"])),
+                )
+            account_id = str(target["account_id"])
+        payload = request_video_publish_account_action(self.database, account_id, "login")
+        self.enqueue_account_action(account_id, "login")
+        return payload
 
     def logout_account(self, account_id: str) -> None:
         lock = self._account_lock(account_id)
@@ -3758,7 +3909,7 @@ class VideoPublishManager:
                 self._douyin_poi_cache.pop(cache_key, None)
 
     def _schedule_douyin_poi_warmup(self, account_id: str) -> bool:
-        if self._read_douyin_poi_cache(self._douyin_poi_cache_key(account_id, "", "local")) is not None:
+        if self._read_douyin_poi_cache(self._douyin_poi_cache_key(account_id, "", None)) is not None:
             return False
         with self._lock:
             if self._stop.is_set() or account_id in self._douyin_poi_warmups:
@@ -3779,7 +3930,7 @@ class VideoPublishManager:
     def _run_douyin_poi_warmup(self, account_id: str) -> None:
         # 自检成功后异步预热本地默认地点，不延长账号勾选等待。作者：zhw，时间：2026-11-18 23:16:55（Asia/Shanghai）
         try:
-            self.search_douyin_poi(account_id, "", "local", wait_for_warmup=False)
+            self.search_douyin_poi(account_id, "", wait_for_warmup=False)
         except Exception as exc:
             _LOGGER.info("Douyin location prefetch failed for %s: %s", account_id, _safe_message(exc))
         finally:
@@ -3857,6 +4008,9 @@ class VideoPublishManager:
                     payload = None
             normalized = self._normalize_douyin_poi_result(payload, city_code)
             self._write_douyin_poi_cache(cache_key, normalized)
+            if city_code is None:
+                resolved_scope = str(normalized["selected_city_code"])
+                self._write_douyin_poi_cache(self._douyin_poi_cache_key(account_id, keyword, resolved_scope), normalized)
             return normalized
         finally:
             with self._lock:
@@ -3878,8 +4032,7 @@ class VideoPublishManager:
         tabs = [{"code": item["code"], "name": item["name"]} for item in raw_tabs[:3]
                 if isinstance(raw_tabs, list) and isinstance(item, dict) and item.get("code") in official_tab_names
                 and item.get("name") == official_tab_names[item["code"]]] if isinstance(raw_tabs, list) else []
-        if not tabs:
-            tabs = [{"code": code, "name": name} for code, name in official_tab_names.items()]
+        selected_tab = selected if selected in official_tab_names else None
         items = []
         for item in payload["items"][:30]:
             if not isinstance(item, dict):
@@ -3899,15 +4052,18 @@ class VideoPublishManager:
                 distance = ""
             candidate = {"location": item.get("name"), "location_id": item.get("id"), "location_address": item.get("address"),
                          "location_city_code": item_city_code,
-                         "location_search_tab_code": selected,
+                         "location_search_tab_code": selected_tab,
                          "location_city_name": item_city_name.strip() or next((c["name"] for c in cities if c["code"] == item_city_code), "")}
             try:
                 validate_douyin_location_options(candidate)
             except VideoPublishError:
                 continue
-            items.append({"id": candidate["location_id"], "name": candidate["location"], "address": candidate["location_address"],
-                          "city_code": item_city_code, "city_name": candidate.get("location_city_name", ""),
-                          "search_tab_code": selected, "distance": distance.strip()})
+            place = {"id": candidate["location_id"], "name": candidate["location"], "address": candidate["location_address"],
+                     "city_code": item_city_code, "city_name": candidate.get("location_city_name", ""),
+                     "distance": distance.strip()}
+            if selected_tab:
+                place["search_tab_code"] = selected_tab
+            items.append(place)
         return {"items": items, "tabs": tabs, "cities": cities, "selected_city_code": selected}
 
     def _search_douyin_metadata(self, account_id: str, args: list[str], marker_name: str, lock_suffix: str,
@@ -4090,25 +4246,33 @@ class VideoPublishManager:
         self._queue.put(("sync", target_id))
         return True
 
-    def _status_sync_worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._schedule_status_sync_once()
-            except Exception:
-                _LOGGER.exception("automatic platform status scheduling failed")
-            if self._stop.wait(30):
-                return
-
-    def _schedule_status_sync_once(self, *, now: datetime | None = None) -> None:
+    def _schedule_status_sync_once(
+        self,
+        batch_ids: Sequence[str] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        if browser_automation_paused():
+            return 0
+        if batch_ids is not None:
+            batch_ids = list(dict.fromkeys(batch_ids))
+            if not batch_ids or len(batch_ids) > 100:
+                return 0
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        batch_filter = ""
+        batch_parameters: tuple[str, ...] = ()
+        if batch_ids is not None:
+            placeholders = ", ".join("?" for _ in batch_ids)
+            batch_filter = f" AND b.id IN ({placeholders})"
+            batch_parameters = tuple(batch_ids)
         with self.database.transaction() as connection:
             rows = connection.execute("""SELECT t.id, t.platform_id, t.status, t.remote_id, t.platform_observed_at,
                 t.platform_checked_at, t.options_json, b.schedule_at
                 FROM video_publish_targets t JOIN video_publish_batches b ON b.id = t.batch_id
                 WHERE t.platform_id IN ('douyin', 'bilibili', 'kuaishou', 'wechat_channels', 'baijiahao') AND
                 (t.status = 'pending_review' OR (t.status = 'unknown' AND t.remote_id IS NOT NULL
-                AND t.platform_observed_at IS NOT NULL))""").fetchall()
-        browser_paused = None
+                AND t.platform_observed_at IS NOT NULL))""" + batch_filter, batch_parameters).fetchall()
+        queued_count = 0
         for row in rows:
             options = _decode_object(row["options_json"])
             if row["platform_id"] == "wechat_channels" and options.get("save_as_draft"):
@@ -4124,15 +4288,12 @@ class VideoPublishManager:
             except (ValueError, TypeError, OverflowError):
                 _LOGGER.warning("invalid platform status sync time for %s", row["id"])
                 continue
-            if row["platform_id"] in {"douyin", "kuaishou"}:
-                if browser_paused is None:
-                    browser_paused = browser_automation_paused()
-                if browser_paused:
-                    continue
             try:
-                self.enqueue_status_sync(str(row["id"]))
+                if self.enqueue_status_sync(str(row["id"])):
+                    queued_count += 1
             except (VideoPublishError, KeyError):
                 continue
+        return queued_count
 
     def cancel_target(self, target_id: str) -> None:
         if cancel_queued_video_target(self.database, target_id):
@@ -4191,6 +4352,23 @@ class VideoPublishManager:
                             update_video_publish_account_status(self.database, item_id, "not_connected", "登录已取消。")
                         except KeyError:
                             _LOGGER.warning("video publish account disappeared after login cancellation: %s", item_id)
+                elif action == "check":
+                    with self._lock:
+                        cancel_event = self._account_check_cancel_events.pop(item_id, None)
+                        previous_status = self._account_check_previous_status.pop(item_id, "connected")
+                    if cancel_event is not None and cancel_event.is_set():
+                        # 取消检查不刷新 checked_at，避免“最近检查有效”缓存被误判。
+                        try:
+                            with self.database.transaction(write=True) as connection:
+                                cursor = connection.execute(
+                                    """UPDATE video_publish_accounts SET status = ?, message = ?, updated_at = ?
+                                       WHERE id = ? AND enabled = 1""",
+                                    (previous_status, "已取消本次检查。", _utc_now(), item_id),
+                                )
+                            if cursor.rowcount == 0:
+                                raise KeyError(item_id)
+                        except KeyError:
+                            _LOGGER.warning("video publish account disappeared after check cancellation: %s", item_id)
                 if action == "sync":
                     with self._lock:
                         self._sync_pending.discard(item_id)
@@ -4256,7 +4434,7 @@ class VideoPublishManager:
         target["effective_caption"] = target["effective_description"] or target["effective_title"]
         key = f"sync:{target_id}"
         with self._account_lock(str(target["account_id"])):
-            if self._stop.is_set():
+            if self._stop.is_set() or browser_automation_paused():
                 return
             if target["platform_id"] == "douyin":
                 result = self.adapter.douyin_status(target, lambda process: self._register_process(key, process))
@@ -4449,6 +4627,8 @@ class VideoPublishManager:
         with self._account_lock(account_id):
             if action == "login" and self._account_login_cancellation_requested(account_id):
                 return
+            if action == "check" and self._account_check_cancellation_requested(account_id):
+                return
             account = _get_account(self.database, account_id)
             if action == "login" and account and account["platform_id"] == "douyin":
                 self._clear_douyin_poi_cache(account_id)
@@ -4464,6 +4644,11 @@ class VideoPublishManager:
     def _account_login_cancellation_requested(self, account_id: str) -> bool:
         with self._lock:
             cancel_event = self._account_login_cancel_events.get(account_id)
+            return cancel_event.is_set() if cancel_event is not None else False
+
+    def _account_check_cancellation_requested(self, account_id: str) -> bool:
+        with self._lock:
+            cancel_event = self._account_check_cancel_events.get(account_id)
             return cancel_event.is_set() if cancel_event is not None else False
 
     def _xiaohongshu_cookie_paths(self, account_alias: str, pending_alias: str) -> tuple[Path, Path]:
@@ -4699,7 +4884,7 @@ class VideoPublishManager:
         if not python.is_file():
             raise VideoPublishError('sau_path_invalid', '登录组件暂不可用，请检查运行环境。', 409)
         helper = Path(__file__).with_name('kuaishou_login_browser.py').resolve(strict=True)
-        if hashlib.sha256(helper.read_bytes().replace(b'\r\n', b'\n')).hexdigest() != '685f31f608cf62409ae089a726407421db5cf8e2aaba968a5dea56f6c15e295c':
+        if hashlib.sha256(helper.read_bytes().replace(b'\r\n', b'\n')).hexdigest() != '3fc68aa244bda90e07d468137f92f0d81af1ca1fe0fc118599affcb00c0c4cde':
             raise VideoPublishError('account_login_unavailable', '登录组件暂不可用，请检查运行环境。', 409)
         try:
             with xiaohongshu_login_slot():
@@ -4746,7 +4931,7 @@ class VideoPublishManager:
         if not python.is_file():
             raise VideoPublishError('sau_path_invalid', '登录组件暂不可用，请检查运行环境。', 409)
         helper = Path(__file__).with_name('wechat_channels_login_browser.py').resolve(strict=True)
-        if hashlib.sha256(helper.read_bytes().replace(b'\r\n', b'\n')).hexdigest() != 'd1431cb109929abcfa7baf45a5472324555743f0943208f40ec1fae099a05e8d':
+        if hashlib.sha256(helper.read_bytes().replace(b'\r\n', b'\n')).hexdigest() != 'f9037df48c3bd3a734383563dc022aa175241333cc94a2ac0c27b1ae656d85c9':
             raise VideoPublishError('account_login_unavailable', '登录组件暂不可用，请检查运行环境。', 409)
         try:
             with xiaohongshu_login_slot():
@@ -5181,7 +5366,8 @@ class VideoPublishManager:
             cancel_now = target_id in self._cancel_requests
             account_id = key.removeprefix("account:") if key.startswith("account:") else ""
             account_cancel = self._account_login_cancel_events.get(account_id) if account_id else None
-            cancel_account_now = account_cancel.is_set() if account_cancel is not None else False
+            account_check_cancel = self._account_check_cancel_events.get(account_id) if account_id else None
+            cancel_account_now = (account_cancel is not None and account_cancel.is_set()) or (account_check_cancel is not None and account_check_cancel.is_set())
         if (cancel_now or cancel_account_now) and process.poll() is None:
             try:
                 process.terminate()
@@ -5289,7 +5475,7 @@ def _claim_video_publish_target(database: Database, target_id: str) -> dict[str,
             now = _utc_now()
             message = "该账号登录状态已失效或已隐藏，请重新检查账号后再发布。"
             connection.execute(
-                "UPDATE video_publish_targets SET status = 'failed', message = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE video_publish_targets SET status = 'failed', message = ?, diagnostic_code = 'account_login_invalid', finished_at = ?, updated_at = ? WHERE id = ?",
                 (message, now, now, target_id),
             )
             _refresh_batch_status(connection, str(row["batch_id"]))
@@ -5693,6 +5879,7 @@ def _target_payload(row: sqlite3.Row) -> dict[str, Any]:
         "heartbeat_at": row["heartbeat_at"],
         "last_output_at": row["last_output_at"],
         "upload_retry_count": int(row["upload_retry_count"] or 0),
+        "diagnostic_code": row["diagnostic_code"],
         "diagnosis": _video_publish_target_diagnosis(row),
         "attempt_count": int(row["attempt_count"]),
         "started_at": row["started_at"],
@@ -5899,6 +6086,14 @@ def _xhs_submit_security_message(platform: str, message: str) -> str | None:
 
 
 def _video_publish_failure(platform: str, output: str) -> tuple[str, str]:
+    diagnostic = _last_diagnostic_line(output)
+    if platform == "bilibili" and re.search(r"\bError:\s*after retries\b", diagnostic, re.IGNORECASE):
+        return (
+            "failed",
+            "B站申请上传凭证时重试失败，视频分片上传和稿件提交未开始。"
+            "平台当前可能限制了上传请求，请暂停连续重试，稍后确认账号状态后再发布。",
+        )
+
     for line in reversed(output.splitlines()):
         if not line.startswith("SAU_VIDEO_ERROR:"):
             continue

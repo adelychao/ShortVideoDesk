@@ -38,8 +38,10 @@ const failedBatchCoverIds = ref(new Set<string>())
 const failedBatchMediaIds = ref(new Set<string>())
 const failedDraftMediaIds = ref(new Set<string>())
 let refreshTimer: number | undefined
+let statusSyncTimer: number | undefined
 let loadRequestId = 0
 let activeLoadCount = 0
+let statusSyncInFlight = false
 
 const statusTabs = [
   { id: 'all', label: '全部任务' },
@@ -242,8 +244,36 @@ async function loadDrafts(): Promise<void> {
 function selectView(value: 'tasks' | 'drafts'): void {
   if (viewMode.value === value) return
   viewMode.value = value
-  if (value === 'tasks') void load()
-  else void loadDrafts()
+  if (value === 'tasks') {
+    void load().then(syncVisibleStatuses)
+    startStatusSync()
+  } else {
+    stopStatusSync()
+    void loadDrafts()
+  }
+}
+
+async function syncVisibleStatuses(): Promise<void> {
+  if (statusSyncInFlight || viewMode.value !== 'tasks' || items.value.length === 0) return
+  statusSyncInFlight = true
+  try {
+    await api.autoSyncVideoPublishBatches(items.value.map((item) => item.id))
+  } catch {
+    // Status sync runs in the background and should not interrupt history browsing.
+  } finally {
+    statusSyncInFlight = false
+  }
+}
+
+function startStatusSync(): void {
+  if (statusSyncTimer) return
+  void syncVisibleStatuses()
+  statusSyncTimer = window.setInterval(() => void syncVisibleStatuses(), 30_000)
+}
+
+function stopStatusSync(): void {
+  if (statusSyncTimer) window.clearInterval(statusSyncTimer)
+  statusSyncTimer = undefined
 }
 
 function continueDraft(draft: VideoPublishDraft): void {
@@ -442,8 +472,9 @@ onActivated(() => {
   }
   if (viewMode.value === 'drafts') void loadDrafts()
   else {
-    void load()
+    void load().then(syncVisibleStatuses)
     void loadDrafts()
+    startStatusSync()
   }
   if (!refreshTimer) refreshTimer = window.setInterval(() => {
     if (viewMode.value === 'tasks') void load(true, true)
@@ -452,6 +483,7 @@ onActivated(() => {
 function stopRefresh(): void {
   if (refreshTimer) window.clearInterval(refreshTimer)
   refreshTimer = undefined
+  stopStatusSync()
 }
 onDeactivated(stopRefresh)
 onBeforeUnmount(stopRefresh)

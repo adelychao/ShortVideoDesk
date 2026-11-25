@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, ref } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ApiError, api } from '../api/client'
 import PlatformLogo from '../components/PlatformLogo.vue'
-import type { VideoPublishBatch, VideoPublishTarget, VideoPublishTargetStatus } from '../api/types'
+import LoginProgress from '../components/LoginProgress.vue'
+import type { VideoPublishAccount, VideoPublishBatch, VideoPublishPlatform, VideoPublishTarget, VideoPublishTargetStatus } from '../api/types'
 import { isBatchScheduled, isDouyinScheduled, videoPublishUserMessage } from '../utils/videoPublishMessages'
 
 const route = useRoute()
@@ -21,7 +22,40 @@ const retryEditorId = ref('')
 const retryMode = ref<'immediate' | 'scheduled'>('scheduled')
 const retryScheduleAt = ref('')
 let refreshTimer: number | undefined
+let statusSyncTimer: number | undefined
 let requestInFlight = false
+let statusSyncInFlight = false
+
+/* 一键「重新登录并重试」：失败原因为账号登录失效时，在详情页完成登录后自动重新提交发布。 */
+const platforms = ref<VideoPublishPlatform[]>([])
+const accounts = ref<VideoPublishAccount[]>([])
+const reloginTargetId = ref('')
+const reloginPhase = ref<'' | 'starting' | 'waiting' | 'retrying'>('')
+const reloginError = ref('')
+const reloginErrorTargetId = ref('')
+const reloginQrKey = ref(Date.now())
+const reloginQrReady = ref(false)
+let reloginTimer: number | undefined
+
+const reloginTarget = computed(() => {
+  if (!reloginTargetId.value || !batch.value) return null
+  return batch.value.targets.find((target) => target.id === reloginTargetId.value) ?? null
+})
+const reloginAccount = computed(() => {
+  const target = reloginTarget.value
+  return target ? accounts.value.find((item) => item.id === target.account_id) ?? null : null
+})
+const reloginQrPlatform = computed(() => !!reloginTarget.value && ['bilibili', 'wechat_channels'].includes(reloginTarget.value.platform_id))
+const reloginCandidate = computed(() => {
+  const target = selectedTarget.value
+  if (!target || target.status !== 'failed' || !batch.value?.media_available) return null
+  if (!isAccountLoginFailure(target) || !platformLoginAvailable(target.platform_id)) return null
+  return target
+})
+const reloginAccountConnected = computed(() => {
+  const target = reloginCandidate.value
+  return !!target && accounts.value.some((item) => item.id === target.account_id && item.status === 'connected')
+})
 
 const platformNames: Record<string, string> = {
   douyin: '抖音', xiaohongshu: '小红书', kuaishou: '快手', bilibili: '哔哩哔哩',
@@ -251,6 +285,18 @@ async function load(silent = false): Promise<void> {
   }
 }
 
+async function syncVisibleStatuses(): Promise<void> {
+  if (statusSyncInFlight || !batch.value || batch.value.id !== currentBatchId.value) return
+  statusSyncInFlight = true
+  try {
+    await api.autoSyncVideoPublishBatches([batch.value.id])
+  } catch {
+    // Status sync runs in the background and should not interrupt detail browsing.
+  } finally {
+    statusSyncInFlight = false
+  }
+}
+
 async function refresh(): Promise<void> {
   notice.value = ''
   await load()
@@ -387,6 +433,104 @@ async function cancelTarget(target: VideoPublishTarget): Promise<void> {
   }
 }
 
+function isAccountLoginFailure(target: VideoPublishTarget): boolean {
+  return target.diagnostic_code === 'account_login_invalid' || /该账号登录状态已失效或已隐藏/.test(target.message || '')
+}
+
+function platformLoginAvailable(platformId: string): boolean {
+  return platforms.value.some((item) => item.id === platformId && item.login_available)
+}
+
+async function loadLoginContext(): Promise<void> {
+  const [platformResult, accountResult] = await Promise.allSettled([api.getVideoPublishPlatforms('video'), api.getVideoPublishAccounts()] as const)
+  if (platformResult.status === 'fulfilled') platforms.value = platformResult.value.platforms
+  if (accountResult.status === 'fulfilled') accounts.value = accountResult.value.items
+}
+
+async function startRelogin(target: VideoPublishTarget): Promise<void> {
+  if (reloginTargetId.value || busyTarget.value) return
+  reloginTargetId.value = target.id
+  reloginPhase.value = 'starting'
+  reloginError.value = ''
+  reloginErrorTargetId.value = ''
+  reloginQrReady.value = false
+  let account: VideoPublishAccount
+  try {
+    // 目标级重登：账号已被退出/隐藏时后端会先恢复启用，再打开登录窗口。
+    account = await api.reloginVideoPublishTarget(target.id)
+  } catch (cause) {
+    reloginFail(target.id, cause instanceof ApiError ? cause.message : '无法打开登录窗口，请稍后重试。')
+    return
+  }
+  accounts.value = [...accounts.value.filter((item) => item.id !== account.id), account]
+  reloginPhase.value = 'waiting'
+  notice.value = ['bilibili', 'wechat_channels'].includes(target.platform_id)
+    ? '正在准备登录二维码，扫码登录成功后会自动重新发布。'
+    : '已打开平台登录窗口，完成登录后会自动重新发布。'
+  error.value = ''
+  reloginTimer = window.setInterval(() => void pollRelogin(target), 2500)
+  void pollRelogin(target)
+}
+
+async function pollRelogin(target: VideoPublishTarget): Promise<void> {
+  reloginQrKey.value = Date.now()
+  let items: VideoPublishAccount[]
+  try {
+    items = (await api.getVideoPublishAccounts()).items
+  } catch {
+    return // 状态读取抖动不中断等待
+  }
+  accounts.value = items
+  if (reloginTargetId.value !== target.id) return
+  const account = items.find((item) => item.id === target.account_id)
+  if (!account) return reloginFail(target.id, '该账号已被移除，无法重新登录。')
+  if (account.status === 'login_in_progress') return
+  if (account.status !== 'connected') return reloginFail(target.id, '登录未完成，请重新点击「重新登录并重试」。')
+  stopReloginTimer()
+  reloginPhase.value = 'retrying'
+  try {
+    await api.retryVideoPublishTarget(target.id, true, false, null)
+    notice.value = '登录已恢复，任务已重新提交发布。'
+    reloginError.value = ''
+    reloginErrorTargetId.value = ''
+    reloginTargetId.value = ''
+    reloginPhase.value = ''
+    await load(true)
+  } catch (cause) {
+    reloginFail(target.id, cause instanceof ApiError ? cause.message : '重新提交发布失败，请稍后重试。')
+  }
+}
+
+function stopReloginTimer(): void {
+  if (reloginTimer !== undefined) {
+    window.clearInterval(reloginTimer)
+    reloginTimer = undefined
+  }
+}
+
+function reloginFail(targetId: string, message: string): void {
+  stopReloginTimer()
+  reloginTargetId.value = ''
+  reloginPhase.value = ''
+  reloginError.value = message
+  reloginErrorTargetId.value = targetId
+}
+
+async function cancelRelogin(): Promise<void> {
+  const account = reloginAccount.value
+  stopReloginTimer()
+  reloginTargetId.value = ''
+  reloginPhase.value = ''
+  if (account?.status === 'login_in_progress') {
+    try { await api.cancelVideoPublishAccountLogin(account.id) } catch { /* 登录可能已结束 */ }
+  }
+  await load(true)
+}
+
+watch(() => [selectedTarget.value?.id, selectedTarget.value ? isAccountLoginFailure(selectedTarget.value) : false], ([, failureNow], [, failureBefore]) => {
+  if (failureNow && !failureBefore && !reloginTargetId.value) void loadLoginContext()
+})
+
 async function deleteBatch(): Promise<void> {
   if (!batch.value || !canDeleteBatch.value || deleting.value || cleaning.value || busyTarget.value || loading.value || requestInFlight) return
   const current = batch.value
@@ -427,12 +571,17 @@ async function cleanBatchMedia(): Promise<void> {
 }
 
 onActivated(() => {
-  void load()
+  void load().then(syncVisibleStatuses)
+  void loadLoginContext()
   if (!refreshTimer) refreshTimer = window.setInterval(() => { void load(true) }, 4000)
+  if (!statusSyncTimer) statusSyncTimer = window.setInterval(() => void syncVisibleStatuses(), 30_000)
 })
 function stopRefresh(): void {
   if (refreshTimer) window.clearInterval(refreshTimer)
   refreshTimer = undefined
+  if (statusSyncTimer) window.clearInterval(statusSyncTimer)
+  statusSyncTimer = undefined
+  stopReloginTimer()
 }
 onDeactivated(stopRefresh)
 onBeforeUnmount(stopRefresh)
@@ -472,32 +621,6 @@ onBeforeUnmount(stopRefresh)
           <span>当前任务状态</span>
           <strong><i class="detail-state-dot" :class="statusTone(batch.status)"></i>{{ isBatchScheduled(batch) ? '定时发布中' : statusLabel(batch.status) }}</strong>
           <small>每个账号独立执行与记录；待确认结果请查看对应平台回执。</small>
-        </div>
-      </section>
-
-      <section class="panel detail-common-settings" aria-label="通用发布设置">
-        <header class="detail-section-head detail-common-head">
-          <h2>通用发布内容</h2>
-          <span>各账号默认使用此内容；平台单独设置见右侧账号详情</span>
-        </header>
-        <div class="detail-common-grid">
-          <div class="detail-common-field">
-            <span>通用标题</span>
-            <strong>{{ batch.title || '未填写' }}</strong>
-          </div>
-          <div class="detail-common-field detail-common-description">
-            <span>通用简介</span>
-            <p>{{ batch.description || '未填写通用简介' }}</p>
-          </div>
-          <div class="detail-common-field detail-common-tags">
-            <span>通用标签</span>
-            <div v-if="batch.tags.length" class="detail-tag-list"><span v-for="tag in batch.tags" :key="tag">{{ tag }}</span></div>
-            <p v-else>未添加通用标签</p>
-          </div>
-          <div class="detail-common-field">
-            <span>通用发布时间</span>
-            <strong>{{ batch.schedule_at ? formatDate(batch.schedule_at) : '立即发布' }}</strong>
-          </div>
         </div>
       </section>
 
@@ -543,6 +666,32 @@ onBeforeUnmount(stopRefresh)
             <span class="detail-row-link">{{ selectedTarget?.id === target.id ? '当前查看' : '查看详情 ›' }}</span>
           </button>
           <p class="detail-target-foot">仅在平台提供进度时显示百分比；否则显示当前处理信息。</p>
+        </section>
+
+        <section class="panel detail-common-settings" aria-label="通用发布设置">
+          <header class="detail-inspector-head">
+            <h2>通用发布内容</h2>
+            <p>各账号默认使用此内容；平台单独设置见下方账号详情</p>
+          </header>
+          <div class="detail-common-body">
+            <div class="detail-common-row">
+              <span>通用标题</span>
+              <strong>{{ batch.title || '未填写' }}</strong>
+            </div>
+            <div class="detail-common-row is-multiline">
+              <span>通用简介</span>
+              <p>{{ batch.description || '未填写通用简介' }}</p>
+            </div>
+            <div class="detail-common-row is-multiline">
+              <span>通用标签</span>
+              <div v-if="batch.tags.length" class="detail-tag-list"><span v-for="tag in batch.tags" :key="tag">{{ tag }}</span></div>
+              <p v-else>未添加通用标签</p>
+            </div>
+            <div class="detail-common-row">
+              <span>通用发布时间</span>
+              <strong>{{ batch.schedule_at ? formatDate(batch.schedule_at) : '立即发布' }}</strong>
+            </div>
+          </div>
         </section>
 
         <aside v-if="selectedTarget" class="panel detail-inspector" aria-label="账号发布详情">
@@ -658,8 +807,22 @@ onBeforeUnmount(stopRefresh)
                 <button v-else class="button button-secondary button-small" type="button" :disabled="!!busyTarget" @click="confirmPublished(selectedTarget)">已确认发布</button>
                 <button class="text-button detail-danger-action" type="button" :disabled="!!busyTarget" @click="confirmNotPublished(selectedTarget)">{{ selectedTarget.options.save_as_draft ? '确认未保存' : '确认未发布' }}</button>
               </template>
-              <button v-if="selectedTarget.status === 'failed'" class="button button-secondary button-small" type="button" :disabled="!!busyTarget || !batch.media_available" :title="batch.media_available ? undefined : '任务素材已清理或原视频不可用，请重新选择视频创建任务'" @click="retryTarget(selectedTarget)">{{ busyTarget === selectedTarget.id ? '提交中…' : '重试该账号' }}</button>
+              <button v-if="selectedTarget.status === 'failed' && !(reloginCandidate && !reloginAccountConnected)" class="button button-secondary button-small" type="button" :disabled="!!busyTarget || !batch.media_available || !!reloginTargetId" :title="batch.media_available ? undefined : '任务素材已清理或原视频不可用，请重新选择视频创建任务'" @click="retryTarget(selectedTarget)">{{ busyTarget === selectedTarget.id ? '提交中…' : '重试该账号' }}</button>
+              <button v-if="reloginCandidate && !reloginAccountConnected" class="button button-small" type="button" :disabled="!!busyTarget || (!!reloginTargetId && reloginTargetId !== selectedTarget.id)" @click="startRelogin(selectedTarget)">{{ reloginTargetId === selectedTarget.id ? (reloginPhase === 'retrying' ? '正在重新提交…' : '等待登录完成…') : '重新登录并重试' }}</button>
               <button v-if="selectedTarget.status === 'queued' || selectedTarget.status === 'running'" class="text-button detail-danger-action" type="button" :disabled="busyTarget === selectedTarget.id" @click="cancelTarget(selectedTarget)">停止此账号任务</button>
+            </div>
+
+            <div v-if="(reloginTarget && reloginTarget.id === selectedTarget.id) || reloginErrorTargetId === selectedTarget.id" class="detail-relogin-panel">
+              <div v-if="reloginTarget && reloginTarget.id === selectedTarget.id && reloginAccount && reloginAccount.status === 'login_in_progress' && reloginQrPlatform" class="detail-relogin-qr">
+                <div class="detail-relogin-qr-image">
+                  <img :key="reloginQrKey" :src="api.videoPublishAccountLoginQrUrl(reloginAccount.id, reloginQrKey)" alt="账号登录二维码" :class="{ 'is-ready': reloginQrReady }" @load="reloginQrReady = true" @error="reloginQrReady = false" />
+                  <span v-if="!reloginQrReady">正在刷新二维码</span>
+                </div>
+                <LoginProgress :qr-ready="reloginQrReady" :in-page-only="true" />
+              </div>
+              <div v-else-if="reloginTarget && reloginTarget.id === selectedTarget.id && reloginPhase === 'waiting'" class="detail-relogin-hint" role="status">已打开平台登录窗口，请在弹出的页面完成登录；登录成功后会自动重新发布。</div>
+              <div v-if="reloginError && reloginErrorTargetId === selectedTarget.id" class="detail-relogin-error" role="alert">{{ reloginError }}</div>
+              <button v-if="reloginTarget && reloginTarget.id === selectedTarget.id && (reloginPhase === 'starting' || reloginPhase === 'waiting')" class="text-button detail-danger-action" type="button" @click="cancelRelogin">取消重登重试</button>
             </div>
 
             <div v-if="retryEditorId === selectedTarget.id" class="detail-retry-editor">
@@ -683,14 +846,17 @@ onBeforeUnmount(stopRefresh)
 .detail-message { margin: 0; }
 .detail-loading { padding: 30px; color: var(--muted); }
 .detail-overview { display: grid; grid-template-columns: minmax(260px, 1.2fr) minmax(320px, 1.4fr) minmax(250px, 1fr); overflow: hidden; }
-.detail-common-settings { overflow: hidden; }
-.detail-common-head > span { color: var(--text-tertiary); font-size: var(--fs-caption); }
-.detail-common-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px 24px; padding: 15px 18px; }
-.detail-common-field { display: grid; align-content: start; gap: 6px; min-width: 0; }
-.detail-common-field > span { color: var(--text-tertiary); font-size: var(--fs-caption); }
-.detail-common-field > strong { color: var(--text-primary); font-size: var(--fs-body); font-weight: var(--fw-medium); line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
-.detail-common-field > p { margin: 0; color: var(--text-tertiary); font-size: var(--fs-body-sm); line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
-.detail-common-description { grid-column: 1 / -1; }
+.detail-common-settings { grid-column: 2; grid-row: 1; }
+.detail-common-body { padding: 15px 17px; }
+.detail-common-row { display: flex; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: var(--fs-body-sm); line-height: 1.55; }
+.detail-common-row:first-child { margin-top: 0; }
+.detail-common-row > span { flex: 0 0 auto; color: var(--muted); }
+.detail-common-row > strong { color: var(--text-primary); font-weight: var(--fw-medium); text-align: right; overflow-wrap: anywhere; white-space: pre-wrap; }
+.detail-common-row.is-multiline { flex-wrap: wrap; }
+.detail-common-row.is-multiline > p,
+.detail-common-row.is-multiline > .detail-tag-list { flex-basis: 100%; }
+.detail-common-row.is-multiline > p { margin: 0; color: var(--text-tertiary); line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
+.detail-common-row.is-multiline > .detail-tag-list { justify-content: flex-start; }
 .detail-tag-list { display: flex; flex-wrap: wrap; gap: 5px; }
 .detail-tag-list > span { padding: 3px 8px; border: 1px solid #e4e9ef; border-radius: 3px; background: #f8fafc; color: var(--text-secondary); font-size: var(--fs-caption); line-height: 1.4; }
 .detail-overview > div { min-width: 0; padding: 17px 19px; }
@@ -716,7 +882,9 @@ onBeforeUnmount(stopRefresh)
 .detail-batch-state > small { color: var(--text-tertiary); font-size: var(--fs-body-sm); line-height: 1.6; }
 .detail-state-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
 .detail-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(310px, 370px); gap: 14px; align-items: start; }
-.detail-targets, .detail-inspector { min-width: 0; overflow: hidden; }
+.detail-targets { grid-column: 1; grid-row: 1 / span 2; }
+.detail-inspector { grid-column: 2; grid-row: 2; }
+.detail-targets, .detail-common-settings, .detail-inspector { min-width: 0; overflow: hidden; }
 .detail-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 54px; padding: 10px 17px; border-bottom: 1px solid var(--line); }
 .detail-section-head h2, .detail-inspector-head h2 { margin: 0; color: var(--text-primary); font-size: var(--fs-title-lg); font-weight: var(--fw-semibold); }
 .detail-section-head h2 small { margin-left: 8px; color: var(--text-tertiary); font-size: var(--fs-caption); font-weight: var(--fw-regular); }
@@ -797,18 +965,24 @@ onBeforeUnmount(stopRefresh)
 .detail-retry-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 4px; font-size: var(--fs-body-sm); }
 .detail-retry-editor strong, .detail-retry-editor small, .detail-retry-editor .input { flex-basis: 100%; }
 .detail-retry-editor small { color: var(--muted); }
+.detail-relogin-panel { display: grid; justify-items: start; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 4px; }
+.detail-relogin-qr { display: flex; align-items: center; gap: 12px; }
+.detail-relogin-qr-image { position: relative; display: grid; width: 128px; min-height: 128px; flex: 0 0 128px; place-items: center; overflow: hidden; border-radius: 6px; background: white; }
+.detail-relogin-qr-image img { display: none; width: 116px; height: 116px; object-fit: contain; }
+.detail-relogin-qr-image img.is-ready { display: block; }
+.detail-relogin-qr-image span { padding: 10px; color: var(--text-tertiary); font-size: var(--fs-caption); text-align: center; }
+.detail-relogin-hint { color: var(--text-secondary); font-size: var(--fs-body-sm); line-height: var(--lh-base); }
+.detail-relogin-error { color: var(--danger); font-size: var(--fs-body-sm); line-height: var(--lh-base); }
 @media (max-width: 1050px) {
   .detail-overview { grid-template-columns: 1fr 1.2fr; }
   .detail-overview > div:last-child { grid-column: 1 / -1; border-top: 1px solid var(--line); border-left: 0; }
   .detail-columns { grid-template-columns: 1fr; }
+  .detail-targets, .detail-common-settings, .detail-inspector { grid-column: 1; grid-row: auto; }
 }
 @media (max-width: 680px) {
   .detail-overview { grid-template-columns: 1fr; }
   .detail-overview > div + div { border-top: 1px solid var(--line); border-left: 0; }
   .detail-overview > div:last-child { grid-column: auto; }
-  .detail-common-grid { grid-template-columns: 1fr; }
-  .detail-common-head { align-items: flex-start; flex-direction: column; }
-  .detail-common-description { grid-column: auto; }
   .detail-section-head { align-items: flex-start; }
   .detail-head-actions { flex-wrap: wrap; justify-content: flex-end; }
   .detail-table-head { display: none; }

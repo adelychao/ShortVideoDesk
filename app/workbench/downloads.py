@@ -15,7 +15,7 @@ from multi_sources import PLATFORMS, DownloadIssue, parse_source, resolve_source
 from .database import Database
 
 
-ProgressCallback = Callable[[str, float | None, str], None]
+ProgressCallback = Callable[..., None]
 
 
 @dataclass(frozen=True)
@@ -94,10 +94,12 @@ def download_source(
     update: ProgressCallback,
     *,
     allow_first_frame: bool,
+    progress_step_id: str = "download",
     task_id: str | None = None,
     access_mode: str = "anonymous",
     account_id: str | None = None,
     database: Database | None = None,
+    download_quality: str | None = None,
 ) -> DownloadResult:
     """Download one supported public work into an isolated temporary directory."""
     initial_source = parse_source(source_text)
@@ -140,7 +142,17 @@ def download_source(
         percent = changes.get("percent")
         progress = float(percent) if isinstance(percent, (int, float)) else None
         message = changes.get("message") or changes.get("phase") or "下载处理中"
-        update("download", progress, str(message))
+        telemetry: dict[str, int | float | None] = {}
+        for source_name in (
+            "downloaded_bytes",
+            "total_bytes",
+            "speed_bytes_per_second",
+            "eta_seconds",
+            "automatic_retry_count",
+        ):
+            value = changes.get(source_name)
+            telemetry[source_name] = value if isinstance(value, (int, float)) else None
+        update(progress_step_id, progress, str(message), **telemetry)
 
     from anonymous_poc import inspect_video as existing_verifier
     from multi_download import download_multiplatform
@@ -170,6 +182,7 @@ def download_source(
             allow_first_frame=allow_first_frame,
             cookie_file=cookie_file,
             browser_cookies=browser_cookies or None,
+            download_quality=download_quality,
         )
 
     if account_manager is not None:

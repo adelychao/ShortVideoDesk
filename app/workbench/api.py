@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -158,6 +159,7 @@ from .video_publishing import (
     add_video_publish_account,
     clean_video_publish_batch_media,
     cleanup_expired_video_publish_media,
+    add_video_publish_target,
     confirm_video_publish_target,
     create_video_publish_batch,
     delete_video_publish_batch,
@@ -194,7 +196,15 @@ _ERROR_TEXT = "请求参数无效。"
 _SUPPORTED_SOURCE_HOSTS = {
     "douyin": frozenset({"www.douyin.com", "www.iesdouyin.com", "v.douyin.com"}),
     "bilibili": frozenset({"bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv"}),
+    "youtube": frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}),
+    "tiktok": frozenset({"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}),
+    "instagram": frozenset({"instagram.com", "www.instagram.com"}),
+    "facebook": frozenset({"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com", "fb.watch"}),
+    "twitter": frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}),
+    "reddit": frozenset({"reddit.com", "www.reddit.com", "old.reddit.com", "redd.it"}),
 }
+_COMMENT_SUPPORTED_PLATFORMS = frozenset({"douyin", "bilibili"})
+_ACCOUNT_DOWNLOAD_SUPPORTED_PLATFORMS = frozenset({"douyin", "bilibili"})
 
 
 class StepConsentRequest(BaseModel):
@@ -349,6 +359,26 @@ class ArtifactVaultRequest(BaseModel):
 
 class ArtifactVaultWriteRequest(ArtifactVaultRequest):
     expected_sha256: str | None = Field(default=None, pattern="^[0-9a-fA-F]{64}$")
+
+
+# 转写/校对稿一键导入知识库支持的产物类型（设计稿 19，2026-11-21）。
+TRANSCRIPT_VAULT_KINDS = {
+    "transcript",
+    "transcript_draft",
+    "transcript_revision",
+    "ocr_result",
+    "ocr_revision",
+}
+TRANSCRIPT_VAULT_DIRECTORY = "转写稿"
+
+
+class ArtifactVaultImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_sha256: str = Field(pattern="^[0-9a-fA-F]{64}$")
+    # 已入库产物传回关联路径时按受控更新写回原文件；首次导入不传路径，由后端按素材标题自动命名。
+    relative_path: str | None = Field(default=None, min_length=1, max_length=1024)
+    library_name: str | None = Field(default=None, max_length=64)
 
 
 class AuthorizeOcrRequest(BaseModel):
@@ -710,6 +740,22 @@ class VideoPublishTargetEditRequest(BaseModel):
     confirmed: bool
 
 
+class VideoPublishTargetAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    batch_id: str = Field(min_length=1, max_length=64)
+    source_target_id: str = Field(min_length=1, max_length=64)
+    account_id: str = Field(min_length=1, max_length=64)
+    options: VideoPublishOptionsRequest
+    confirmed: bool
+
+
+class VideoPublishAutoStatusSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    batch_ids: list[str] = Field(min_length=1, max_length=100)
+
+
 class ArticlePlatformAccountRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -766,10 +812,10 @@ def _parse_supported_source(value: str) -> Source:
     allowed_hosts = _SUPPORTED_SOURCE_HOSTS.get(source.platform)
     parsed = urlsplit(source.url)
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("当前只支持抖音和 B 站官方公开作品链接。")
+        raise ValueError("请粘贴支持平台的官方公开单条视频链接。")
     hostname = (parsed.hostname or "").casefold().rstrip(".")
     if allowed_hosts is None or hostname not in allowed_hosts:
-        raise ValueError("当前只支持抖音和 B 站官方公开作品链接。")
+        raise ValueError("请粘贴支持平台的官方公开单条视频链接。")
     return source
 
 
@@ -779,6 +825,7 @@ class RetryStepRequest(BaseModel):
     source_url: str | None = Field(default=None, min_length=8, max_length=4096)
     ocr_action: Literal["continue", "restart"] | None = None
     transcription_authorized: bool | None = None
+    download_quality: Literal["720p"] | None = None
 
 
 class TranscriptionStepConfigRequest(BaseModel):
@@ -1700,9 +1747,16 @@ def create_task(body: CreateTaskRequest, request: Request) -> dict[str, object]:
     if len(requested) > 9:
         raise HTTPException(status_code=422, detail="URL 任务处理步骤数量超过上限。")
     if body.source_url is None:
-        raise HTTPException(status_code=422, detail="请提供抖音或 B 站的公开作品链接或分享文案。")
+        raise HTTPException(status_code=422, detail="请提供支持平台的公开单条视频链接或分享文案。")
     try:
         source = _parse_supported_source(body.source_url)
+        if (
+            source.platform not in _COMMENT_SUPPORTED_PLATFORMS
+            and any(step in requested for step in {StepKind.COMMENTS.value, StepKind.ANALYZE_COMMENTS.value})
+        ):
+            raise HTTPException(status_code=422, detail="该平台目前只支持视频下载及通用媒体处理，不支持评论采集或评论分析。")
+        if body.platform_access_mode == "account" and source.platform not in _ACCOUNT_DOWNLOAD_SUPPORTED_PLATFORMS:
+            raise HTTPException(status_code=422, detail="该平台本期仅支持匿名下载公开单条视频，不支持登录态访问。")
         platform_account_id = None
         platform_account_name = None
         if body.platform_access_mode == "account":
@@ -2345,6 +2399,88 @@ def create_article_from_script(body: ArticleFromScriptRequest, request: Request)
     )
 
 
+_article_job_lock = threading.RLock()
+_article_job_context = threading.local()
+_article_job_threads: dict[str, threading.Thread] = {}
+
+
+def _article_job_row(database: Database, job_id: str) -> dict[str, Any]:
+    with database.transaction() as connection:
+        row = connection.execute('SELECT * FROM article_generation_jobs WHERE id = ?', (job_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail='文章生成任务不存在。')
+    return dict(row)
+
+
+def _recover_article_generation_jobs(database: Database) -> None:
+    with database.transaction(write=True) as connection:
+        jobs = connection.execute("SELECT id, idempotency_key FROM article_generation_jobs WHERE status = 'running'").fetchall()
+        for job in jobs:
+            key_hash = hashlib.sha256(str(job['idempotency_key']).encode('utf-8')).hexdigest()
+            article = connection.execute('SELECT id FROM articles WHERE generation_key_sha256 = ?', (key_hash,)).fetchone()
+            if article:
+                connection.execute("UPDATE article_generation_jobs SET status = 'completed', article_id = ?, finished_at = ? WHERE id = ?", (article['id'], utc_now(), job['id']))
+            else:
+                connection.execute("UPDATE article_generation_jobs SET status = 'failed', error_message = ?, finished_at = ? WHERE id = ?", ('程序已重启，请重新生成。', utc_now(), job['id']))
+
+
+@_router.post('/article-generation-jobs', status_code=202, dependencies=[Depends(_same_origin)])
+def start_article_generation_job(body: ArticleFromTextRequest, request: Request) -> dict[str, Any]:
+    if not body.authorized or not body.content.strip():
+        raise HTTPException(status_code=422, detail='请填写文案并确认发送给模型。')
+    runner = _runner(request)
+    job_id = uuid.uuid4().hex
+    with _article_job_lock:
+        with runner.database.transaction(write=True) as connection:
+            existing = connection.execute('SELECT * FROM article_generation_jobs WHERE idempotency_key = ?', (body.idempotency_key,)).fetchone()
+            if existing is not None:
+                if str(existing['content']) != body.content.strip():
+                    raise HTTPException(status_code=409, detail='此请求标识已用于其他文案。')
+                return dict(existing)
+            connection.execute("INSERT INTO article_generation_jobs (id, idempotency_key, content, status, created_at) VALUES (?, ?, ?, 'running', ?)", (job_id, body.idempotency_key, body.content.strip(), utc_now()))
+
+        def run() -> None:
+            _article_job_context.job_id = job_id
+            try:
+                if _article_job_row(runner.database, job_id)['status'] != 'running':
+                    return
+                create_article_from_text(body, request)
+            except Exception as exc:
+                message = str(exc.detail) if isinstance(exc, HTTPException) else '文章生成失败，请稍后重试。'
+                with _article_job_lock, runner.database.transaction(write=True) as connection:
+                    connection.execute("UPDATE article_generation_jobs SET status = 'failed', error_message = ?, finished_at = ? WHERE id = ? AND status = 'running'", (message[:500], utc_now(), job_id))
+            finally:
+                del _article_job_context.job_id
+                with _article_job_lock:
+                    _article_job_threads.pop(job_id, None)
+
+        thread = threading.Thread(target=run, name=f'article-job-{job_id[:8]}', daemon=True)
+        _article_job_threads[job_id] = thread
+        thread.start()
+    return _article_job_row(runner.database, job_id)
+
+
+@_router.get('/article-generation-jobs/latest', dependencies=[Depends(_same_origin)])
+def latest_article_generation_job(request: Request) -> dict[str, Any] | None:
+    with _runner(request).database.transaction() as connection:
+        row = connection.execute('SELECT id, status FROM article_generation_jobs ORDER BY created_at DESC LIMIT 1').fetchone()
+    return dict(row) if row else None
+
+
+@_router.get('/article-generation-jobs/{job_id}', dependencies=[Depends(_same_origin)])
+def get_article_generation_job(job_id: str, request: Request) -> dict[str, Any]:
+    return _article_job_row(_runner(request).database, job_id)
+
+
+@_router.post('/article-generation-jobs/{job_id}/cancel', dependencies=[Depends(_same_origin)])
+def cancel_article_generation_job(job_id: str, request: Request) -> dict[str, Any]:
+    database = _runner(request).database
+    with _article_job_lock:
+        with database.transaction(write=True) as connection:
+            connection.execute("UPDATE article_generation_jobs SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'running'", (utc_now(), job_id))
+        return _article_job_row(database, job_id)
+
+
 @_router.post("/articles/from-text", status_code=201, dependencies=[Depends(_same_origin)])
 def create_article_from_text(body: ArticleFromTextRequest, request: Request) -> dict[str, object]:
     if not body.authorized:
@@ -2534,6 +2670,10 @@ def _generate_article_from_text(
         if existing_article_id is not None:
             article = get_article(runner.database, existing_article_id)
             if article is not None:
+                job_id = getattr(_article_job_context, 'job_id', None)
+                if job_id:
+                    with _article_job_lock, runner.database.transaction(write=True) as connection:
+                        connection.execute("UPDATE article_generation_jobs SET status = 'completed', article_id = ?, finished_at = ? WHERE id = ? AND status = 'running'", (existing_article_id, utc_now(), job_id))
                 return article
     else:
         now = datetime.now(timezone.utc).isoformat()
@@ -2561,40 +2701,48 @@ def _generate_article_from_text(
         response = provider.analyze_text(_article_generation_prompt(), source_text, model_id)
         from .steps.text_analysis_common import parse_json_object
 
-        generated = normalize_document(parse_json_object(str(response.text)))
-        article = create_article(
-            runner.database,
-            generated,
-            source_task_id=task_id,
-            source_artifact_id=artifact_id,
-            source_kind=source_kind,
-            generation_key_sha256=hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest() if idempotency_key else None,
-            note=note,
-        )
-        usage_json = json.dumps(
-            {"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None,
-             "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
-            ensure_ascii=False, separators=(",", ":"),
-        )
-        usage = getattr(response, "usage", None)
-        if hasattr(usage, "__dataclass_fields__"):
-            usage_value = {key: str(value) if hasattr(value, "as_tuple") else value for key, value in usage.__dict__.items()}
+        job_id = getattr(_article_job_context, 'job_id', None)
+        with _article_job_lock:
+            if job_id and _article_job_row(runner.database, job_id)['status'] != 'running':
+                _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status='failed', error_code='cancelled')
+                return {}
+            generated = normalize_document(parse_json_object(str(response.text)))
+            article = create_article(
+                runner.database,
+                generated,
+                source_task_id=task_id,
+                source_artifact_id=artifact_id,
+                source_kind=source_kind,
+                generation_key_sha256=hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest() if idempotency_key else None,
+                note=note,
+            )
             usage_json = json.dumps(
-                {**usage_value, "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
+                {"input_tokens": None, "audio_seconds": None, "image_count": None, "output_tokens": None,
+                 "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
                 ensure_ascii=False, separators=(",", ":"),
             )
-        _update_article_generation_run(
-            runner,
-            task_id=task_id,
-            run_id=run_id,
-            status="completed",
-            article_id=str(article["id"]),
-            request_id=getattr(response, "request_id", None) or run_id,
-            usage_json=usage_json,
-        )
-        if task_id is None:
-            article = get_article(runner.database, str(article["id"])) or article
-        return article
+            usage = getattr(response, "usage", None)
+            if hasattr(usage, "__dataclass_fields__"):
+                usage_value = {key: str(value) if hasattr(value, "as_tuple") else value for key, value in usage.__dict__.items()}
+                usage_json = json.dumps(
+                    {**usage_value, "input_detail": {"operation": operation, "source_artifact_ids": [artifact_id] if artifact_id else [], "authorized": True}},
+                    ensure_ascii=False, separators=(",", ":"),
+                )
+            _update_article_generation_run(
+                runner,
+                task_id=task_id,
+                run_id=run_id,
+                status="completed",
+                article_id=str(article["id"]),
+                request_id=getattr(response, "request_id", None) or run_id,
+                usage_json=usage_json,
+            )
+            if task_id is None:
+                article = get_article(runner.database, str(article["id"])) or article
+            if job_id:
+                with runner.database.transaction(write=True) as connection:
+                    connection.execute("UPDATE article_generation_jobs SET status = 'completed', article_id = ?, finished_at = ? WHERE id = ? AND status = 'running'", (str(article['id']), utc_now(), job_id))
+            return article
     except HTTPException as exc:
         _update_article_generation_run(runner, task_id=task_id, run_id=run_id, status="failed", error_code=f"http_{exc.status_code}")
         raise
@@ -3208,6 +3356,49 @@ def generate_article_image(article_id: str, body: ArticleImageGenerationRequest,
         status = 404 if isinstance(exc, KeyError) else 409 if isinstance(exc, RuntimeError) else 422
         raise HTTPException(status_code=status, detail=str(exc)) from None
     return {"article": updated, "image_url": f"/api/v1/articles/{article_id}/images/{filename}", "model_id": metadata["model_id"], "request_id": metadata["request_id"] or None, "cost_known": False}
+
+
+@_router.post("/articles/{article_id}/images/upload", status_code=201, dependencies=[Depends(_same_origin)])
+async def upload_article_body_image(
+    article_id: str,
+    request: Request,
+    block_id: str = Query(..., min_length=1, max_length=80),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    runner = _runner(request)
+    article = get_article(runner.database, article_id)
+    if article is None:
+        raise HTTPException(status_code=404, detail="文章不存在。")
+    block_index = next((
+        index for index, block in enumerate(article["document"].get("blocks", []))
+        if isinstance(block, dict) and block.get("id") == block_id and block.get("type") == "paragraph"
+    ), None)
+    if block_index is None:
+        raise HTTPException(status_code=404, detail="正文配图位置不存在，请刷新文章后重试。")
+    data = await file.read(10_000_001)
+    if not data or len(data) > 10_000_000:
+        raise HTTPException(status_code=413, detail="正文配图必须小于 10 MB。")
+    name = Path(file.filename or "article-image.jpg").name[:255]
+    suffix = Path(name).suffix.casefold()
+    signatures = {
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+    }
+    if suffix not in signatures or not signatures[suffix]:
+        raise HTTPException(status_code=415, detail="正文配图仅支持 JPEG、PNG 或 WebP 图片。")
+    try:
+        updated, filename = save_article_image(
+            runner.database, article, data, suffix, name=name,
+            block_index=block_index, note="上传正文配图",
+        )
+    except OSError:
+        raise HTTPException(status_code=500, detail="无法写入文章图片目录，请检查目录设置。") from None
+    except (KeyError, RuntimeError, ValueError) as exc:
+        status = 404 if isinstance(exc, KeyError) else 409 if isinstance(exc, RuntimeError) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    return {"article": updated, "image_url": f"/api/v1/articles/{article_id}/images/{filename}"}
 
 
 @_router.post("/articles/{article_id}/publish", dependencies=[Depends(_same_origin)])
@@ -4773,6 +4964,134 @@ def review_generated_artifact(
         raise HTTPException(status_code=409, detail="审核产物保存失败或来源已变化。") from None
 
 
+@_router.post("/artifacts/{artifact_id}/vault-import", dependencies=[Depends(_same_origin)])
+def import_artifact_to_vault(
+    artifact_id: str,
+    body: ArtifactVaultImportRequest,
+    request: Request,
+) -> dict[str, object]:
+    """一键导入转写/校对稿到知识库（设计稿 19，2026-11-21）。
+
+    复用知识卡的写入机制：首次导入按「转写稿/<素材标题>.md」自动命名，目标已存在
+    不同内容时自动改用建议路径，不覆盖已有文件；产物已入库时由前端传回关联路径，
+    走 update_vault_note_if_unchanged 受控更新——仅当知识库文件仍匹配上次写入的
+    校验值时覆盖，被外部改过的文件不会被静默覆盖。成功后写 obsidian_writes 台账
+    并把关联信息记入产物元数据，供「打开知识库文件/所在目录」使用。
+    """
+    runner = _runner(request)
+    with runner.database.transaction() as connection:
+        original = connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+    if original is None:
+        raise HTTPException(status_code=404, detail="转写产物不存在。")
+    if str(original["kind"]) not in TRANSCRIPT_VAULT_KINDS:
+        raise HTTPException(status_code=422, detail="仅转写与校对稿支持一键导入知识库。")
+    if str(original["sha256"]).casefold() != body.expected_sha256.casefold():
+        raise HTTPException(status_code=409, detail="产物内容已变化；请刷新后重新导入。")
+    metadata = _json_object(original["metadata_json"])
+    managed_path = metadata.get("vault_note_path")
+    managed_root = metadata.get("vault_output_root")
+    update_requested = isinstance(body.relative_path, str) and bool(body.relative_path.strip())
+    from .obsidian import update_vault_note_if_unchanged, write_vault_note
+
+    try:
+        content, title = _vault_artifact_content(runner, artifact_id, allow_transcript=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="转写产物不存在。") from exc
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=_safe_error(exc)) from exc
+
+    if update_requested:
+        # 受控更新：按产物元数据定位原库，不经过“默认取第一个目录”的选择逻辑。
+        if not (
+            isinstance(managed_path, str)
+            and managed_path.strip().casefold() == body.relative_path.strip().casefold()
+            and isinstance(managed_root, str)
+            and managed_root.strip()
+        ):
+            raise HTTPException(status_code=422, detail="传入路径与该产物已关联的知识库文件不一致；请刷新后重试。")
+        entries = _output_library_entries(runner)
+        try:
+            recorded_root = Path(str(managed_root))
+            if recorded_root.is_symlink():
+                raise ValueError("原知识库目录已失效。")
+            resolved_root = recorded_root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=409, detail="原知识库目录已不存在，未更新；请先在知识库与设置中恢复该目录。") from None
+        matching_entry = next(
+            ((name, directory) for name, directory in entries
+             if os.path.normcase(str(directory.resolve(strict=True) if directory.exists() else directory)) == os.path.normcase(str(resolved_root))),
+            None,
+        )
+        if matching_entry is None:
+            raise HTTPException(status_code=409, detail="原知识库目录已不在设置中，未更新；请在知识库与设置中检查。")
+        library_name, root = matching_entry
+        with runner.database.transaction() as connection:
+            previous = connection.execute(
+                """SELECT sha256 FROM obsidian_writes
+                   WHERE artifact_id = ? AND output_root = ? AND relative_path = ?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (artifact_id, str(resolved_root), str(managed_path)),
+            ).fetchone()
+        if previous is None:
+            raise HTTPException(status_code=409, detail="缺少原文件校验记录，未覆盖知识库文件；原文件关联已保留。")
+        try:
+            result = update_vault_note_if_unchanged(root, str(managed_path), content, str(previous["sha256"]))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=_safe_error(exc)) from exc
+    else:
+        library_name, root = _select_output_library(runner, body.library_name)
+        if not root.is_dir() or root.is_symlink():
+            raise HTTPException(status_code=409, detail="知识库目录不可用，请到知识库与设置中检查。")
+        base = (title or "转写稿").replace('\\/:*?"<>|', "_").strip()[:100].rstrip("_").strip() or "转写稿"
+        default_relative = f"{TRANSCRIPT_VAULT_DIRECTORY}/{base}.md"
+        try:
+            directory = root / TRANSCRIPT_VAULT_DIRECTORY
+            if directory.exists() and not directory.is_dir():
+                raise ValueError(f"「{TRANSCRIPT_VAULT_DIRECTORY}」已被同名文件占用，无法创建文件夹。")
+            directory.mkdir(parents=True, exist_ok=True)
+            result = write_vault_note(root, default_relative, content, None)
+            if not result.written and result.conflict_path:
+                result = write_vault_note(root, result.conflict_path, content, None)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=_safe_error(exc)) from exc
+
+    if result.written and result.path:
+        resolved_root = str(root.resolve(strict=True))
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with runner.database.transaction(write=True) as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO obsidian_writes (
+                       id, artifact_id, output_root, relative_path, sha256, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    artifact_id,
+                    resolved_root,
+                    result.path,
+                    digest,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+            row = connection.execute("SELECT metadata_json FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+            if row is not None:
+                fresh_metadata = _json_object(row["metadata_json"])
+                fresh_metadata["vault_note_path"] = result.path
+                fresh_metadata["vault_output_root"] = resolved_root
+                fresh_metadata["vault_library_name"] = library_name
+                fresh_metadata["vault_filename_managed"] = True
+                connection.execute(
+                    "UPDATE artifacts SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(fresh_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")), artifact_id),
+                )
+    return {
+        "written": result.written,
+        "path": result.path,
+        "reason": result.reason,
+        "conflict_path": result.conflict_path,
+        "library_name": library_name if result.written else None,
+    }
+
+
 @_router.post("/tasks/{task_id}/video-notes", dependencies=[Depends(_same_origin)])
 def create_video_notes(
     task_id: str,
@@ -5208,6 +5527,11 @@ def retry_step(
         step = next((item for item in task.steps if item.id == step_id), None)
         if step is None:
             raise KeyError("step not found")
+        download_quality = body.download_quality if body else None
+        if download_quality is not None and (
+            step.kind is not StepKind.DOWNLOAD or task.source.platform != "youtube"
+        ):
+            raise HTTPException(status_code=422, detail="720p 降画质重试仅适用于 YouTube 下载步骤。")
         transcription_consent: tuple[str, str] | None = None
         if step.kind is StepKind.TRANSCRIBE:
             if local_asr.get_task_options(runner.database, task_id) is None:
@@ -5245,6 +5569,7 @@ def retry_step(
                 step_id,
                 ocr_action=body.ocr_action if body else None,
                 transcription_consent=transcription_consent,
+                download_quality=download_quality,
             )
         else:
             candidate = body.source_url if body and body.source_url else task.source.value
@@ -5259,6 +5584,7 @@ def retry_step(
                 source_url=parsed.url if body and body.source_url else None,
                 ocr_action=body.ocr_action if body else None,
                 transcription_consent=transcription_consent,
+                download_quality=download_quality,
             )
     except RunnerError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -5396,12 +5722,12 @@ def open_vault_note(
     request: Request,
     reveal: bool = Query(default=False),
 ) -> dict[str, bool]:
-    """Open an approved card's vault note, or reveal it in the file manager.
+    """Open an approved card's or imported transcript's vault note, or reveal it in the file manager.
 
-    The note location is resolved server-side from the card metadata that the
+    The note location is resolved server-side from the artifact metadata that the
     auto-write step recorded; clients never pass a path. Only directories
     still configured as knowledge libraries are searched, preferring the one
-    the card was written to.
+    the note was written to.
     """
     runner = _runner(request)
     entries = _output_library_entries(runner)
@@ -5410,13 +5736,13 @@ def open_vault_note(
     with runner.database.transaction() as connection:
         row = connection.execute("SELECT kind, metadata_json FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="知识卡不存在。")
-    if str(row["kind"]) != "knowledge_card_approved":
-        raise HTTPException(status_code=422, detail="仅已审核知识卡支持打开知识库笔记。")
+        raise HTTPException(status_code=404, detail="产物不存在。")
+    if str(row["kind"]) != "knowledge_card_approved" and str(row["kind"]) not in TRANSCRIPT_VAULT_KINDS:
+        raise HTTPException(status_code=422, detail="仅已入库的转写校对稿或已审核知识卡支持打开知识库笔记。")
     metadata = _json_object(row["metadata_json"])
     note_path_value = metadata.get("vault_note_path")
     if not isinstance(note_path_value, str) or not note_path_value.strip():
-        raise HTTPException(status_code=409, detail="该知识卡尚未写入知识库。")
+        raise HTTPException(status_code=409, detail="该产物尚未写入知识库。")
     recorded_root = metadata.get("vault_output_root")
     configured_keys = [os.path.normcase(str(directory)) for _, directory in entries]
     candidates: list[Path] = []
@@ -5615,6 +5941,17 @@ def cancel_video_publish_account_login(account_id: str, request: Request) -> dic
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
 
 
+@_router.post("/video-publish/accounts/{account_id}/cancel-check", dependencies=[Depends(_same_origin)])
+def cancel_video_publish_account_check(account_id: str, request: Request) -> dict[str, str]:
+    try:
+        _video_publish_manager(request).cancel_account_check(account_id)
+        return {"message": "正在取消检查。"}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="视频发布账号不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
 @_router.post("/video-publish/accounts/{account_id}/check", dependencies=[Depends(_same_origin)])
 def check_video_publish_account(account_id: str, request: Request) -> dict[str, object]:
     manager = _video_publish_manager(request)
@@ -5622,7 +5959,7 @@ def check_video_publish_account(account_id: str, request: Request) -> dict[str, 
     if not status["configured"]:
         raise HTTPException(status_code=409, detail=str(status["message"]))
     try:
-        account = request_video_publish_account_action(manager.database, account_id, "check")
+        account = manager.request_account_action(account_id, "check")
         manager.enqueue_account_action(account_id, "check")
         return account
     except KeyError:
@@ -6041,6 +6378,25 @@ def sync_video_publish_target(target_id: str, request: Request) -> dict[str, boo
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
 
 
+@_router.post("/video-publish/status-sync/automatic", status_code=202, dependencies=[Depends(_same_origin)])
+def schedule_video_publish_status_sync(
+    body: VideoPublishAutoStatusSyncRequest,
+    request: Request,
+) -> dict[str, int]:
+    queued = _video_publish_manager(request)._schedule_status_sync_once(body.batch_ids)
+    return {"queued": queued}
+
+
+@_router.post("/video-publish/targets/{target_id}/relogin", dependencies=[Depends(_same_origin)])
+def relogin_video_publish_target(target_id: str, request: Request) -> dict[str, object]:
+    try:
+        return _video_publish_manager(request).relogin_target_account(target_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="发布目标不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
 @_router.post("/video-publish/targets/{target_id}/retry", dependencies=[Depends(_same_origin)])
 def retry_video_publish_target(target_id: str, body: VideoPublishTargetRetryRequest, request: Request) -> dict[str, object]:
     if not body.confirmed:
@@ -6075,6 +6431,26 @@ def edit_video_publish_target_endpoint(target_id: str, body: VideoPublishTargetE
         return get_video_publish_batch(manager.database, str(target["batch_id"]), include_attempts=True) if target else {}
     except KeyError:
         raise HTTPException(status_code=404, detail="发布目标不存在。") from None
+    except VideoPublishError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+
+
+@_router.post("/video-publish/targets/add", dependencies=[Depends(_same_origin)])
+def add_video_publish_target_endpoint(body: VideoPublishTargetAddRequest, request: Request) -> dict[str, object]:
+    manager = _video_publish_manager(request)
+    try:
+        added_target_id = add_video_publish_target(
+            manager.database,
+            body.batch_id,
+            body.source_target_id,
+            body.account_id,
+            body.options.model_dump(exclude_unset=True),
+            confirmed=body.confirmed,
+        )
+        manager.enqueue_publish(added_target_id)
+        return get_video_publish_batch(manager.database, body.batch_id, include_attempts=True) or {}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="发布任务或原目标不存在。") from None
     except VideoPublishError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
 
@@ -6123,6 +6499,7 @@ def mount_workbench_api(app: FastAPI, runner: TaskRunner | None = None) -> TaskR
             try:
                 video_publish_manager.start()
                 recover_article_publications(selected_runner.database)
+                _recover_article_generation_jobs(selected_runner.database)
                 yield
             finally:
                 video_publish_manager.stop()
@@ -6147,6 +6524,7 @@ def _vault_artifact_content(
     artifact_id: str,
     *,
     metadata_overrides: dict[str, object] | None = None,
+    allow_transcript: bool = False,
 ) -> tuple[str, str]:
     with runner.database.transaction() as connection:
         row = connection.execute(
@@ -6169,8 +6547,9 @@ def _vault_artifact_content(
         metadata.update(metadata_overrides)
     approved_card = artifact_kind == "knowledge_card_approved" and metadata.get("human_reviewed") is True
     finalized_script = artifact_kind == "final_script" and metadata.get("finalized") is True and metadata.get("human_reviewed") is True
-    if not approved_card and not finalized_script:
-        raise ValueError("只能选择已审核的知识卡或定稿写入知识库。")
+    transcript_note = allow_transcript and artifact_kind in TRANSCRIPT_VAULT_KINDS
+    if not approved_card and not finalized_script and not transcript_note:
+        raise ValueError("只能选择已审核的知识卡、定稿或转写校对稿写入知识库。")
     root = runner.config.archive_root
     if root is None:
         raise ValueError("归档目录未配置。")
@@ -6484,6 +6863,12 @@ def _step_payload(step: StepRecord) -> dict[str, object]:
         "message": _safe_error(step.message or ""),
         "error_code": step.error_code,
         "retry_count": step.retry_count,
+        "downloaded_bytes": step.downloaded_bytes,
+        "total_bytes": step.total_bytes,
+        "speed_bytes_per_second": step.speed_bytes_per_second,
+        "eta_seconds": step.eta_seconds,
+        "last_progress_at": step.last_progress_at,
+        "automatic_retry_count": step.automatic_retry_count,
         "started_at": step.started_at,
         "finished_at": step.finished_at,
     }
@@ -6706,7 +7091,7 @@ def _source_validation_message(exc: object) -> str:
     text = _safe_error(exc)
     if any("\u4e00" <= character <= "\u9fff" for character in text):
         return text
-    return "链接无效。请粘贴抖音或 B 站官方公开作品链接或分享文案。"
+    return "链接无效。请粘贴支持平台的官方公开单条视频链接或分享文案。"
 
 
 def _credential_status(provider_id: str = "zhipu") -> dict[str, object]:

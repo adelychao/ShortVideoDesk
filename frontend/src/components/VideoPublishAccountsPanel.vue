@@ -29,7 +29,6 @@ const selectedPlatform = ref(props.initialPlatform || '')
 const loading = ref(false)
 const busy = ref('')
 const error = ref('')
-const message = ref('')
 const qrKey = ref(Date.now())
 const qrReady = ref<Record<string, boolean>>({})
 let timer: number | undefined
@@ -94,14 +93,12 @@ async function refreshAccounts(): Promise<void> {
     const pendingIds = new Set(accounts.value.filter((item) => item.status === 'login_in_progress').map((item) => item.id))
     const notice = result.notices?.find((item) => pendingIds.has(item.account_id))
     replaceAccounts(result.items)
-    if (notice) { error.value = notice.message; message.value = '' }
-    if (!accounts.value.some((item) => item.status === 'login_in_progress' || item.status === 'checking')) message.value = ''
+    if (notice) error.value = notice.message
   } catch (cause) { error.value = errorText(cause) }
 }
 async function load(): Promise<void> {
   loading.value = true
   error.value = ''
-  message.value = ''
   const results = await Promise.allSettled([api.getVideoPublishStatus(), api.getVideoPublishPlatforms(props.context === 'article' ? 'article' : 'video'), api.getVideoPublishAccounts()] as const)
   if (results[0].status === 'fulfilled') {
     sau.value = results[0].value.sau
@@ -122,17 +119,25 @@ defineExpose({ refresh: load })
 async function login(account: VideoPublishAccount): Promise<void> {
   if (!platforms.value.find((item) => item.id === account.platform_id)?.login_available) return
   if (account.platform_id === 'wechat_channels') { qrReady.value[account.id] = false; qrKey.value = Date.now() }
-  busy.value = account.id; error.value = ''; message.value = ''
+  busy.value = account.id; error.value = ''
   try {
     const updated = await api.loginVideoPublishAccount(account.id)
     replaceAccounts(accounts.value.map((item) => item.id === account.id ? updated : item))
-    message.value = ['bilibili', 'wechat_channels'].includes(account.platform_id) ? '正在准备登录二维码，请稍候。' : '正在打开登录窗口，请留意弹出的页面。'
     startPolling()
   } catch (cause) { error.value = errorText(cause); await refreshAccounts() }
   finally { busy.value = '' }
 }
+async function cancelLogin(account: VideoPublishAccount): Promise<void> {
+  busy.value = account.id; error.value = ''
+  try {
+    await api.cancelVideoPublishAccountLogin(account.id)
+    await refreshAccounts()
+    startPolling()
+  } catch (cause) { error.value = errorText(cause) }
+  finally { busy.value = '' }
+}
 async function check(account: VideoPublishAccount): Promise<void> {
-  busy.value = account.id; error.value = ''; message.value = ''
+  busy.value = account.id; error.value = ''
   try {
     const updated = await api.checkVideoPublishAccount(account.id)
     replaceAccounts(accounts.value.map((item) => item.id === account.id ? updated : item))
@@ -141,10 +146,9 @@ async function check(account: VideoPublishAccount): Promise<void> {
   finally { busy.value = '' }
 }
 async function openWorkbench(account: VideoPublishAccount): Promise<void> {
-  busy.value = account.id; error.value = ''; message.value = ''
+  busy.value = account.id; error.value = ''
   try {
-    const result = await api.openVideoPublishAccountWorkbench(account.id)
-    message.value = result.message
+    await api.openVideoPublishAccountWorkbench(account.id)
   } catch (cause) { error.value = errorText(cause) }
   finally { busy.value = '' }
 }
@@ -197,10 +201,8 @@ onBeforeUnmount(() => { active = false; stopPolling() })
 
 <template>
   <section class="panel settings-section video-accounts" :class="{ 'is-embedded': embedded }" :aria-labelledby="embedded ? undefined : 'video-accounts-title'" :aria-label="embedded ? (context === 'article' ? '知乎登录账号' : '小红书登录账号') : undefined">
-    <div v-if="!embedded" class="panel-head"><div><h2 id="video-accounts-title">视频发布账号</h2><p>按平台管理视频发布账号。</p></div><ElButton text class="text-button" native-type="button" :disabled="loading || !!busy" @click="load">{{ loading ? '读取中…' : '刷新状态' }}</ElButton></div>
-    <ElAlert v-if="!embedded" class="info-box video-account-note" type="info" :closable="false" :show-icon="false" role="note" title="抖音和 B 站账号可共用于视频发布、素材下载与评论采集；添加账号时无需额外设置用途。" />
+    <div v-if="!embedded" class="panel-head"><div><h2 id="video-accounts-title">视频发布账号</h2></div><ElButton text class="text-button" native-type="button" :disabled="loading || !!busy" @click="load">{{ loading ? '读取中…' : '刷新状态' }}</ElButton></div>
     <ElAlert v-if="error" class="info-box form-error" type="error" :closable="false" :show-icon="false" role="alert" :title="error" />
-    <ElAlert v-if="message" class="info-box task-success" type="success" :closable="false" :show-icon="false" role="status" :title="message" />
     <p v-if="loading && !platforms.length" role="status">正在读取账号…</p>
     <div v-else class="account-layout" :class="{ 'account-layout-embedded': embedded }">
       <nav v-if="!embedded" class="account-platforms" :aria-label="context === 'article' ? '文章发布平台' : '视频发布平台'">
@@ -239,10 +241,11 @@ onBeforeUnmount(() => { active = false; stopPolling() })
               <LoginProgress :qr-ready="!!qrReady[account.id]" :in-page-only="['bilibili', 'wechat_channels'].includes(account.platform_id)" :waiting-hint="account.platform_id === 'wechat_channels' ? '正在连接官方登录页并获取二维码；遇到可恢复的加载异常时系统会尝试恢复一次。如仍未显示，可在登录窗口手动重试。' : undefined" />
             </div>
             <div class="account-actions">
-              <ElButton v-if="account.status !== 'connected'" class="button button-secondary button-small" native-type="button" :disabled="!!busy || !sau?.configured || !currentPlatform?.login_available || account.status === 'checking' || account.status === 'login_in_progress'" @click="login(account)">{{ account.status === 'login_in_progress' ? '登录中…' : account.status === 'checking' ? '检查中…' : '登录' }}</ElButton>
+              <ElButton v-if="account.status === 'login_in_progress'" class="button button-secondary button-small" native-type="button" :disabled="!!busy" @click="cancelLogin(account)">{{ busy === account.id ? '正在取消…' : '取消登录' }}</ElButton>
+              <ElButton v-else-if="account.status !== 'connected'" class="button button-secondary button-small" native-type="button" :disabled="!!busy || !sau?.configured || !currentPlatform?.login_available || account.status === 'checking'" @click="login(account)">{{ account.status === 'checking' ? '检查中…' : '登录' }}</ElButton>
               <ElButton v-else class="button button-secondary button-small" native-type="button" :disabled="!!busy || !sau?.configured" @click="check(account)">检查</ElButton>
               <ElButton v-if="workbenchPlatforms.has(account.platform_id) && account.status === 'connected'" class="button button-secondary button-small" native-type="button" :disabled="!!busy || !sau?.configured" @click="openWorkbench(account)">{{ busy === account.id ? '正在打开…' : '打开工作台' }}</ElButton>
-              <ElButton text class="text-button" native-type="button" :disabled="!!busy || account.status === 'checking' || account.status === 'login_in_progress'" @click="logout(account)">{{ account.status === 'connected' ? '退出登录' : '移除账号' }}</ElButton>
+              <ElButton v-if="account.status === 'connected'" text class="text-button" native-type="button" :disabled="!!busy" @click="logout(account)">退出登录</ElButton>
             </div>
           </li>
         </ul>
@@ -262,7 +265,6 @@ onBeforeUnmount(() => { active = false; stopPolling() })
 .video-accounts :deep(.el-button.text-button:hover:not(.is-disabled)) { color: var(--pine); text-decoration: underline; text-underline-offset: 3px; }
 .video-accounts :deep(.el-alert.info-box) { align-items: flex-start; padding: 10px 12px; border-radius: 11px; font-size: var(--fs-body); line-height: var(--lh-base); }
 .video-accounts :deep(.el-alert.info-box .el-alert__title) { font-size: inherit; font-weight: var(--fw-regular); line-height: inherit; }
-.video-account-note { margin-bottom: 12px; }
 
 .account-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; min-height: 420px; }
 .account-platforms { display: flex; flex-direction: column; gap: 6px; padding: 15px 11px; border-right: 1px solid var(--line); background: var(--paper-2); }

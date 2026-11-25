@@ -30,6 +30,7 @@ const baseSnapshot = ref('')
 const loading = ref(true)
 const saving = ref(false)
 const uploadingCover = ref(false)
+const uploadingParagraphBlockId = ref<string | null>(null)
 type ArticleImageTarget = 'cover' | 'paragraph'
 type ArticleImageMode = 'provider' | 'vector'
 type ArticleImageJob = { articleId: string; target: ArticleImageTarget; blockId: string | null; mode: ArticleImageMode }
@@ -52,6 +53,7 @@ const leaveDialogOpen = ref(false)
 const finalizeSuccessDialogOpen = ref(false)
 const editorActive = ref(false)
 const coverInput = ref<HTMLInputElement | null>(null)
+const paragraphImageInputs = new Map<string, HTMLInputElement>()
 const bodyEditor = ref<{
   insertImageAtAnchor: (input: { src: string; alt: string; slotId: string; anchorText: string }) => 'replaced' | 'inserted-after-paragraph' | 'inserted-at-cursor' | 'unavailable'
   replaceManagedImageSource: (slotId: string, src: string) => boolean
@@ -418,6 +420,43 @@ function insertParagraphImage(item: (typeof paragraphImagePrompts.value)[number]
   }
 }
 
+function setParagraphImageInput(blockId: string, element: Element | null): void {
+  if (element instanceof HTMLInputElement) paragraphImageInputs.set(blockId, element)
+  else paragraphImageInputs.delete(blockId)
+}
+
+function openParagraphImagePicker(blockId: string): void {
+  if (!article.value || saving.value || uploadingCover.value || uploadingParagraphBlockId.value || hasImageGenerationWork()) return
+  paragraphImageInputs.get(blockId)?.click()
+}
+
+async function uploadParagraphImage(event: Event, blockId: string): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file || !article.value || !document.value) return
+  if (uploadingCover.value || uploadingParagraphBlockId.value || hasImageGenerationWork()) {
+    input.value = ''
+    return
+  }
+  if (isDirty.value && !await saveArticle(false)) {
+    input.value = ''
+    return
+  }
+  uploadingParagraphBlockId.value = blockId
+  error.value = ''
+  message.value = ''
+  try {
+    const result = await api.uploadArticleBodyImage(articleId.value, blockId, file)
+    acceptGeneratedImage(result.article, 'paragraph', blockId)
+    message.value = '正文配图已上传。'
+  } catch (cause) {
+    reportError(errorMessage(cause))
+  } finally {
+    uploadingParagraphBlockId.value = null
+    input.value = ''
+  }
+}
+
 function imageTargetKey(target: ArticleImageTarget, blockId: string | null): string | null {
   return target === 'cover' ? 'cover' : blockId
 }
@@ -447,7 +486,7 @@ function imageGenerationButtonText(target: ArticleImageTarget, blockId: string |
 }
 
 function openImageModeDialog(target: ArticleImageTarget, blockId: string | null = null): void {
-  if (!article.value || saving.value || uploadingCover.value || isImageGenerationActive(target, blockId) || imageGenerationQueuePosition(target, blockId)) return
+  if (!article.value || saving.value || uploadingCover.value || uploadingParagraphBlockId.value || isImageGenerationActive(target, blockId) || imageGenerationQueuePosition(target, blockId)) return
   imageRequest.value = { target, blockId }
   imageModeDialogOpen.value = true
   void loadImageSettings()
@@ -728,8 +767,8 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
           </div>
           <input ref="coverInput" class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" :disabled="!article" @change="uploadCover" />
           <div class="article-image-actions">
-            <el-button type="primary" size="small" :disabled="!article || saving || uploadingCover || isImageGenerationActive('cover', null) || !!imageGenerationQueuePosition('cover', null)" :loading="isImageGenerationActive('cover', null)" @click="openImageModeDialog('cover')">{{ imageGenerationButtonText('cover', null, coverUrl ? '重新生成' : '生成配图') }}</el-button>
-            <el-button size="small" :disabled="!article || uploadingCover || saving || hasImageGenerationWork()" @click="coverInput?.click()">{{ uploadingCover ? '上传中…' : coverUrl ? '上传新封面' : '上传封面' }}</el-button>
+            <el-button type="primary" size="small" :disabled="!article || saving || uploadingCover || !!uploadingParagraphBlockId || isImageGenerationActive('cover', null) || !!imageGenerationQueuePosition('cover', null)" :loading="isImageGenerationActive('cover', null)" @click="openImageModeDialog('cover')">{{ imageGenerationButtonText('cover', null, coverUrl ? '重新生成' : '生成配图') }}</el-button>
+            <el-button size="small" :disabled="!article || uploadingCover || !!uploadingParagraphBlockId || saving || hasImageGenerationWork()" @click="coverInput?.click()">{{ uploadingCover ? '上传中…' : coverUrl ? '上传新封面' : '上传封面' }}</el-button>
           </div>
           <p v-if="!article" class="helper">保存草稿后可使用图片功能</p>
           <p v-else class="helper">支持 JPEG、PNG、WebP，单张不超过 10 MB。</p>
@@ -743,6 +782,7 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
             <h3 class="article-image-section-title">正文配图</h3>
             <div v-for="(item, index) in paragraphImagePrompts" :key="item.id" class="article-paragraph-prompt">
               <p class="article-paragraph-image-title">配图 {{ index + 1 }}</p>
+              <input :ref="(element) => setParagraphImageInput(item.id, element as HTMLInputElement | null)" class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" :disabled="!article || saving || uploadingCover || !!uploadingParagraphBlockId || hasImageGenerationWork()" @change="uploadParagraphImage($event, item.id)" />
               <p class="article-paragraph-image-context" :title="item.text">{{ item.text }}</p>
               <button v-if="item.image_path" type="button" class="article-image-preview-link" :aria-label="'预览正文配图 ' + (index + 1)" @click="openImagePreview(articleImageUrl(item.image_path), '正文配图 ' + (index + 1))">
                 <img class="article-inline-image-preview" :src="articleImageUrl(item.image_path)" :alt="'正文配图 ' + (index + 1)" />
@@ -754,8 +794,9 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
               </div>
               <el-input :id="'paragraph-prompt-' + item.id" class="article-prompt-input" type="textarea" :rows="3" maxlength="4000" placeholder="描述这张配图的画面重点。" :model-value="item.image_prompt" @update:model-value="updateParagraphPrompt(item.id, $event)" />
               <p v-if="item.image_model_id" class="helper">{{ item.image_model_id }}</p>
-              <div class="article-image-actions">
-                <el-button type="primary" plain size="small" :disabled="!article || saving || uploadingCover || isImageGenerationActive('paragraph', item.id) || !!imageGenerationQueuePosition('paragraph', item.id)" :loading="isImageGenerationActive('paragraph', item.id)" @click="openImageModeDialog('paragraph', item.id)">{{ imageGenerationButtonText('paragraph', item.id, item.image_path ? '重新生成' : '生成配图') }}</el-button>
+              <div class="article-image-actions article-image-actions--paragraph">
+                <el-button type="primary" plain size="small" :disabled="!article || saving || uploadingCover || !!uploadingParagraphBlockId || isImageGenerationActive('paragraph', item.id) || !!imageGenerationQueuePosition('paragraph', item.id)" :loading="isImageGenerationActive('paragraph', item.id)" @click="openImageModeDialog('paragraph', item.id)">{{ imageGenerationButtonText('paragraph', item.id, item.image_path ? '重新生成' : '生成配图') }}</el-button>
+                <el-button size="small" :disabled="!article || saving || uploadingCover || !!uploadingParagraphBlockId || hasImageGenerationWork()" :loading="uploadingParagraphBlockId === item.id" @click="openParagraphImagePicker(item.id)">{{ uploadingParagraphBlockId === item.id ? '上传中…' : item.image_path ? '上传替换' : '上传图片' }}</el-button>
                 <el-button size="small" :disabled="!item.image_path || saving" @click="insertParagraphImage(item)">{{ isImageInserted(item.id) ? '更新正文图片' : '插入正文' }}</el-button>
               </div>
             </div>
@@ -870,6 +911,7 @@ watch(shouldProtectDraft, (shouldProtect, _, onCleanup) => {
 .article-image-preview-link:focus-visible { outline: 2px solid var(--pine); outline-offset: 2px; }
 .article-image-preview-link span { position: absolute; bottom: 6px; right: 6px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); color: var(--text-primary); font-size: var(--fs-caption); }
 .article-image-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }
+.article-image-actions--paragraph { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .article-image-actions--single { grid-template-columns: minmax(0, 1fr); margin-top: 2px; }
 .article-aside-card .helper { margin: 8px 0 0; color: var(--text-tertiary); font-size: var(--fs-body-sm); overflow-wrap: anywhere; }
 .article-prompt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0 2px; }

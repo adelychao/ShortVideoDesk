@@ -36,7 +36,9 @@ def is_windows_platform() -> bool:
 
 
 def browser_automation_paused() -> bool:
-    return False
+    if not _is_windows():
+        return False
+    return not _windows_browser_state_safe()
 
 
 def require_safe_browser(operation: str) -> None:
@@ -48,12 +50,48 @@ def require_safe_browser(operation: str) -> None:
 
 
 def _windows_browser_state_safe() -> bool:
-    return True
+    return _session_unlocked()
 
 
 def _session_unlocked() -> bool:
-    # zhw 2026-11-16 23:20:15：兼容已固定哈希的小红书登录组件，不再按 Windows 会话状态拦截。
-    return True
+    try:
+        class SessionInfo(ctypes.Structure):
+            _fields_ = [
+                ("level", wintypes.DWORD),
+                ("session_id", wintypes.DWORD),
+                ("state", wintypes.DWORD),
+                ("flags", wintypes.LONG),
+            ]
+
+        api = ctypes.WinDLL("wtsapi32", use_last_error=True)
+        query = api.WTSQuerySessionInformationW
+        query.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        query.restype = wintypes.BOOL
+        api.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+        pointer = ctypes.c_void_p()
+        size = wintypes.DWORD()
+        current_session = 0xFFFFFFFF
+        session_info_ex = 25
+        if not query(None, current_session, session_info_ex, ctypes.byref(pointer), ctypes.byref(size)):
+            return False
+        try:
+            if size.value < ctypes.sizeof(SessionInfo):
+                return False
+            info = ctypes.cast(pointer, ctypes.POINTER(SessionInfo)).contents
+            # WTSINFOEX starts with Level, followed immediately by the level-1
+            # fields SessionId, SessionState and SessionFlags. SessionFlags is
+            # 0 while locked and 1 while unlocked.
+            return info.level == 1 and info.state == 0 and info.flags == 1
+        finally:
+            api.WTSFreeMemory(pointer)
+    except (AttributeError, OSError, ValueError, ctypes.ArgumentError):
+        return False
 
 
 def _account_safe() -> bool:

@@ -17,6 +17,7 @@ interface StepOption {
 const props = withDefaults(defineProps<{
   modelValue: StepKind[]
   sourceKind?: 'url' | 'file'
+  platform?: string | null
   modelConfigured?: boolean
   textModelConfigured?: boolean
   asrModelConfigured?: boolean
@@ -55,18 +56,41 @@ const selectedScriptStyleIds = computed({
 const maxSelectedScriptStyles = 20
 const enabledScriptStyles = computed(() => props.scriptStyleTemplates.filter((item) => item.enabled))
 const scriptStyleSelectionRequired = computed(() => props.modelValue.includes('generate_scripts') && selectedScriptStyleIds.value.length === 0)
+const commentsSupported = computed(() => (
+  props.sourceKind === 'url'
+  && (!props.platform || ['douyin', 'bilibili'].includes(props.platform))
+))
 
 const options = computed<StepOption[]>(() => [
   { kind: 'download', title: '下载视频与封面', description: '保存经身份核对和完整解码校验的视频及封面。', available: props.sourceKind === 'url' },
   { kind: 'import', title: '导入本地媒体', description: '复制本机视频或音频到所选归档目录。', available: props.sourceKind === 'file' },
   { kind: 'transcribe', title: '语音转文字', description: '可选择本地或云端语音转写。', available: props.asrModelConfigured ?? props.modelConfigured },
   { kind: 'ocr', title: '字幕 OCR 与校对', description: '识别视频画面中的文字，可选择本地或云端方式。', available: (props.imageModelConfigured ?? props.textModelConfigured ?? props.modelConfigured) && props.mediaType !== 'audio', dependency: '需要视频画面' },
-  { kind: 'comments', title: '采集公开评论', description: '逐页采集公开主评论；默认不获取楼中楼回复。', available: props.sourceKind === 'url', dependency: '同时需要下载素材' },
-  { kind: 'analyze_comments', title: '筛选评论', description: '按真实点赞数排序全部已采集评论，再由模型分析主题、问题、分歧并精选。', available: (props.textModelConfigured ?? props.modelConfigured) && props.sourceKind === 'url', dependency: '需要评论采集' },
+  { kind: 'comments', title: '采集公开评论', description: '逐页采集公开主评论；默认不获取楼中楼回复。', available: commentsSupported.value, dependency: '同时需要下载素材' },
+  { kind: 'analyze_comments', title: '筛选评论', description: '按真实点赞数排序全部已采集评论，再由模型分析主题、问题、分歧并精选。', available: (props.textModelConfigured ?? props.modelConfigured) && commentsSupported.value, dependency: '需要评论采集' },
   { kind: 'knowledge_cards', title: '生成知识卡片', description: '提取观点、方法和案例；新卡片会等待人工审核，不自动写入 Vault。', available: props.textModelConfigured ?? props.modelConfigured, dependency: '需要转写' },
   { kind: 'generate_scripts', title: '生成多版口播稿', description: '根据原视频最终识别文案和所选风格模板生成可编辑草稿。', available: props.textModelConfigured ?? props.modelConfigured, dependency: '需要转写' },
   { kind: 'write_obsidian', title: '保存到知识库', description: '将选中的 Markdown 写入你指定的目录。', available: false, dependency: '需要生成 Markdown' },
 ])
+
+function optionHelpText(option: StepOption): string {
+  if (option.kind === 'transcribe' && props.transcriptionSummary) return props.transcriptionSummary
+  if (option.kind === 'ocr' && props.ocrSummary && props.mediaType !== 'audio') return props.ocrSummary
+  if (option.available) {
+    return option.dependency || (option.kind === 'download'
+      ? '无封面时生成首帧可选'
+      : option.kind === 'transcribe' ? '可在设置中选择转写方式' : '本地处理')
+  }
+  if (option.kind === 'write_obsidian') return '需审核后写入'
+  if (option.kind === 'import') return '本地文件'
+  if ((option.kind === 'comments' || option.kind === 'analyze_comments')
+    && props.sourceKind === 'url' && props.platform && !commentsSupported.value) {
+    return '仅抖音和 B 站支持评论采集'
+  }
+  if (option.kind === 'download' || option.kind === 'comments') return '链接任务'
+  if (option.kind === 'ocr' && props.mediaType === 'audio') return '需要视频画面'
+  return '需配置对应模型'
+}
 
 function toggle(kind: StepKind, event: Event): void {
   const option = options.value.find((item) => item.kind === kind)
@@ -124,7 +148,7 @@ function toggle(kind: StepKind, event: Event): void {
         <label class="option-main" :for="`step-${option.kind}`">
           <span class="option-title">{{ option.title }}</span>
           <span :id="`step-${option.kind}-help`" class="option-desc" :title="option.description">
-            {{ option.kind === 'transcribe' && props.transcriptionSummary ? props.transcriptionSummary : option.kind === 'ocr' && props.ocrSummary && props.mediaType !== 'audio' ? props.ocrSummary : !option.available ? (option.kind === 'write_obsidian' ? '需审核后写入' : option.kind === 'import' ? '本地文件' : option.kind === 'download' || option.kind === 'comments' ? '链接任务' : option.kind === 'ocr' && props.mediaType === 'audio' ? '需要视频画面' : '需配置对应模型') : option.dependency || (option.kind === 'download' ? '无封面时生成首帧可选' : option.kind === 'transcribe' ? '可在设置中选择转写方式' : '本地处理') }}
+            {{ optionHelpText(option) }}
           </span>
         </label>
         <button v-if="option.kind === 'transcribe' || option.kind === 'ocr' || (option.available && props.modelValue.includes(option.kind) && (option.kind === 'download' || option.kind === 'comments'))"

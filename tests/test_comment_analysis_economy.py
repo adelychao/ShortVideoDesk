@@ -3,6 +3,8 @@ import json
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from app.workbench.database import Database
 from app.workbench.models import CommentRecord
 from app.workbench.steps import analyze_comments_economy as economy
@@ -87,6 +89,59 @@ def test_incomplete_model_response_is_not_claimed_as_analyzed(tmp_path, monkeypa
     result = economy.analyze_economically(context, [make_comment(1, '怎么处理？')], options())
     assert not result.processed_comment_ids
     assert context._comment_analysis_coverage['unanalysed_original_count'] == 1
+
+
+@pytest.mark.parametrize('resume', [False, True])
+def test_incomplete_batch_keeps_valid_labels_and_only_requests_missing_items(tmp_path, monkeypatch, resume):
+    context = make_context(tmp_path, monkeypatch)
+    comments = [make_comment(1, '先分类我'), make_comment(2, '漏掉我')]
+    first_response = '{"items":[{"n":1,"labels":["V"]}]}'
+    if resume:
+        import hashlib
+        fingerprints = [hashlib.sha256(comment.text.encode('utf-8')).hexdigest() for comment in comments]
+        monkeypatch.setattr(economy, '_cached', lambda *_: {
+            (1, False): ({'fingerprints': fingerprints, 'raw_response_text': first_response}, 'first-raw'),
+        })
+    requests = []
+
+    def analyze(_prompt, data, _model, **_kwargs):
+        texts = [item['text'] for item in json.loads(data)]
+        requests.append(texts)
+        response = first_response if len(texts) == 2 else '{"items":[{"n":1,"labels":["Q"]}]}'
+        return SimpleNamespace(text=response)
+
+    monkeypatch.setattr(economy, 'authorized_model_call',
+                        lambda _context, **kwargs: kwargs['operation'](SimpleNamespace(analyze_text=analyze)))
+    result = economy.analyze_economically(context, comments, options(mode='full'))
+
+    assert requests == ([['漏掉我']] if resume else [['先分类我', '漏掉我'], ['漏掉我']])
+    assert {row.comment_id: row.labels for row in result.classifications} == {
+        'platform-1': ['经验与观点'], 'platform-2': ['观众提问'],
+    }
+    assert context._comment_analysis_coverage['completed_batches'] == 1
+    assert context._comment_analysis_coverage['stop_reason'] is None
+
+
+def test_partial_batch_retains_valid_labels_when_repair_exceeds_budget(tmp_path, monkeypatch):
+    from decimal import Decimal
+    context = make_context(tmp_path, monkeypatch)
+    usage = (0, 0, Decimal('0'), False)
+
+    def call(_context, **_kwargs):
+        nonlocal usage
+        assert usage[1] == 0
+        usage = (500, 1000, Decimal('0.001'), False)
+        return SimpleNamespace(text='{"items":[{"n":1,"labels":["V"]}]}')
+
+    monkeypatch.setattr(economy, '_spent', lambda *_: usage)
+    monkeypatch.setattr(economy, 'authorized_model_call', call)
+    comments = [make_comment(1, '先分类我'), make_comment(2, '漏掉我')]
+    result = economy.analyze_economically(context, comments, options(mode='full', token_budget=2000))
+
+    assert result.processed_comment_ids == ['platform-1']
+    assert context._comment_analysis_coverage['unanalysed_original_count'] == 1
+    assert context._comment_analysis_coverage['completed_batches'] == 0
+    assert '预算' in context._comment_analysis_coverage['stop_reason']
 
 
 def test_provider_sends_configured_output_limit(monkeypatch):

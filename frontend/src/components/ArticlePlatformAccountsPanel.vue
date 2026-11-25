@@ -18,7 +18,6 @@ const loading = ref(false)
 const refreshing = ref(false)
 const busyAction = ref('')
 const errorMessage = ref('')
-const successMessage = ref('')
 const selectedPlatformId = ref('wechat')
 const accountDialogOpen = ref(false)
 const accountFormElement = ref<HTMLFormElement | null>(null)
@@ -231,10 +230,8 @@ async function loginWeibo(): Promise<void> {
   if (busyAction.value) return
   busyAction.value = 'weibo_login'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
-    const result = await api.startWeiboLogin()
-    successMessage.value = result.message
+    await api.startWeiboLogin()
     await loadPlatforms()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -247,10 +244,8 @@ async function openCsdnEditor(): Promise<void> {
   if (busyAction.value) return
   busyAction.value = 'csdn_editor'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
-    const status = await api.openCsdnEditor()
-    successMessage.value = status.message
+    await api.openCsdnEditor()
     await loadPlatforms()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -264,11 +259,9 @@ async function clearCsdnSession(): Promise<void> {
   if (!await confirmAction('确定清除本机保存的 CSDN 登录状态？', '清除 CSDN 登录状态', '清除')) return
   busyAction.value = 'csdn_clear'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
     await api.clearCsdnSession()
     await loadPlatforms()
-    successMessage.value = '本机 CSDN 登录状态已清除。'
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
@@ -280,10 +273,8 @@ async function openToutiaoEditor(): Promise<void> {
   if (busyAction.value) return
   busyAction.value = 'toutiao_editor'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
-    const status = await api.openToutiaoEditor()
-    successMessage.value = status.message
+    await api.openToutiaoEditor()
     await loadPlatforms()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -297,11 +288,9 @@ async function clearToutiaoSession(): Promise<void> {
   if (!await confirmAction('确定清除本机保存的今日头条登录状态？', '清除今日头条登录状态', '清除')) return
   busyAction.value = 'toutiao_clear'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
     await api.clearToutiaoSession()
     await loadPlatforms()
-    successMessage.value = '本机今日头条登录状态已清除。'
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
@@ -327,7 +316,6 @@ async function showAccountDialog(platformId: string, account?: ArticlePlatformAc
   selectedPlatformId.value = platformId
   dialogPlatformId.value = platformId
   errorMessage.value = ''
-  successMessage.value = ''
   resetForm()
   if (account) {
     editingAccountId.value = account.id
@@ -407,10 +395,8 @@ async function saveAccount(): Promise<void> {
     return
   }
   const platformId = dialogPlatformId.value
-  const platformName = dialogPlatform.value?.name ?? '平台'
   busyAction.value = 'save'
   errorMessage.value = ''
-  successMessage.value = ''
   try {
     const status = editingAccountId.value
       ? await api.updateArticlePlatformAccount(
@@ -427,10 +413,6 @@ async function saveAccount(): Promise<void> {
           accountForm.secretValue,
         )
     replacePlatformStatus(status)
-    const savedName = status.accounts.find((item) => item.id === editingAccountId.value)?.name
-    successMessage.value = isWechatDialog.value
-      ? (savedName || accountForm.accountName || '公众号') + '的 AppID 与 AppSecret 已通过接口验证。'
-      : platformName + '账号凭据已保存。'
     closeAccountDialogAfterSave()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -448,11 +430,9 @@ async function verifyAccount(account: ArticlePlatformAccount): Promise<void> {
   if (busyAction.value) return
   busyAction.value = 'verify:' + account.id
   errorMessage.value = ''
-  successMessage.value = ''
   try {
     const status = await api.verifyWechatAccountCredentials(account.id)
     replacePlatformStatus(status)
-    successMessage.value = account.name + '的 AppID 与 AppSecret 已通过微信接口验证。'
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
@@ -466,10 +446,8 @@ async function removeAccount(platform: ArticlePlatformStatus, account: ArticlePl
   if (!await confirmAction('确定移除「' + account.name + '」' + credentialLabel + '？历史发布记录会保留。', '移除发布账号', '移除')) return
   busyAction.value = 'remove:' + account.id
   errorMessage.value = ''
-  successMessage.value = ''
   try {
     replacePlatformStatus(await api.removeArticlePlatformAccount(platform.id, account.id))
-    successMessage.value = platform.name + '账号「' + account.name + '」已移除。'
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
@@ -488,16 +466,13 @@ onMounted(() => {
     <div class="panel-head">
       <div>
         <h2 id="article-platform-account-title">文章发布账号</h2>
-        <p>按平台管理发布账号。敏感密钥保存在 Windows 凭据管理器，不会回显到页面。</p>
       </div>
       <ElButton text class="text-button" native-type="button" :disabled="loading || refreshing || Boolean(busyAction)" @click="refreshStatuses">
         {{ loading ? '读取中…' : refreshing ? '检查中…' : '刷新状态' }}
       </ElButton>
     </div>
 
-    <ElAlert class="info-box publishing-account-note" type="info" :closable="false" :show-icon="false" role="note" title="CSDN 和头条号使用本机隔离浏览器档案；知乎、百家号和小红书复用 SAU 登录会话。公众号凭据通过微信接口验证。" />
     <ElAlert v-if="errorMessage" class="info-box form-error" type="error" :closable="false" :show-icon="false" role="alert" :title="errorMessage" />
-    <ElAlert v-if="successMessage" class="info-box task-success" type="success" :closable="false" :show-icon="false" role="status" :title="successMessage" />
 
     <div v-if="loading && !platforms.length" class="publishing-loading" role="status">正在读取发布账号状态…</div>
 
@@ -963,7 +938,6 @@ onMounted(() => {
 .publishing-accounts { padding: 18px; }
 .publishing-accounts .panel-head { align-items: flex-start; margin-bottom: 14px; }
 .publishing-accounts .panel-head h2 { margin: 0; font-size: var(--fs-title-xl); font-weight: var(--fw-semibold); }
-.publishing-accounts .panel-head p { margin: 5px 0 0; color: var(--text-tertiary); font-size: var(--fs-body-sm); }
 .publishing-accounts :deep(.el-button) { margin-left: 0; font-family: inherit; font-weight: var(--fw-medium); }
 .publishing-accounts :deep(.el-button.button-small) { font-size: var(--fs-body-sm); }
 .publishing-accounts :deep(.el-button.text-button) { min-height: 36px; color: var(--pine); font-size: var(--fs-body); background: transparent; border-color: transparent; }
@@ -973,7 +947,6 @@ onMounted(() => {
 .publishing-accounts :deep(.el-link.button) { font-size: var(--fs-body-sm); font-weight: var(--fw-medium); }
 .publishing-accounts :deep(.el-alert.info-box) { align-items: flex-start; padding: 10px 12px; border-radius: 11px; font-size: var(--fs-body-sm); line-height: var(--lh-base); }
 .publishing-accounts :deep(.el-alert.info-box .el-alert__title) { font-size: inherit; font-weight: var(--fw-regular); line-height: inherit; }
-.publishing-account-note { margin-bottom: 12px; padding: 10px 12px; line-height: 1.5; font-size: var(--fs-body-sm); }
 .publishing-loading { padding: 26px; color: var(--muted); text-align: center; font-size: var(--fs-body-sm); }
 .publishing-layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 420px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 .publishing-platform-nav { display: flex; flex-direction: column; gap: 6px; padding: 15px 11px; border-right: 1px solid var(--line); background: var(--paper-2); }

@@ -36,6 +36,12 @@ _MAX_ARCHIVE_SEQUENCE = 1_000_000
 _ARCHIVE_SEQUENCE_LOCK = threading.Lock()
 _ARCHIVE_SEQUENCE_PATTERN = re.compile(r"^(\d{4,})_")
 _TOPIC_TAG_PATTERN = re.compile(r"(?<!\b[CcFf])#")
+_FACEBOOK_METRIC_PATTERN = r"\d[\d,.]*\s*(?:[KMB]\s*)?(?:views?|reactions?|likes?|comments?|shares?)"
+_FACEBOOK_ENGAGEMENT_PREFIX_PATTERN = re.compile(
+    rf"^\s*{_FACEBOOK_METRIC_PATTERN}(?:\s*[·•]\s*{_FACEBOOK_METRIC_PATTERN})+\s*\|\s*",
+    flags=re.IGNORECASE,
+)
+_MAX_ARCHIVE_TITLE_LENGTH = 48
 
 
 def safe_title(title: str, max_length: int = 80) -> str:
@@ -58,6 +64,28 @@ def safe_title(title: str, max_length: int = 80) -> str:
     if not cleaned:
         cleaned = "untitled"[:max_length]
     return cleaned
+
+
+def _archive_directory_title(title: str, platform: str) -> str:
+    """Create a concise directory label without changing the stored title."""
+    if not isinstance(title, str):
+        raise TypeError("title must be a string")
+
+    normalized = unicodedata.normalize("NFKC", title)
+    if platform.casefold() == "facebook":
+        normalized = _FACEBOOK_ENGAGEMENT_PREFIX_PATTERN.sub("", normalized, count=1)
+    title_without_topics = _TOPIC_TAG_PATTERN.split(normalized, maxsplit=1)[0].strip()
+    title_without_topics = re.sub(r"\s*\|\s*", " ", title_without_topics)
+    fallback = "未命名素材"
+    title_part = safe_title(
+        title_without_topics or fallback,
+        max_length=max(_MAX_ARCHIVE_TITLE_LENGTH, len(title_without_topics)),
+    )
+    if len(title_part) > _MAX_ARCHIVE_TITLE_LENGTH:
+        title_part = title_part[:_MAX_ARCHIVE_TITLE_LENGTH]
+        if " " in title_part:
+            title_part = title_part.rsplit(" ", maxsplit=1)[0]
+    return title_part.rstrip(" _.") or fallback
 
 
 def local_archive_time(value: datetime) -> datetime:
@@ -88,10 +116,7 @@ def archive_path(
             raise ValueError("archive date path is not a safe directory")
     _assert_contained(day_directory, resolved_root, strict=True)
 
-    if not isinstance(title, str):
-        raise TypeError("title must be a string")
-    title_without_topics = _TOPIC_TAG_PATTERN.split(unicodedata.normalize("NFKC", title), maxsplit=1)[0].strip()
-    title_part = safe_title(title_without_topics or "未命名素材").rstrip(" _.") or "未命名素材"
+    title_part = _archive_directory_title(title, platform)
     # 作者：zhw；日期：2026-10-30 00:30:01。工作台的发布流程在数据库写事务内调用此函数；线程锁覆盖同进程的其他调用。
     with _ARCHIVE_SEQUENCE_LOCK:
         highest = 0

@@ -153,6 +153,7 @@ const xiaohongshuCoverRatio = ref<'portrait' | 'landscape'>('portrait')
 const kuaishouCoverRatio = ref<'original' | 'landscape' | 'portrait' | 'square' | 'tall'>('original')
 const accountBusy = ref('')
 const accountCancelBusy = ref('')
+const accountCheckCancelBusy = ref('')
 const submitting = ref(false)
 const savingDraft = ref(false)
 const loading = ref(true)
@@ -173,6 +174,52 @@ const editBatchId = computed(() => typeof route.query.edit_batch_id === 'string'
 const editTargetId = computed(() => typeof route.query.edit_target_id === 'string' ? route.query.edit_target_id : '')
 const draftIdFromRoute = computed(() => typeof route.query.draft_id === 'string' ? route.query.draft_id : '')
 const isEditMode = computed(() => Boolean(editBatchId.value && editTargetId.value))
+const editAccount = computed(() => {
+  const target = editTarget.value
+  return target ? accounts.value.find((item) => item.id === target.account_id) ?? null : null
+})
+const editLoginAvailable = computed(() => {
+  const platformId = editAccount.value?.platform_id || editTarget.value?.platform_id || ''
+  return platforms.value.some((item) => item.id === platformId && item.login_available)
+})
+/* 编辑模式下，原账号若已退出/被停用（不在启用列表），合成一张卡片以便展示并支持“重新登录并恢复”。 */
+const hiddenEditAccount = computed<VideoPublishAccount | null>(() => {
+  const target = editTarget.value
+  if (!isEditMode.value || !target) return null
+  if (accounts.value.some((item) => item.id === target.account_id)) return null
+  return {
+    id: target.account_id,
+    platform_id: target.platform_id,
+    account_alias: target.account_alias,
+    display_name: target.account_name || target.account_alias || '原发布账号',
+    status: 'error',
+    message: '账号已退出登录或已停用，可重新登录恢复，或取消勾选改选其他账号',
+    checked_at: null,
+    enabled: true,
+  }
+})
+function isHiddenEditAccount(account: VideoPublishAccount): boolean {
+  return !!hiddenEditAccount.value && hiddenEditAccount.value.id === account.id
+}
+const renderAccountCards = computed<VideoPublishAccount[]>(() => {
+  const base = platformAccounts(activePlatform.value?.id || '')
+  const hidden = hiddenEditAccount.value
+  if (isEditMode.value && editTarget.value && hidden) return [hidden, ...base]
+  return base
+})
+const editExtras = computed(() => selectedAccounts.value.filter((item) => item.id !== editTarget.value?.account_id))
+const editFooterTitle = computed(() => {
+  const target = editTarget.value
+  if (!target) return '仅重试当前账号'
+  const count = selectedAccounts.value.length
+  if (count === 0) return '未选择可用账号'
+  if (count === 1 && selectedAccountIds.value.includes(target.account_id)) return '仅重试当前账号'
+  return `${count} 个账号目标`
+})
+function platformPanelActive(platformId: string): boolean {
+  if (platformSelectionCount(platformId) > 0) return true
+  return !!isEditMode.value && !!editTarget.value && editTarget.value.platform_id === platformId && selectedAccountIds.value.includes(editTarget.value.account_id)
+}
 const selectedAccounts = computed(() => accounts.value.filter((account) => selectedAccountIds.value.includes(account.id) && account.status === 'connected'))
 const selectedPlatforms = computed(() => [...new Set(selectedAccounts.value.map((account) => account.platform_id))])
 const showDouyinTopicPopover = computed(() => !douyinTopicPopoverDismissed.value && selectedAccounts.value.some(account => account.platform_id === 'douyin') && Boolean(douyinTopicKeyword.value) && (douyinTopicBusy.value || Boolean(douyinTopicError.value) || douyinTopicSearched.value))
@@ -185,8 +232,7 @@ const editTargetReady = computed(() => Boolean(
   isEditMode.value
   && editBatch.value?.media_available
   && editTarget.value
-  && ['failed', 'cancelled'].includes(editTarget.value.status)
-  && selectedAccounts.value.some((account) => account.id === editTarget.value?.account_id),
+  && ['failed', 'cancelled'].includes(editTarget.value.status),
 ))
 const visiblePlatforms = computed(() => isEditMode.value && editTarget.value
   ? platforms.value.filter((platform) => platform.id === editTarget.value?.platform_id)
@@ -1129,9 +1175,8 @@ async function initializeDraftForm(draftId: string): Promise<void> {
   Object.assign(poiSelections, form.poi_selections || {})
   Object.assign(poiQueries, form.poi_queries || {})
   Object.assign(poiCityCodes, form.poi_city_codes || {})
-  for (const [accountId, poi] of Object.entries(poiSelections)) {
-    if (poi && !poi.search_tab_code) poiSelections[accountId] = { ...poi, search_tab_code: 'local' }
-    if (poiCityCodes[accountId] && !['local', 'domestic', 'overseas'].includes(poiCityCodes[accountId])) poiCityCodes[accountId] = 'local'
+  for (const [accountId, scope] of Object.entries(poiCityCodes)) {
+    if (!/^(local|domestic|overseas|\d{6})$/.test(scope)) delete poiCityCodes[accountId]
   }
   Object.assign(douyinMetadata, form.douyin_metadata || {})
   for (const account of accounts.value.filter(item => item.platform_id === 'douyin' && selectedAccountIds.value.includes(item.id))) {
@@ -1213,9 +1258,6 @@ async function loadPage(): Promise<void> {
           throw new Error('该账号当前状态不支持编辑，请先停止任务或核实平台结果。')
         }
         if (!result.media_available) throw new Error('任务素材已清理或原视频不可用，请重新选择视频创建新任务。')
-        if (!accounts.value.some((account) => account.id === target.account_id && account.status === 'connected')) {
-          throw new Error('原发布账号当前未连接，请先检查登录状态后再编辑。')
-        }
         initializeEditForm(result, target)
         initializedEditKey = editKey
       } catch (cause) {
@@ -1291,17 +1333,18 @@ function initializeEditForm(batch: VideoPublishBatch, target: VideoPublishTarget
     override.allowDownload = typeof options.allow_download === 'boolean' ? options.allow_download : null
     const restoredTags = (options.douyin_creator_tags || []).map((tag) => ({ ...tag })) as DouyinCreatorTag[]
     if (options.location && options.location_id && options.location_address && (options.location_city_code || options.location_search_tab_code)) {
-      poiSelections[accountId] = {
+      const poi: VideoPublishPoi = {
         id: options.location_id,
         name: options.location,
         address: options.location_address,
         city_code: options.location_city_code || '',
         city_name: options.location_city_name || '',
-        search_tab_code: options.location_search_tab_code || 'local',
+        search_tab_code: options.location_search_tab_code,
       }
+      poiSelections[accountId] = poi
       poiQueries[accountId] = options.location
-      poiCityCodes[accountId] = options.location_search_tab_code || 'local'
-      restoredTags.push({ id: options.location_id, category: 'location', name: options.location, address: options.location_address, city_code: options.location_city_code || '', city_name: options.location_city_name || '', search_tab_code: options.location_search_tab_code || 'local' })
+      poiCityCodes[accountId] = poi.search_tab_code || poi.city_code
+      restoredTags.push({ ...poi, category: 'location' })
     } else {
       poiSelections[accountId] = null
       poiQueries[accountId] = ''
@@ -1382,9 +1425,13 @@ async function refreshAccounts(): Promise<void> {
     if (accountCancelBusy.value && accountById.get(accountCancelBusy.value)?.status !== 'login_in_progress') {
       accountCancelBusy.value = ''
     }
+    if (accountCheckCancelBusy.value && accountById.get(accountCheckCancelBusy.value)?.status !== 'checking') {
+      accountCheckCancelBusy.value = ''
+    }
+    const editAccountId = isEditMode.value ? editTarget.value?.account_id || '' : ''
     selectedAccountIds.value = selectedAccountIds.value.filter((id) => {
       const status = accountById.get(id)?.status
-      return status === 'connected' || status === 'checking'
+      return id === editAccountId || status === 'connected' || status === 'checking'
     })
     settleAccountPreflights(result.items)
     if (notice) error.value = notice.message
@@ -1527,18 +1574,41 @@ async function checkAccount(account: VideoPublishAccount): Promise<void> {
   }
 }
 
-async function logoutAccount(account: VideoPublishAccount): Promise<void> {
-  if (accountBusy.value) return
-  if (!await confirmWithElementPlus(`退出并移除「${videoAccountName(account)}」？本机登录状态将被清除，平台账号及发布历史会保留。`, '确认退出并移除账号')) return
-  accountBusy.value = account.id
+async function cancelAccountCheck(account: VideoPublishAccount): Promise<void> {
+  if (accountCheckCancelBusy.value) return
+  accountCheckCancelBusy.value = account.id
+  error.value = ''
   try {
-    await api.logoutVideoPublishAccount(account.id)
-    accounts.value = accounts.value.filter((item) => item.id !== account.id)
-    selectedAccountIds.value = selectedAccountIds.value.filter((id) => id !== account.id)
+    await api.cancelVideoPublishAccountCheck(account.id)
+    showStatusMessage('正在取消检查，请稍候。', 'info')
+    // 立即移除预检标记，避免取消后刷新时被自动重新勾选。
+    pendingAccountPreflightIds.delete(account.id)
+    startAccountPolling()
+    await refreshAccounts()
+  } catch (cause) {
+    error.value = safeError(cause)
+    await refreshAccounts()
+    accountCheckCancelBusy.value = ''
+  }
+}
+
+/* 编辑模式下原账号已退出/被隐藏（不在启用列表）时，先恢复账号再打开登录窗口。 */
+const editReloginBusy = ref(false)
+
+async function restoreEditAccount(): Promise<void> {
+  const target = editTarget.value
+  if (!target || editReloginBusy.value) return
+  editReloginBusy.value = true
+  error.value = ''
+  try {
+    const account = await api.reloginVideoPublishTarget(target.id)
+    accounts.value = [...accounts.value.filter((item) => item.id !== account.id), account]
+    showStatusMessage(['bilibili', 'wechat_channels'].includes(account.platform_id) ? '正在准备登录二维码，扫码登录后即可保存修改并重试。' : '正在打开登录窗口，完成登录后即可保存修改并重试。', 'info')
+    startAccountPolling()
   } catch (cause) {
     error.value = safeError(cause)
   } finally {
-    accountBusy.value = ''
+    editReloginBusy.value = false
   }
 }
 
@@ -1546,10 +1616,16 @@ async function toggleAccount(account: VideoPublishAccount, checked: boolean): Pr
   const wasSelected = selectedAccountIds.value.includes(account.id)
   if (wasSelected) {
     selectedAccountIds.value = selectedAccountIds.value.filter((id) => id !== account.id)
+    // 取消勾选时同步移除预检标记，避免检查完成后又被自动勾选回来。
+    pendingAccountPreflightIds.delete(account.id)
     return
   }
   if (!checked) return
-  if (account.status !== 'connected' || pendingAccountPreflightIds.has(account.id)) return
+  if (pendingAccountPreflightIds.has(account.id)) return
+  if (account.status !== 'connected') {
+    showStatusMessage(`「${videoAccountName(account)}」当前未连接，请先重新登录后再选择。`, 'info')
+    return
+  }
 
   if (hasRecentSuccessfulAccountCheck(account)) {
     selectedAccountIds.value = [...selectedAccountIds.value, account.id]
@@ -1756,10 +1832,10 @@ function metadataForAccount(accountId: string): DouyinMetadataDraft {
 function updateDouyinMetadata(accountId: string, value: DouyinMetadataDraft): void {
   douyinMetadata[accountId] = value
   const poi = value.creator_tags.find(tag => tag.category === 'location')
-  if (poi && poi.address && poi.search_tab_code && poi.city_name !== undefined) {
-    poiSelections[accountId] = { id: poi.id, name: poi.name, address: poi.address, city_code: poi.city_code || '', city_name: poi.city_name, search_tab_code: poi.search_tab_code }
+  if (poi?.address && (poi.city_code || poi.search_tab_code)) {
+    poiSelections[accountId] = { id: poi.id, name: poi.name, address: poi.address, city_code: poi.city_code || '', city_name: poi.city_name || '', search_tab_code: poi.search_tab_code }
     poiQueries[accountId] = value.queries.location || poi.name
-    poiCityCodes[accountId] = poi.search_tab_code
+    poiCityCodes[accountId] = poi.search_tab_code || poi.city_code || ''
   } else {
     poiSelections[accountId] = null
     poiQueries[accountId] = value.queries.location || ''
@@ -2062,7 +2138,7 @@ function optionsFor(platformId: string, accountId: string): {
       options.location_address = poi.address
       if (poi.city_code) options.location_city_code = poi.city_code
       if (poi.city_name) options.location_city_name = poi.city_name
-      options.location_search_tab_code = poi.search_tab_code || 'local'
+      if (poi.search_tab_code) options.location_search_tab_code = poi.search_tab_code
     }
     const metadata = douyinMetadata[accountId]
     const creatorTags = metadata?.creator_tags.filter(tag => tag.category !== 'location') || []
@@ -2163,7 +2239,7 @@ async function submitBatch(): Promise<void> {
   const destinationText = selectedAccounts.value.map((account) => `${platformName(account.platform_id)} · ${videoAccountName(account)}`).join('、')
   const when = scheduleMode.value === 'scheduled' ? `\n计划发布时间：\n${selectedPlatforms.value.map(id => `${platformName(id)}：${platformSchedule(id).replace('T', ' ')}`).join('\n')}` : '\n发布时间：立即发布'
   const confirmText = isEditMode.value
-    ? `确认修改并重新发送到「${destinationText}」？\n原任务：${editBatch.value?.title || ''}\n视频：${activeMediaName.value}${when}\n原处理记录会保留，只重新排队这个账号。`
+    ? `确认修改并重新发送到「${destinationText}」？\n原任务：${editBatch.value?.title || ''}\n视频：${activeMediaName.value}${when}\n${editExtras.value.length ? '新勾选的账号会在本任务下新增发布目标；' : ''}已勾选的原账号会更新设置并重新排队，未勾选账号的发布记录保持不变。`
     : '确认创建发布任务？'
   if (!await confirmWithElementPlus(confirmText, isEditMode.value ? '确认修改并重新发送' : '确认创建视频发布任务')) return
   submitting.value = true
@@ -2171,13 +2247,25 @@ async function submitBatch(): Promise<void> {
   try {
     if (isEditMode.value) {
       if (!editTarget.value || !editBatch.value) throw new Error('原任务信息已失效，请返回详情页重新打开编辑。')
-      const account = selectedAccounts.value.find((item) => item.id === editTarget.value?.account_id)
-      if (!account) throw new Error('原发布账号当前不可用，请检查账号登录状态。')
-      const options = optionsFor(account.platform_id, account.id) || {}
-      options.title = title.value.trim()
-      options.description = description.value
-      options.tags = tags.value.slice(0, MAX_VIDEO_TAGS)
-      const updated = await api.editVideoPublishTarget(editTarget.value.id, { options, confirmed: true })
+      const originalId = editTarget.value.account_id
+      const originalSelected = selectedAccountIds.value.includes(originalId)
+      const original = selectedAccounts.value.find((item) => item.id === originalId)
+      if (originalSelected && !original) throw new Error('原发布账号已退出登录或未连接，请先重新登录恢复，或取消勾选并改选其他已连接账号。')
+      if (originalSelected && original && original.status !== 'connected') throw new Error('原发布账号尚未连接，请先重新登录后再保存。')
+      if (!selectedAccounts.value.length) throw new Error('请至少勾选一个已连接的账号后再保存。')
+      const accounts_ = selectedAccounts.value.filter((item) => item.platform_id === editTarget.value?.platform_id)
+      let updated: VideoPublishBatch | null = null
+      for (const account of accounts_) {
+        const options = { ...(optionsFor(account.platform_id, account.id) || {}) }
+        options.title = title.value.trim()
+        options.description = description.value
+        options.tags = tags.value.slice(0, MAX_VIDEO_TAGS)
+        if (account.id === originalId) {
+          updated = await api.editVideoPublishTarget(editTarget.value.id, { options, confirmed: true })
+        } else {
+          updated = await api.addVideoPublishTarget({ batch_id: editBatch.value.id, source_target_id: editTarget.value.id, account_id: account.id, options, confirmed: true })
+        }
+      }
       for (const key of Object.keys(coverUploads)) {
         if (coverPreviews[key]) URL.revokeObjectURL(coverPreviews[key])
         coverPreviews[key] = ''
@@ -2185,7 +2273,7 @@ async function submitBatch(): Promise<void> {
         coverDimensions[key] = null
       }
       initializedEditKey = ''
-      await router.push({ name: 'video-publish-detail', params: { batchId: updated.id } })
+      await router.push({ name: 'video-publish-detail', params: { batchId: (updated || editBatch.value).id } })
       return
     }
     const draftId = activeDraftId.value
@@ -2468,24 +2556,20 @@ onBeforeUnmount(() => {
         <div class="video-platform-accounts-scroll">
           <section class="video-settings-section" aria-labelledby="video-platform-accounts-heading">
             <div class="video-settings-section-heading"><h3 id="video-platform-accounts-heading">发布账号</h3><span>{{ platformSelectionCount(activePlatform.id) }} / {{ platformAccounts(activePlatform.id).length }} 个已选</span></div>
-            <div v-if="isEditMode && editTarget" class="video-edit-account-lock">
-              <PlatformLogo class="video-platform-mark" :platform-id="editTarget.platform_id" :name="platformName(editTarget.platform_id)" />
-              <span><strong>{{ editTarget.account_name || editTarget.account_alias || '当前发布账号' }}</strong><small>仅修改该账号，其他平台账号及发布记录不受影响</small></span>
-              <span class="video-edit-media-lock">账号固定</span>
-            </div>
-            <div v-else-if="platformAccounts(activePlatform.id).length" class="video-account-list">
-              <ElCard v-for="account in platformAccounts(activePlatform.id)" :key="account.id" class="video-account-entry" :class="{ 'is-picked': selectedAccountIds.includes(account.id), 'is-checking': isAccountChecking(account) }" shadow="never">
+            <div v-if="renderAccountCards.length" class="video-account-list">
+              <ElCard v-for="account in renderAccountCards" :key="account.id" class="video-account-entry" :class="{ 'is-picked': selectedAccountIds.includes(account.id), 'is-checking': isAccountChecking(account) }" shadow="never">
                 <div class="video-account-option">
                   <div class="video-account-choice">
-                    <ElCheckbox class="video-account-checkbox" :model-value="selectedAccountIds.includes(account.id)" :aria-label="`选择账号 ${videoAccountName(account)}`" :disabled="account.status !== 'connected' || pendingAccountPreflightIds.has(account.id) || !sau?.configured" @change="toggleAccount(account, $event === true)" />
+                    <ElCheckbox class="video-account-checkbox" :model-value="selectedAccountIds.includes(account.id)" :aria-label="`选择账号 ${videoAccountName(account)}`" :disabled="pendingAccountPreflightIds.has(account.id)" @change="toggleAccount(account, $event === true)" />
                     <ElAvatar v-if="account.avatar_url" class="video-account-avatar" :src="account.avatar_url" :size="36" fit="cover" />
-                    <span class="video-account-label"><strong>{{ videoAccountName(account) }}</strong><small><template v-if="isAccountChecking(account)"><el-icon class="is-loading"><Loading /></el-icon><span class="account-status-checking">正在检查</span></template><template v-else-if="justConnectedIds.has(account.id)"><el-icon class="account-status-ok"><CircleCheck /></el-icon><span>已连接</span></template><template v-else>{{ accountStatusLabel[account.status] || account.status }}</template></small></span>
+                    <span class="video-account-label"><strong>{{ videoAccountName(account) }}<small v-if="isEditMode && editTarget?.account_id === account.id && isHiddenEditAccount(account)" class="video-account-alias">{{ account.account_alias }}</small></strong><small><template v-if="isAccountChecking(account)"><el-icon class="is-loading"><Loading /></el-icon><span class="account-status-checking">正在检查</span></template><template v-else-if="justConnectedIds.has(account.id)"><el-icon class="account-status-ok"><CircleCheck /></el-icon><span>已连接</span></template><template v-else>{{ accountStatusLabel[account.status] || account.status }}</template></small></span>
                   </div>
                   <div class="video-account-actions">
-                    <ElButton v-if="account.status === 'connected' || account.status === 'error'" class="text-button" native-type="button" :disabled="accountBusy === account.id || pendingAccountPreflightIds.has(account.id)" @click="checkAccount(account)"><template v-if="accountCheckBusy === account.id"><el-icon class="is-loading"><Loading /></el-icon>检查中…</template><template v-else>{{ account.status === 'error' ? '重新检查' : '检查' }}</template></ElButton>
-                    <ElButton v-if="account.status !== 'connected' && account.status !== 'login_in_progress'" class="text-button" native-type="button" :disabled="accountBusy === account.id || account.status === 'checking' || pendingAccountPreflightIds.has(account.id) || !sau?.configured || !activePlatform.login_available" @click="startLogin(account)"><template v-if="account.status === 'checking'"><el-icon class="is-loading"><Loading /></el-icon>正在检查</template><template v-else>{{ account.status === 'expired' || account.status === 'error' ? '重新登录' : '登录' }}</template></ElButton>
+                    <ElButton v-if="isHiddenEditAccount(account)" class="button button-secondary button-small" native-type="button" :disabled="!sau?.configured || !editLoginAvailable || editReloginBusy" :title="editLoginAvailable ? undefined : '该平台暂不支持重新登录，请到账号管理处理'" @click="restoreEditAccount">{{ editReloginBusy ? '正在恢复…' : '重新登录并恢复' }}</ElButton>
+                    <ElButton v-else-if="isAccountChecking(account)" class="text-button" native-type="button" :disabled="account.status !== 'checking' || accountCheckCancelBusy === account.id" @click="cancelAccountCheck(account)"><template v-if="accountCheckCancelBusy === account.id"><el-icon class="is-loading"><Loading /></el-icon>正在取消…</template><template v-else><el-icon class="is-loading"><Loading /></el-icon>取消检查</template></ElButton>
+                    <ElButton v-else-if="account.status === 'connected' || account.status === 'error'" class="text-button" native-type="button" :disabled="accountBusy === account.id || pendingAccountPreflightIds.has(account.id)" @click="checkAccount(account)">{{ account.status === 'error' ? '重新检查' : '检查' }}</ElButton>
+                    <ElButton v-if="!isHiddenEditAccount(account) && !isAccountChecking(account) && account.status !== 'connected' && account.status !== 'login_in_progress'" class="text-button" native-type="button" :disabled="accountBusy === account.id || pendingAccountPreflightIds.has(account.id) || !sau?.configured || !activePlatform.login_available" @click="startLogin(account)">{{ account.status === 'expired' || account.status === 'error' ? '重新登录' : '登录' }}</ElButton>
                     <ElButton v-if="account.status === 'login_in_progress'" class="text-button" native-type="button" :disabled="!!accountCancelBusy" @click="cancelAccountLogin(account)">{{ accountCancelBusy === account.id ? '正在取消…' : '取消登录' }}</ElButton>
-                    <ElButton class="video-account-remove" native-type="button" :disabled="!!accountBusy || account.status === 'checking' || account.status === 'login_in_progress'" @click="logoutAccount(account)">{{ account.status === 'connected' ? '退出登录' : '移除账号' }}</ElButton>
                   </div>
                 </div>
                 <p v-if="account.duplicate_notice || (['error', 'expired'].includes(account.status) && account.message) || (account.status === 'not_connected' && account.message === '登录已取消。')" class="video-account-message" role="status">{{ account.duplicate_notice || account.message }}</p>
@@ -2511,8 +2595,8 @@ onBeforeUnmount(() => {
           </section>
         </div>
 
-        <div :key="`${activePlatform.id}-${platformSelectionCount(activePlatform.id) > 0}`" class="video-platform-settings-scroll">
-          <section v-if="platformSelectionCount(activePlatform.id) > 0" class="video-settings-section video-platform-tuning" aria-labelledby="video-platform-fields-heading">
+        <div :key="`${activePlatform.id}-${platformPanelActive(activePlatform.id)}`" class="video-platform-settings-scroll">
+          <section v-if="platformPanelActive(activePlatform.id)" class="video-settings-section video-platform-tuning" aria-labelledby="video-platform-fields-heading">
             <div class="video-settings-section-heading"><h3 id="video-platform-fields-heading">{{ activePlatform.name }}发布设置</h3><span>仅作用于当前平台</span></div>
             <section class="video-platform-cover-settings" :aria-labelledby="`video-${activePlatform.id}-cover-heading`">
               <div class="video-settings-section-heading"><h4 :id="`video-${activePlatform.id}-cover-heading`">视频封面</h4><span>{{ coverSlots(activePlatform.id).length > 1 ? '按平台比例设置' : '使用通用封面或单独裁剪' }}</span></div>
@@ -2720,10 +2804,10 @@ onBeforeUnmount(() => {
     </div>
 
     <footer v-if="hasPublishMedia && !loading" class="video-create-footer">
-      <div><strong>{{ isEditMode ? '仅重试当前账号' : `${readyAccountCount} 个账号目标` }}</strong><span>{{ activeMediaName || '尚未选择视频素材' }} · {{ scheduleMode === 'scheduled' ? (scheduleAt ? `定时 ${scheduleAt.replace('T', ' ')}${!isEditMode && selectedPlatforms.some(id => hasPlatformSchedule(id)) ? '（部分平台单独设置）' : ''}` : '待选择定时时间') : '立即发布' }}</span></div>
+      <div><strong>{{ isEditMode ? editFooterTitle : `${readyAccountCount} 个账号目标` }}</strong><span>{{ activeMediaName || '尚未选择视频素材' }} · {{ scheduleMode === 'scheduled' ? (scheduleAt ? `定时 ${scheduleAt.replace('T', ' ')}${!isEditMode && selectedPlatforms.some(id => hasPlatformSchedule(id)) ? '（部分平台单独设置）' : ''}` : '待选择定时时间') : '立即发布' }}</span></div>
       <div class="video-create-footer-actions">
         <div v-if="error" :key="footerErrorAnimationKey" class="video-create-footer-error" role="alert">{{ error }}</div>
-        <div class="video-create-footer-buttons"><ElButton class="button button-secondary" native-type="button" :disabled="submitting || savingDraft" @click="cancel">{{ isEditMode ? '返回任务详情' : '取消' }}</ElButton><ElButton v-if="!isEditMode" class="button button-secondary" native-type="button" :disabled="submitting || savingDraft || !!coverUploading" @click="saveDraft">{{ savingDraft ? '正在保存…' : activeDraftId ? '更新草稿' : '保存草稿' }}</ElButton><ElButton class="button" native-type="button" :disabled="submitting || savingDraft || !sau?.configured" @click="submitBatch">{{ submitting ? '正在创建…' : isEditMode ? '保存修改并重试' : '创建发布任务' }}</ElButton></div>
+        <div class="video-create-footer-buttons"><ElButton class="button button-secondary" native-type="button" :disabled="submitting || savingDraft" @click="cancel">{{ isEditMode ? '返回任务详情' : '取消' }}</ElButton><ElButton v-if="!isEditMode" class="button button-secondary" native-type="button" :disabled="submitting || savingDraft || !!coverUploading" @click="saveDraft">{{ savingDraft ? '正在保存…' : activeDraftId ? '更新草稿' : '保存草稿' }}</ElButton><ElButton class="button" native-type="button" :disabled="submitting || savingDraft || !sau?.configured || (isEditMode && !selectedAccounts.length)" :title="isEditMode && !selectedAccounts.length ? '请至少勾选一个已连接的账号' : undefined" @click="submitBatch">{{ submitting ? (isEditMode ? '正在提交…' : '正在创建…') : isEditMode ? (editExtras.length ? '保存并发布到所选账号' : '保存修改并重试') : '创建发布任务' }}</ElButton></div>
       </div>
     </footer>
 
@@ -2902,10 +2986,7 @@ onBeforeUnmount(() => {
 .video-cover-actions .text-button { font-size: var(--fs-caption); }
 .video-cover-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 .video-account-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 10px; }
-.video-edit-account-lock { display: flex; align-items: center; gap: 10px; min-height: 58px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #f7f9fb; }
-.video-edit-account-lock > span:nth-child(2) { display: grid; flex: 1; min-width: 0; gap: 3px; }
-.video-edit-account-lock strong { overflow: hidden; color: var(--text-primary); font-size: var(--fs-body-sm); font-weight: var(--fw-semibold); text-overflow: ellipsis; white-space: nowrap; }
-.video-edit-account-lock small { color: var(--muted); font-size: var(--fs-caption); }
+.video-account-alias { margin-left: 6px; color: var(--text-tertiary); font-size: var(--fs-caption); font-weight: var(--fw-regular); }
 .video-account-entry { display: grid; align-content: start; gap: 9px; min-width: 0; min-height: 92px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: #fff; box-shadow: 0 1px 3px rgb(24 39 75 / 4%); }
 .video-account-entry.is-picked { border-color: #94b5f1; background: #f8fbff; }
 .video-account-option { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; gap: 9px; min-height: 0; }
@@ -2940,9 +3021,7 @@ onBeforeUnmount(() => {
 .video-login-qr-image img { display: none; width: 132px; height: 132px; object-fit: contain; }
 .video-login-qr-image img.is-ready { display: block; }
 .video-login-qr-image span { padding: 12px; color: var(--muted); font-size: var(--fs-caption); text-align: center; }
-.video-account-remove { flex: 0 0 auto; border: 0; background: transparent; color: #9b8279; font-size: var(--fs-body-sm); cursor: pointer; }
 .video-account-message { margin: 3px 0 8px; color: var(--danger); font-size: var(--fs-body-sm); line-height: 1.5; }
-.video-account-remove:hover { background: #f4e9e5; color: #964f43; }
 .video-platform-tuning { gap: 10px; }
 .video-platform-tuning .video-form-field { margin: 0; }
 .douyin-section { display: grid; gap: 20px; margin: 4px -8px 0; padding: 20px 16px; border-radius: 8px; background: #f9f9fa; }

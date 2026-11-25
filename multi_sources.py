@@ -10,7 +10,8 @@ from app.platforms import extract_url
 PLATFORMS = {
     "douyin": "抖音", "xiaohongshu": "小红书",
     "bilibili": "B站", "weibo": "微博", "tiktok": "TikTok",
-    "instagram": "Instagram", "twitter": "X / Twitter", "reddit": "Reddit",
+    "instagram": "Instagram", "facebook": "Facebook",
+    "twitter": "X / Twitter", "reddit": "Reddit", "youtube": "YouTube",
 }
 
 
@@ -45,13 +46,34 @@ def parse_source(value: str) -> Source:
     if len(url) > 4096:
         raise ValueError("链接过长")
     host, path = p.hostname, p.path
+    canonical_path = path.rstrip("/") or "/"
     short_hosts = {
         "v.douyin.com": "douyin", "xhslink.com": "xiaohongshu",
         "b23.tv": "bilibili",
         "vm.tiktok.com": "tiktok", "vt.tiktok.com": "tiktok",
+        "fb.watch": "facebook",
     }
     if host in short_hosts and re.fullmatch(r"/(?:[A-Za-z0-9_-]+/){0,2}[A-Za-z0-9_-]+/?", path):
         return Source(short_hosts[host], url, None, True)
+    youtube_hosts = {"youtube.com", "www.youtube.com", "m.youtube.com"}
+    if host == "youtu.be" and re.fullmatch(r"/[A-Za-z0-9_-]{11}/?", path):
+        return Source("youtube", url, path.strip("/"))
+    if host in youtube_hosts:
+        if canonical_path == "/watch":
+            ids = parse_qs(p.query, keep_blank_values=True).get("v", [])
+            if len(ids) == 1 and re.fullmatch(r"[A-Za-z0-9_-]{11}", ids[0]):
+                return Source("youtube", url, ids[0])
+        match = re.fullmatch(r"/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})", canonical_path)
+        if match:
+            return Source("youtube", url, match.group(1))
+    facebook_hosts = {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}
+    if host in facebook_hosts:
+        if canonical_path in {"/watch", "/video.php"}:
+            ids = parse_qs(p.query, keep_blank_values=True).get("v", [])
+            if len(ids) == 1 and re.fullmatch(r"[0-9]{5,30}", ids[0]):
+                return Source("facebook", url, ids[0])
+        if re.fullmatch(r"/share/v/[A-Za-z0-9_-]{5,100}", canonical_path):
+            return Source("facebook", url, None, True)
     patterns = [
         ("douyin", {"www.douyin.com", "www.iesdouyin.com"}, r"/(?:share/)?video/([0-9]{1,30})/?"),
         ("xiaohongshu", {"www.xiaohongshu.com", "xiaohongshu.com"}, r"/(?:explore|discovery/item)/([0-9a-fA-F]{24})/?"),
@@ -60,6 +82,7 @@ def parse_source(value: str) -> Source:
         ("weibo", {"m.weibo.cn"}, r"/(?:status|detail)/([A-Za-z0-9]+)/?"),
         ("tiktok", {"www.tiktok.com", "tiktok.com", "m.tiktok.com"}, r"/@[^/\s]+/video/([0-9]{1,30})/?"),
         ("instagram", {"www.instagram.com", "instagram.com"}, r"/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)/?"),
+        ("facebook", facebook_hosts, r"/(?:reel/([0-9]{5,30})|(?:[^/]+/)?videos/([0-9]{5,30}))(?:/[^/]+)?/?"),
         ("twitter", {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}, r"/(?:[^/]+|i/web)/status/([0-9]+)(?:/video/[0-9]+)?/?"),
         ("reddit", {"www.reddit.com", "reddit.com", "old.reddit.com"}, r"/(?:r/[^/]+/|user/[^/]+/)?comments/([A-Za-z0-9]+)(?:/[^/]+)?/?"),
     ]
@@ -70,7 +93,8 @@ def parse_source(value: str) -> Source:
                 part = parse_qs(p.query)["p"]
                 if len(part) != 1 or not part[0].isdigit() or not 1 <= int(part[0]) <= 10000:
                     raise ValueError("B站分P参数必须是 1 到 10000 的整数")
-            return Source(platform, url, match.group(1))
+            media_id = next((value for value in match.groups() if value is not None), None)
+            return Source(platform, url, media_id)
     if host in {"www.tiktok.com", "tiktok.com"} and re.fullmatch(r"/t/[A-Za-z0-9_-]+/?", path):
         return Source("tiktok", url, None, True)
     if host == "redd.it" and re.fullmatch(r"/[A-Za-z0-9]+/?", path):
@@ -155,15 +179,15 @@ def classify_failure(exc: Exception) -> tuple[str, str]:
     text = str(exc).lower()
     code = getattr(exc, "issue_code", "")
     code = getattr(code, "value", code)
-    if any(w in text for w in ("ssl", "tls", "certificate", "timed out", "timeout", "connection", "err_name_not_resolved")) or code == "network_error":
-        return "network_error", "网络或 TLS 连接失败；未更改代理、证书校验或个人会话"
+    if any(w in text for w in ("ssl", "tls", "certificate", "timed out", "timeout", "connection", "err_name_not_resolved", "incomplete read", "remote end closed", "broken pipe", "http error 408", "http error 416", "http error 5")) or code == "network_error":
+        return "network_error", "视频流连接或传输中断；请检查网络状态后重试"
     if any(w in text for w in ("ip存在风险", "300012", "安全限制", "security check")) or code == "security_blocked":
         return "security_blocked", "平台限制了当前网络的匿名访问，未继续尝试绕过验证"
     if code == "rate_limited" or any(w in text for w in ("429", "rate limit", "too many requests")):
         return "rate_limited", "平台暂时限制请求频率，请稍后重试"
     if code in {"login_required", "verification_required"} or any(w in text for w in ("authentication is required", "login required", "log in", "sign in", "captcha", "cookies")):
         return "authentication_required", "平台要求登录、访客凭据或验证；当前工具仅使用匿名会话"
-    if any(w in text for w in ("404", "not found", "unavailable", "removed", "deleted")):
+    if any(w in text for w in ("404", "410", "451", "not found", "unavailable", "removed", "deleted")):
         return "content_unavailable", "该作品不可用，可能已删除、受地区限制或不允许匿名访问"
     if "ffprobe" in text:
         if "未检测到" in text or "not found" in text or "no such file" in text:

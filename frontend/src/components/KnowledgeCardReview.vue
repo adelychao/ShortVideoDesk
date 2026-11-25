@@ -1,12 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { ElButton, ElDialog } from 'element-plus'
-import 'element-plus/es/components/button/style/css'
-import 'element-plus/es/components/dialog/style/css'
 import { ApiError, api } from '../api/client'
 import type { ObsidianOutputDirectory, TaskArtifact } from '../api/types'
 import MarkdownPreview from './MarkdownPreview.vue'
 import MarkdownRichTextEditor from './MarkdownRichTextEditor.vue'
+import VaultLibraryDialog from './VaultLibraryDialog.vue'
 
 const props = defineProps<{ artifacts: TaskArtifact[] }>()
 const emit = defineEmits<{ (event: 'updated'): void }>()
@@ -23,7 +21,6 @@ const editing = ref(false)
 let loadSequence = 0
 
 const libraryDialogOpen = ref(false)
-const libraryChoice = ref('')
 const libraryOptions = ref<ObsidianOutputDirectory[]>([])
 let libraryChoiceResolve: ((choice: string | null) => void) | null = null
 
@@ -144,20 +141,17 @@ async function saveRevision(): Promise<void> {
 
 function chooseLibrary(options: ObsidianOutputDirectory[]): Promise<string | null> {
   libraryOptions.value = options
-  libraryChoice.value = options[0]?.name ?? ''
   libraryDialogOpen.value = true
   return new Promise((resolve) => {
     libraryChoiceResolve = resolve
   })
 }
 
-function confirmLibraryChoice(): void {
-  const choice = libraryChoice.value
-  if (!choice) return
+function confirmLibraryChoice(libraryName: string): void {
   const resolve = libraryChoiceResolve
   libraryChoiceResolve = null
   libraryDialogOpen.value = false
-  resolve?.(choice)
+  resolve?.(libraryName)
 }
 
 function cancelLibraryChoice(): void {
@@ -165,11 +159,6 @@ function cancelLibraryChoice(): void {
   libraryChoiceResolve = null
   libraryDialogOpen.value = false
   resolve?.(null)
-}
-
-function handleLibraryDialogClose(): void {
-  // 关闭按钮 / ESC / 点击遮罩也视为取消选择。
-  if (libraryChoiceResolve) cancelLibraryChoice()
 }
 
 async function resolveApprovalLibrary(): Promise<{ cancelled: boolean; libraryName: string | null }> {
@@ -286,29 +275,14 @@ watch(cards, (items) => {
     <p v-if="error" class="info-box form-error" role="alert">{{ error }}</p>
     <p v-if="message" class="helper" role="status">{{ message }}</p>
 
-    <el-dialog
-      v-model="libraryDialogOpen"
-      class="card-library-dialog"
-      title="选择要写入的知识库"
-      width="520"
-      :teleported="false"
-      :close-on-click-modal="false"
-      @close="handleLibraryDialogClose"
-    >
-      <p class="library-dialog-hint">这张知识卡审核通过后将写入所选目录。</p>
-      <fieldset class="library-choice-list">
-        <legend class="library-choice-legend">知识库目录</legend>
-        <label v-for="library in libraryOptions" :key="library.name" class="library-choice-item">
-          <input v-model="libraryChoice" type="radio" name="card-vault-library" :value="library.name" />
-          <span class="library-choice-name">{{ library.name }}</span>
-          <span class="library-choice-directory">{{ library.directory }}</span>
-        </label>
-      </fieldset>
-      <template #footer>
-        <el-button @click="cancelLibraryChoice">取消</el-button>
-        <el-button type="primary" :disabled="!libraryChoice" @click="confirmLibraryChoice">审核并写入</el-button>
-      </template>
-    </el-dialog>
+    <VaultLibraryDialog
+      :open="libraryDialogOpen"
+      :libraries="libraryOptions"
+      hint="这张知识卡审核通过后将写入所选目录。"
+      confirm-label="审核并写入"
+      @confirm="confirmLibraryChoice"
+      @cancel="cancelLibraryChoice"
+    />
   </section>
 </template>
 
@@ -324,29 +298,4 @@ watch(cards, (items) => {
 .card-rich-editor { min-height: 18rem; }
 .card-rich-editor.is-busy { pointer-events: none; opacity: .7; }
 .card-markdown-preview { min-height: 18rem; padding: 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
-
-/* —— 审核通过时选择知识库目录的弹窗 —— */
-.card-library-dialog :deep(.el-dialog__title) { color: var(--text-primary); font-size: var(--fs-title-lg); font-weight: var(--fw-semibold); }
-.card-library-dialog :deep(.el-dialog__body) { padding-top: 8px; color: var(--text-secondary); }
-.library-dialog-hint { margin: 0 0 10px; font-size: var(--fs-body); line-height: var(--lh-base); color: var(--text-secondary); }
-.library-choice-list { display: grid; gap: 8px; margin: 0; padding: 0; border: 0; }
-.library-choice-legend { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
-.library-choice-item {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  grid-template-areas: "radio name" "radio directory";
-  align-items: center;
-  column-gap: 10px;
-  row-gap: 2px;
-  min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  cursor: pointer;
-}
-.library-choice-item:hover { border-color: var(--pine); }
-.library-choice-item:has(input:checked) { border-color: var(--pine); background: var(--pine-soft); }
-.library-choice-item input { grid-area: radio; width: 16px; height: 16px; accent-color: var(--pine); }
-.library-choice-name { grid-area: name; font-size: var(--fs-body); font-weight: var(--fw-semibold); color: var(--text-primary); overflow-wrap: anywhere; }
-.library-choice-directory { grid-area: directory; font-size: var(--fs-caption); color: var(--text-tertiary); overflow-wrap: anywhere; }
 </style>

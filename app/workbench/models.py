@@ -105,7 +105,7 @@ class SourceRecord:
 
 
 def sanitize_source_url(value: str) -> str:
-    """Return a URL safe for persistence while retaining required numeric IDs."""
+    """Return a URL safe for persistence while retaining required platform IDs."""
     if not isinstance(value, str) or not value.strip() or len(value) > 8192:
         raise ValueError("source URL is invalid")
     from multi_sources import redact_url
@@ -130,6 +130,10 @@ def sanitize_source_url(value: str) -> str:
             allowed_query_names = {"p"}
         elif host == "douyin.com" or host.endswith(".douyin.com"):
             allowed_query_names = {"modal_id", "vid"}
+        elif host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+            allowed_query_names = {"v"}
+        elif host in {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}:
+            allowed_query_names = {"v"}
         else:
             allowed_query_names = set()
 
@@ -148,11 +152,19 @@ def sanitize_source_url(value: str) -> str:
                 if not 1 <= part <= 10000:
                     raise ValueError("Bilibili part query is invalid")
                 valid_values[key] = [str(part)]
-            else:
+            elif key in {"modal_id", "vid"}:
                 if len(set(values)) != 1 or not all(
                     re.fullmatch(r"[0-9]{1,30}", item) for item in values
                 ):
                     raise ValueError("Douyin item query is invalid")
+                valid_values[key] = values
+            elif key == "v" and host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+                if len(values) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{11}", values[0]):
+                    raise ValueError("YouTube video query is invalid")
+                valid_values[key] = values
+            elif key == "v" and host in {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}:
+                if len(values) != 1 or not re.fullmatch(r"[0-9]{5,30}", values[0]):
+                    raise ValueError("Facebook video query is invalid")
                 valid_values[key] = values
         safe_query: list[tuple[str, str]] = []
         emitted: set[str] = set()
@@ -206,6 +218,12 @@ class StepRecord:
     retry_count: int = 0
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    downloaded_bytes: int | None = None
+    total_bytes: int | None = None
+    speed_bytes_per_second: float | None = None
+    eta_seconds: int | None = None
+    last_progress_at: datetime | None = None
+    automatic_retry_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, StepKind):
@@ -234,6 +252,12 @@ class StepUpdate:
     retry_count: int | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    downloaded_bytes: int | None = None
+    total_bytes: int | None = None
+    speed_bytes_per_second: float | None = None
+    eta_seconds: int | None = None
+    last_progress_at: datetime | None = None
+    automatic_retry_count: int | None = None
 
 
 @dataclass(frozen=True)

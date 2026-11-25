@@ -378,7 +378,12 @@ def analyze_collected_comments(context: StepContext) -> StepResult:
     return StepResult(
         status=StepStatus.PARTIAL.value if isinstance(coverage, dict) and (coverage.get("unanalysed_original_count") or coverage.get("stop_reason")) else StepStatus.COMPLETED.value,
         artifact_ids=[
-            *[str(item["raw_artifact_id"]) for item in raw_batches if isinstance(item.get("raw_artifact_id"), str)],
+            *[
+                artifact_id
+                for item in raw_batches
+                for key in ("raw_artifact_id", "repair_raw_artifact_id")
+                if isinstance(artifact_id := item.get(key), str)
+            ],
             json_artifact.id,
             markdown_artifact.id,
             *([summary_artifact.id] if summary_artifact else []),
@@ -387,6 +392,7 @@ def analyze_collected_comments(context: StepContext) -> StepResult:
             "comment_count": len(comments),
             "selected_count": len(analysis.selected),
             "processed_comment_count": len(analysis.processed_comment_ids),
+            "stop_reason": coverage.get("stop_reason") if isinstance(coverage, dict) else None,
             "scope": "本次采集到的公开评论；观点与待核实事实分开标注",
             "summary_warning": summary_error,
         }},

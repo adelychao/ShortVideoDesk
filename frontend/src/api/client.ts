@@ -30,6 +30,7 @@ import type {
   TaskDeletionResult,
   TranscriptComparisonData,
   VaultPreview,
+  VaultImportResult,
   VaultWriteResult,
   UploadReceipt,
   CollectionMediaSelectResult,
@@ -47,6 +48,7 @@ import type {
   ArticlePublication,
   ArticleSourceScript,
   ArticleFromTextRequest,
+  ArticleGenerationJob,
   ArticlePublishTarget,
   CsdnTagCatalog,
   ToutiaoAccountPublishOptions,
@@ -164,6 +166,14 @@ export const api = {
 
   checkVideoPublishAccount(accountId: string): Promise<VideoPublishAccount> {
     return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/check`, { method: 'POST', body: JSON.stringify({}) })
+  },
+
+  cancelVideoPublishAccountCheck(accountId: string): Promise<{ message: string }> {
+    return request(`/video-publish/accounts/${encodeURIComponent(accountId)}/cancel-check`, { method: 'POST', body: JSON.stringify({}) })
+  },
+
+  reloginVideoPublishTarget(targetId: string): Promise<VideoPublishAccount> {
+    return request(`/video-publish/targets/${encodeURIComponent(targetId)}/relogin`, { method: 'POST', body: JSON.stringify({}) })
   },
 
   openVideoPublishAccountWorkbench(accountId: string): Promise<{ message: string }> {
@@ -289,8 +299,16 @@ export const api = {
     return request(`/video-publish/targets/${encodeURIComponent(targetId)}/edit`, { method: 'POST', body: JSON.stringify(input) })
   },
 
+  addVideoPublishTarget(input: { batch_id: string; source_target_id: string; account_id: string; options: VideoPublishTargetEditRequest['options']; confirmed: boolean }): Promise<VideoPublishBatch> {
+    return request('/video-publish/targets/add', { method: 'POST', body: JSON.stringify(input) })
+  },
+
   syncVideoPublishTarget(targetId: string): Promise<{ queued: boolean }> {
     return request(`/video-publish/targets/${encodeURIComponent(targetId)}/sync`, { method: 'POST', body: JSON.stringify({}) })
+  },
+
+  autoSyncVideoPublishBatches(batchIds: string[]): Promise<{ queued: number }> {
+    return request('/video-publish/status-sync/automatic', { method: 'POST', body: JSON.stringify({ batch_ids: batchIds }) })
   },
 
   retryVideoPublishTarget(targetId: string, confirmed: boolean, changeSchedule = false, scheduleAt: string | null = null, xhsManualSubmit = false): Promise<VideoPublishBatch> {
@@ -351,6 +369,22 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     })
+  },
+
+  startArticleGenerationJob(input: ArticleFromTextRequest): Promise<ArticleGenerationJob> {
+    return request('/article-generation-jobs', { method: 'POST', body: JSON.stringify(input) })
+  },
+
+  latestArticleGenerationJob(): Promise<Pick<ArticleGenerationJob, 'id' | 'status'> | null> {
+    return request('/article-generation-jobs/latest')
+  },
+
+  articleGenerationJob(id: string): Promise<ArticleGenerationJob> {
+    return request(`/article-generation-jobs/${encodeURIComponent(id)}`)
+  },
+
+  cancelArticleGenerationJob(id: string): Promise<ArticleGenerationJob> {
+    return request(`/article-generation-jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' })
   },
 
   getArticle(articleId: string): Promise<ArticleRecord> {
@@ -458,6 +492,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ target, block_id: blockId, ...(mode === 'vector' ? { mode } : {}), confirmed }),
     })
+  },
+
+  async uploadArticleBodyImage(articleId: string, blockId: string, file: File): Promise<{ article: ArticleRecord; image_url: string }> {
+    const form = new FormData()
+    form.set('file', file)
+    let response: Response
+    try {
+      const query = new URLSearchParams({ block_id: blockId })
+      response = await fetch(`${API_BASE}/articles/${encodeURIComponent(articleId)}/images/upload?${query}`, {
+        method: 'POST', mode: 'same-origin', credentials: 'same-origin', cache: 'no-store',
+        headers: { Accept: 'application/json' }, body: form,
+      })
+    } catch {
+      throw new ApiError(0, '无法连接本机工作台服务，请确认服务正在运行。')
+    }
+    const payload = await response.json().catch(() => null) as { detail?: unknown } | null
+    if (!response.ok) throw new ApiError(response.status, safeMessage(payload?.detail))
+    return payload as { article: ArticleRecord; image_url: string }
   },
 
   articleImageUrl(articleId: string, filename: string): string {
@@ -693,6 +745,21 @@ export const api = {
     return request<{ opened: boolean }>(`/artifacts/${encodeURIComponent(artifactId)}/open-vault-note${query}`, { method: 'POST' })
   },
 
+  importArtifactToVault(
+    artifactId: string,
+    expectedSha256: string,
+    options: { libraryName?: string | null; relativePath?: string | null } = {},
+  ): Promise<VaultImportResult> {
+    return request<VaultImportResult>(`/artifacts/${encodeURIComponent(artifactId)}/vault-import`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_sha256: expectedSha256,
+        ...(options.relativePath ? { relative_path: options.relativePath } : {}),
+        ...(options.libraryName ? { library_name: options.libraryName } : {}),
+      }),
+    })
+  },
+
   getTextArtifact(artifactId: string): Promise<{ artifact_id: string; sha256: string; content: string }> {
     return request<{ artifact_id: string; sha256: string; content: string }>(`/artifacts/${encodeURIComponent(artifactId)}/text`)
   },
@@ -842,10 +909,12 @@ export const api = {
     stepId: string,
     ocrAction?: 'continue' | 'restart',
     transcriptionAuthorized = false,
+    downloadQuality?: '720p',
   ): Promise<TaskDetail> {
     const body: Record<string, unknown> = {}
     if (ocrAction) body.ocr_action = ocrAction
     if (transcriptionAuthorized) body.transcription_authorized = true
+    if (downloadQuality) body.download_quality = downloadQuality
     return request<TaskDetail>(
       `/tasks/${encodeURIComponent(taskId)}/steps/${encodeURIComponent(stepId)}/retry`,
       { method: 'POST', body: JSON.stringify(body) },

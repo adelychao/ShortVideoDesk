@@ -33,6 +33,89 @@ from app.workbench.runner import TaskRunner
 from app.workbench import article_platforms
 
 
+def test_background_article_cancellation_discards_late_result(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    database = Database(tmp_path / 'article-job.sqlite3')
+    database.migrate()
+    runner = SimpleNamespace(database=database, config=AppConfig(database))
+    entered, release = threading.Event(), threading.Event()
+    document = default_document('文章')
+    document['body_markdown'] = '正文'
+
+    class Provider:
+        def analyze_text(self, *_args):
+            entered.set()
+            assert release.wait(10)
+            return SimpleNamespace(text=json.dumps(document, ensure_ascii=False), usage=None, request_id='remote')
+
+    monkeypatch.setattr(workbench_api, '_runner', lambda _: runner)
+    monkeypatch.setattr(workbench_api, 'get_default_model_profile', lambda _: {'provider_id': 'zhipu', 'model_id': 'glm', 'capabilities_json': '["text_generation"]'})
+    monkeypatch.setattr(workbench_api, '_model_configuration_ready', lambda *a, **k: True)
+    monkeypatch.setattr(workbench_api, 'task_profile_api_key', lambda _: 'test')
+    monkeypatch.setattr(workbench_api, 'create_provider', lambda *a, **k: Provider())
+    body = workbench_api.ArticleFromTextRequest(content='原文', idempotency_key='background-test-00001', authorized=True)
+    job = workbench_api.start_article_generation_job(body, SimpleNamespace())
+    assert entered.wait(5)
+    thread = workbench_api._article_job_threads[job['id']]
+    assert workbench_api.cancel_article_generation_job(job['id'], SimpleNamespace())['status'] == 'cancelled'
+    release.set()
+    thread.join(5)
+    result = workbench_api.get_article_generation_job(job['id'], SimpleNamespace())
+    assert result['status'] == 'cancelled'
+    assert result['content'] == '原文'
+    assert list_articles(database)['total'] == 0
+
+
+def test_background_article_job_completes_and_cancel_cannot_remove_result(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    database = Database(tmp_path / 'article-job-success.sqlite3')
+    database.migrate()
+    runner = SimpleNamespace(database=database, config=AppConfig(database))
+    entered, release = threading.Event(), threading.Event()
+    document = default_document('完成的文章')
+    document['body_markdown'] = '正文'
+
+    class Provider:
+        def analyze_text(self, *_args):
+            entered.set()
+            assert release.wait(10)
+            return SimpleNamespace(text=json.dumps(document, ensure_ascii=False), usage=None, request_id='remote')
+
+    monkeypatch.setattr(workbench_api, '_runner', lambda _: runner)
+    monkeypatch.setattr(workbench_api, 'get_default_model_profile', lambda _: {'provider_id': 'zhipu', 'model_id': 'glm', 'capabilities_json': '["text_generation"]'})
+    monkeypatch.setattr(workbench_api, '_model_configuration_ready', lambda *a, **k: True)
+    monkeypatch.setattr(workbench_api, 'task_profile_api_key', lambda _: 'test')
+    monkeypatch.setattr(workbench_api, 'create_provider', lambda *a, **k: Provider())
+    body = workbench_api.ArticleFromTextRequest(content='原文', idempotency_key='background-success-0001', authorized=True)
+    job = workbench_api.start_article_generation_job(body, SimpleNamespace())
+    assert entered.wait(5)
+    thread = workbench_api._article_job_threads[job['id']]
+    assert workbench_api.start_article_generation_job(body, SimpleNamespace())['id'] == job['id']
+    release.set()
+    thread.join(5)
+    result = workbench_api.cancel_article_generation_job(job['id'], SimpleNamespace())
+    assert result['status'] == 'completed'
+    assert result['article_id']
+    assert list_articles(database)['total'] == 1
+
+
+def test_interrupted_background_article_job_recovers_saved_draft(tmp_path: Path) -> None:
+    database = Database(tmp_path / 'article-job-recovery.sqlite3')
+    database.migrate()
+    key = 'background-recovery-0001'
+    document = default_document('已保存')
+    document['body_markdown'] = '正文'
+    article = create_article(database, document, source_kind='pasted_script', generation_key_sha256=hashlib.sha256(key.encode()).hexdigest())
+    with database.transaction(write=True) as connection:
+        connection.execute("INSERT INTO article_generation_jobs (id, idempotency_key, content, status, created_at) VALUES (?, ?, ?, 'running', ?)", ('job-id', key, '原文', '2026-01-01T00:00:00+00:00'))
+    workbench_api._recover_article_generation_jobs(database)
+    result = workbench_api._article_job_row(database, 'job-id')
+    assert result['status'] == 'completed'
+    assert result['article_id'] == article['id']
+
+
 def test_article_from_text_route_is_available_without_creating_a_task():
     route = next(
         (route for route in workbench_api._router.routes if route.path.endswith("/articles/from-text")),
@@ -1392,6 +1475,7 @@ def test_app_startup_recovers_interrupted_publications(monkeypatch) -> None:
         "recover_article_publications",
         lambda database: calls.append("recover") or [],
     )
+    monkeypatch.setattr(workbench_api, "_recover_article_generation_jobs", lambda database: calls.append("recover_jobs"))
     monkeypatch.setattr(
         workbench_api,
         "get_platform_account_manager",
@@ -1402,11 +1486,11 @@ def test_app_startup_recovers_interrupted_publications(monkeypatch) -> None:
 
     async def run_lifespan() -> None:
         async with app.router.lifespan_context(app):
-            assert calls == ["start", "recover"]
+            assert calls == ["start", "recover", "recover_jobs"]
 
     asyncio.run(run_lifespan())
 
-    assert calls == ["start", "recover", "stop", "shutdown"]
+    assert calls == ["start", "recover", "recover_jobs", "stop", "shutdown"]
 
 
 def test_schema_migration_adds_account_metadata_and_unknown_state(tmp_path: Path) -> None:

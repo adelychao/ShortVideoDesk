@@ -10,7 +10,7 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "workbench.sqlite3"
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 36
 BUSY_TIMEOUT_MS = 15_000
 
 
@@ -552,6 +552,23 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
             created_at TEXT NOT NULL
         )""",
         "CREATE INDEX idx_comment_analysis_options_task ON comment_analysis_options(task_id)",
+    ),
+    35: (
+        "ALTER TABLE task_steps ADD COLUMN downloaded_bytes INTEGER",
+        "ALTER TABLE task_steps ADD COLUMN total_bytes INTEGER",
+        "ALTER TABLE task_steps ADD COLUMN speed_bytes_per_second REAL",
+        "ALTER TABLE task_steps ADD COLUMN eta_seconds INTEGER",
+        "ALTER TABLE task_steps ADD COLUMN last_progress_at TEXT",
+        "ALTER TABLE task_steps ADD COLUMN automatic_retry_count INTEGER NOT NULL DEFAULT 0",
+    ),
+    36: (
+        """CREATE TABLE article_generation_jobs (
+            id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+            content TEXT NOT NULL, status TEXT NOT NULL,
+            article_id TEXT REFERENCES articles(id) ON DELETE SET NULL,
+            error_message TEXT, created_at TEXT NOT NULL, finished_at TEXT
+        )""",
+        "CREATE INDEX idx_article_generation_jobs_created ON article_generation_jobs(created_at DESC)",
     ),
 }
 

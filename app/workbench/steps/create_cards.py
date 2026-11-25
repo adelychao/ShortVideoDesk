@@ -197,7 +197,10 @@ def _request_prompt(user_prompt: str) -> str:
 
 
 def _parse_card_response(raw: str) -> dict[str, object]:
-    parsed = parse_json_object(raw)
+    try:
+        parsed = parse_json_object(raw)
+    except RunnerError:
+        parsed = _parse_card_json_with_quote_repair(raw)
     title = string_field(parsed.get("title"), maximum=160)
     summary = string_field(parsed.get("summary"), maximum=1200)
     takeaway = string_field(parsed.get("takeaway"), maximum=1000)
@@ -214,6 +217,110 @@ def _parse_card_response(raw: str) -> dict[str, object]:
         "takeaway": takeaway,
         "reminder": reminder,
     }
+
+
+def _parse_card_json_with_quote_repair(raw: str) -> dict[str, object]:
+    match = re.search(r"\{[\s\S]*\}", raw)
+    if match is None:
+        raise RunnerError("invalid_analysis_output", "知识卡返回格式无效。")
+    candidate = _escape_unescaped_json_quotes(match.group(0))
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, RecursionError):
+        raise RunnerError("invalid_analysis_output", "知识卡返回格式无效。") from None
+    if not isinstance(parsed, dict):
+        raise RunnerError("invalid_analysis_output", "知识卡返回格式无效。")
+    return parsed
+
+
+def _escape_unescaped_json_quotes(candidate: str) -> str:
+    # zhw 2026-11-21 13:30:28：模型有时会漏掉 JSON 字符串内部双引号的转义；只转义不符合当前键或字符串结束位置的引号，保留原文并让已保存响应可重用。
+    containers: list[dict[str, str]] = []
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    string_role = "value"
+    string_container: dict[str, str] | None = None
+
+    for index, character in enumerate(candidate):
+        if in_string:
+            if escaped:
+                output.append(character)
+                escaped = False
+            elif character == "\\":
+                output.append(character)
+                escaped = True
+            elif character == '"':
+                if _is_json_string_end(candidate, index, string_role, string_container):
+                    output.append(character)
+                    in_string = False
+                    if string_container is not None:
+                        string_container["expect"] = "colon" if string_role == "key" else "comma_or_end"
+                else:
+                    output.append('\\\"')
+            else:
+                output.append(character)
+            continue
+
+        if character == '"':
+            string_container = containers[-1] if containers else None
+            string_role = (
+                "key"
+                if string_container is not None
+                and string_container["type"] == "object"
+                and string_container["expect"] == "key_or_end"
+                else "value"
+            )
+            in_string = True
+        elif character == "{":
+            containers.append({"type": "object", "expect": "key_or_end"})
+        elif character == "[":
+            containers.append({"type": "array", "expect": "value_or_end"})
+        elif character in "}]":
+            if containers:
+                containers.pop()
+                if containers:
+                    containers[-1]["expect"] = "comma_or_end"
+        elif character == ":":
+            if containers and containers[-1]["type"] == "object" and containers[-1]["expect"] == "colon":
+                containers[-1]["expect"] = "value"
+        elif character == ",":
+            if containers and containers[-1]["expect"] == "comma_or_end":
+                containers[-1]["expect"] = (
+                    "key_or_end" if containers[-1]["type"] == "object" else "value_or_end"
+                )
+        elif not character.isspace() and containers:
+            frame = containers[-1]
+            if frame["expect"] in {"value", "value_or_end"}:
+                frame["expect"] = "comma_or_end"
+        output.append(character)
+
+    return "".join(output)
+
+
+def _is_json_string_end(
+    candidate: str,
+    quote_index: int,
+    string_role: str,
+    container: dict[str, str] | None,
+) -> bool:
+    if container is None:
+        return False
+    next_index = quote_index + 1
+    while next_index < len(candidate) and candidate[next_index].isspace():
+        next_index += 1
+    next_character = candidate[next_index] if next_index < len(candidate) else ""
+    if string_role == "key":
+        return container["type"] == "object" and next_character == ":"
+    if container["type"] == "object":
+        if next_character == "}":
+            return True
+        next_value = candidate[next_index + 1 :].lstrip() if next_character == "," else ""
+        return next_character == "," and next_value.startswith('"')
+    if next_character == "]":
+        return True
+    next_value = candidate[next_index + 1 :].lstrip() if next_character == "," else ""
+    return next_character == "," and bool(next_value) and next_value[0] in '"[{[-0123456789tfn'
 
 
 def _cached_response(

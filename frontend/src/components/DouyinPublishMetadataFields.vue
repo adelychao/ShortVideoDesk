@@ -41,11 +41,6 @@ const categories: Array<{ value: DouyinCreatorTagCategory; label: string }> = [
   { value: 'game_handle', label: '游戏手柄' },
   { value: 'mark_anything', label: '标记万物' },
 ]
-const defaultPoiTabs = [
-  { code: 'local', name: '本地' },
-  { code: 'domestic', name: '国内' },
-  { code: 'overseas', name: '国际' },
-]
 const category = computed({
   get: () => props.modelValue.category || 'location',
   set: (value: DouyinCreatorTagCategory) => update({ ...props.modelValue, category: value }),
@@ -54,8 +49,8 @@ const query = computed(() => props.modelValue.queries[category.value] || '')
 const setQuery = (value: string) => update({ ...props.modelValue, queries: { ...props.modelValue.queries, [category.value]: value } })
 const tagResults = ref<DouyinCreatorTag[]>([])
 const poiResults = ref<VideoPublishPoi[]>([])
-const poiTabs = ref(defaultPoiTabs.map(tab => ({ ...tab })))
-const cityCode = ref('local')
+const poiTabs = ref<VideoPublishPoiSearchResult['tabs']>([])
+const cityCode = ref<string | null>(null)
 const tagBusy = ref(false)
 const tagError = ref('')
 const tagSearched = ref(false)
@@ -109,7 +104,7 @@ function safeTag(tag: DouyinCreatorTag): DouyinCreatorTag {
     clean.address = tag.address || ''
     clean.city_code = tag.city_code || ''
     clean.city_name = tag.city_name || ''
-    clean.search_tab_code = tag.search_tab_code || 'local'
+    clean.search_tab_code = tag.search_tab_code
   }
   if (tag.category === 'mini_program') clean.share_url = tag.share_url || query.value
   if (tag.category === 'game_handle') {
@@ -166,7 +161,7 @@ function writePoiSearchCache(key: string, result: VideoPublishPoiSearchResult): 
 
 function showPoiSearchResult(result: VideoPublishPoiSearchResult): void {
   poiResults.value = result.items.map(item => ({ ...item }))
-  poiTabs.value = result.tabs.length ? result.tabs.map(tab => ({ ...tab })) : defaultPoiTabs.map(tab => ({ ...tab }))
+  poiTabs.value = [...result.tabs, ...result.cities]
   cityCode.value = result.selected_city_code
   tagSearched.value = true
 }
@@ -231,6 +226,9 @@ async function runTagSearch(searchText = query.value): Promise<void> {
           if (activeRequest.category === 'location') {
             const response = await api.searchDouyinPoi(activeRequest.accountId, activeRequest.keyword, activeRequest.cityCode)
             writePoiSearchCache(tagSearchKey(activeRequest), response)
+            if (activeRequest.cityCode === null) {
+              writePoiSearchCache(tagSearchKey({ ...activeRequest, cityCode: response.selected_city_code }), response)
+            }
             if (activeRequest.version === tagVersion) {
               showPoiSearchResult(response)
             }
@@ -334,6 +332,7 @@ function poiDistanceLabel(distance?: string): string {
 }
 
 function changeCity(code: string): void {
+  if (cityCode.value === code) return
   cityCode.value = code
   void runTagSearch()
 }
@@ -485,13 +484,14 @@ function closeHotDropdown(): void {
 }
 
 watch(() => [props.accountId, category.value], () => {
+  if (tagTimer !== undefined) window.clearTimeout(tagTimer)
   tagVersion++
   queuedTagSearch = null
   tagBusy.value = false
   tagResults.value = []
   poiResults.value = []
-  poiTabs.value = defaultPoiTabs.map(tab => ({ ...tab }))
-  cityCode.value = 'local'
+  poiTabs.value = []
+  cityCode.value = null
   locationFocused.value = false
   tagError.value = ''
   tagSearched.value = false
@@ -538,7 +538,7 @@ onBeforeUnmount(() => {
             </ElInput>
             <ElPopover :visible="locationFocused && !selectedTag('location')" :virtual-ref="locationInput || undefined" virtual-triggering placement="bottom-start" :fallback-placements="['top-start', 'bottom-end', 'top-end']" :width="locationPopoverWidth" :show-arrow="false" popper-class="douyin-location-popper" :popper-style="{ padding: '0' }">
               <div class="poi-dropdown" aria-label="抖音地点搜索结果">
-                <div class="poi-tabs" role="tablist" aria-label="地点范围">
+                <div v-if="poiTabs.length" class="poi-tabs" role="tablist" aria-label="地点范围">
                   <button v-for="tab in poiTabs" :key="tab.code" class="poi-tab" type="button" role="tab" :class="{ active: tab.code === cityCode }" :aria-selected="tab.code === cityCode" @mousedown.prevent @click="changeCity(tab.code)">{{ tab.name }}</button>
                 </div>
                 <div class="poi-dropdown-list" role="listbox">
@@ -622,7 +622,7 @@ onBeforeUnmount(() => {
 .location-clear-button:disabled { cursor: not-allowed; opacity: .55; }
 .location-clear-button .el-icon { font-size: 16px; }
 .poi-dropdown { max-height: 360px; overflow: hidden; min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--text-primary); }
-.poi-tabs { position: sticky; top: 0; z-index: 1; display: flex; align-items: stretch; gap: 22px; min-height: 46px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--paper); }
+.poi-tabs { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; align-items: stretch; gap: 0 22px; min-height: 46px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .poi-tab { position: relative; display: inline-flex; align-items: center; padding: 0 2px; border: 0; background: transparent; color: var(--text-tertiary); font-size: 13px; cursor: pointer; }
 .poi-tab.active { color: var(--text-primary); font-weight: var(--fw-semibold); }
 .poi-tab.active::after { position: absolute; right: 0; bottom: 0; left: 0; height: 2px; background: var(--text-primary); content: ''; }
